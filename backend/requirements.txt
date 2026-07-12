@@ -1,0 +1,28 @@
+# ── VRK Kiosk — backend requirements ── Python 3.12 required ──
+# Policy: only direct imports are listed; pip resolves sub-dependencies.
+
+# Server & API
+fastapi==0.136.1
+uvicorn[standard]==0.46.0
+python-multipart==0.0.27
+httpx==0.28.1
+python-dotenv==1.2.2
+pydantic==2.13.4
+
+# STT pipeline (EP-03)
+faster-whisper==1.2.1
+numpy
+scipy==1.17.1
+
+# TTS pipeline (EP-04)
+kokoro==0.9.4
+soundfile==0.13.1
+
+# Face recognition — visitor identification (EP-05)
+deepface==0.0.100
+opencv-python==4.13.0.92
+mediapipe==0.10.35
+
+# Data layer
+motor==3.7.1
+redis==7.4.0

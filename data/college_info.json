@@ -1,0 +1,142 @@
+{
+  "meta": {
+    "source": "https://www.rnsit.ac.in",
+    "last_updated": "2026-05-20",
+    "description": "Comprehensive database for RNS Institute of Technology"
+  },
+  "college": {
+    "name": "RNS Institute of Technology",
+    "short_name": "RNSIT",
+    "established": 2001,
+    "founder": "Dr. R. N. Shetty",
+    "type": "Private Engineering College",
+    "affiliation": "Visvesvaraya Technological University (VTU)",
+    "autonomous": true,
+    "website": "https://www.rnsit.ac.in",
+    "location": "R R Nagar Post, Channasandra, Bengaluru - 560098",
+    "admission_codes": {"comedk": "E104", "cet": "E118"}
+  },
+  "administration": {
+    "group_chairman": "Dr. R. N. Shetty",
+    "director": {"name": "Dr. M K Venkatesha", "phone": "+91 98808 67337"},
+    "principal": {"name": "Dr. Ramesh Babu H S", "phone": "+91 94489 53800"},
+    "contacts": {
+      "admissions_phone": "+91 81472 86667",
+      "admissions_email": "admissions@rnsit.ac.in",
+      "enquiry_phone": ["+91 80286 11880", "+91 80286 11881", "+91 80286 11882"]
+    },
+    "working_hours": "9:20 AM to 5:00 PM (all working days)"
+  },
+  "departments": {
+    "cse": {"name": "Computer Science and Engineering", "hod": "Dr. Kiran Y.C.", "intake": 720, "block": "CSE Block", "phd_center": true},
+    "ece": {"name": "Electronics and Communication Engineering", "block": "Main Campus", "phd_center": true},
+    "ise": {"name": "Information Science and Engineering", "block": "CSE Block"},
+    "eee": {"name": "Electrical and Electronics Engineering"},
+    "mech": {"name": "Mechanical Engineering", "block": "Mechanical Block", "phd_center": true},
+    "civil": {"name": "Civil Engineering", "block": "Civil Block", "phd_center": true},
+    "aiml": {"name": "CSE (AI and ML)", "hod": "Dr. Andhe Pallavi", "block": "CSE Block"},
+    "cse_ds": {"name": "CSE (Data Science)", "block": "CSE Block"},
+    "cse_cs": {"name": "CSE (Cyber Security)", "block": "CSE Block"},
+    "aids": {"name": "Artificial Intelligence and Data Science"},
+    "mca": {"name": "Master of Computer Applications", "block": "MBA Block"},
+    "mba": {"name": "Master of Business Administration", "block": "MBA Block", "phd_center": true}
+  },
+  "facilities": {
+    "library": {
+      "name": "RNSIT Central Library",
+      "timings": "09:00 AM to 08:00 PM",
+      "location": "Opposite the Administrative Block",
+      "platform": "K-NIMBUS"
+    },
+    "canteen": {"location": "Near the sports ground and hostel entrance"},
+    "auditorium": {
+      "name": "Dr. Shivaram Karanth Auditorium",
+      "location": "Administrative Block",
+      "seating_capacity": 1800
+    },
+    "gym": {"available": true, "details": "Separate gym facilities and timings for boys and girls"},
+    "hostels": {
+      "boys": {"capacity": 530, "type": "Shared basis"},
+      "girls": {"capacity": 300, "amenities": ["Morning Yoga", "Meditation sessions"]}
+    },
+    "sports": {
+      "cricket_ground_sqm": 17000,
+      "courts": ["Basketball", "Football"]
+    },
+    "placement_cell": {"location": "Ground floor of Admin Block"},
+    "medical": {"details": "First-aid kits and 24/7 ambulance services"},
+    "wifi": {"details": "Campus-wide Wi-Fi available for students and staff"},
+    "banking": {"details": "Canara Bank extension counter and ATM on campus"},
+    "toyota_center": {"name": "Toyota Center of Excellence", "location": "Mechanical Engineering department"},
+    "counselling": {"details": "One-on-one session with college counsellors", "booking_url": "https://calendly.com/rnsit-website/15min"}
+  },
+  "placements": {
+    "total_companies": "200+",
+    "stats": {
+      "2025": {"placements": 1060, "highest_ctc_lpa": 50, "internships": 426},
+      "2024": {"job_offers": 1071, "highest_ctc_lpa": 26.65},
+      "2023": {"job_offers": 1386, "highest_ctc_lpa": 56}
+    },
+    "recent_recruiters": ["Cognizant", "Infosys", "IBM", "HCL", "Tata Elxsi", "LTIMindtree", "Mphasis", "HP", "LSEG", "Amagi"]
+  },
+  "academics": {
+    "programs": {"ug": "BE", "pg": ["MBA", "MCA"], "phd": "VTU Research Centers in CSE, ECE, MECH, CIVIL, CHEM, PHYSICS, MATH, MBA"},
+    "clubs": ["QuizCorp", "Google DSC", "AdroIT", "Big O Coding Club", "Placement Club", "Aura"],
+    "cultural_fest": "Aperture"
+  },
+  "admissions": {
+    "status": "Open for 2026",
+    "modes": ["COMEDK", "CET (Karnataka)", "Management Quota"],
+    "contact_phone": "+91 81472 86667",
+    "contact_email": "admissions@rnsit.ac.in",
+    "cet_code": "E118",
+    "comedk_code": "E104"
+  },
+  "faqs": [
+    {"question": "Hello", "answer": "Hello! Welcome to RNS Institute of Technology. I am your digital receptionist. How may I assist you today?"},
+    {"question": "Hi", "answer": "Hi there! Welcome to RNSIT. How can I help you today?"},
+    {"question": "Hey", "answer": "Hey! Welcome to RNS Institute of Technology. What can I help you with?"},
+    {"question": "Good morning", "answer": "Good morning! Welcome to RNSIT. How may I assist you today?"},
+    {"question": "Good afternoon", "answer": "Good afternoon! Welcome to RNSIT. How may I help you?"},
+    {"question": "Thank you", "answer": "You are most welcome! It was my pleasure to assist you. Have a wonderful day at RNSIT!"},
+    {"question": "Thanks", "answer": "You are welcome! Feel free to ask if you need anything else. Have a great day!"},
+    {"question": "Bye", "answer": "Goodbye! Thank you for visiting RNSIT. Have a wonderful day!"},
+    {"question": "Goodbye", "answer": "Goodbye! It was nice helping you. Have a great day at RNSIT!"},
+    {"question": "What can you do", "answer": "I can help you with information about RNSIT departments, facilities, staff, admissions, placements, library, hostel, canteen, and much more. Just ask me anything!"},
+    {"question": "Who is the Principal of RNSIT?", "answer": "Dr. Ramesh Babu H S is the current Principal of RNSIT. Contact: +91 94489 53800."},
+    {"question": "Who is the Director of RNSIT?", "answer": "Dr. M K Venkatesha is the Director of RNSIT. Contact: +91 98808 67337."},
+    {"question": "Who is the Chairman of RNSIT?", "answer": "Dr. R. N. Shetty is the Group Chairman and founder of RNSIT."},
+    {"question": "When was RNSIT established?", "answer": "RNSIT was established in the year 2001."},
+    {"question": "Who founded RNSIT?", "answer": "Dr. R. N. Shetty, a well-known industrialist and philanthropist, founded RNSIT."},
+    {"question": "Where is the Accounts Manager office?", "answer": "The Accounts office is located in the Administrative Block."},
+    {"question": "What is the highest placement package offered?", "answer": "The highest CTC offered was 56 LPA in 2023. In 2025, it was 50 LPA."},
+    {"question": "How can I contact the Admissions department?", "answer": "Call +91 81472 86667 or email admissions@rnsit.ac.in. The admissions office is open on all Saturdays and Sundays too."},
+    {"question": "Is there a gym on campus?", "answer": "Yes, RNSIT has separate gym facilities and timings for boys and girls."},
+    {"question": "Where is the canteen located?", "answer": "The canteen is located near the sports ground and hostel entrance."},
+    {"question": "What are the college working hours?", "answer": "The college working hours are 9:20 AM to 5:00 PM on all working days."},
+    {"question": "Does RNSIT have Wi-Fi?", "answer": "Yes, RNSIT has campus-wide Wi-Fi available for all students and staff."},
+    {"question": "Where is the Dr. Shivaram Karanth Auditorium?", "answer": "The Dr. Shivaram Karanth Auditorium is located in the Administrative Block with a seating capacity of 1800."},
+    {"question": "What is the intake for the CSE department?", "answer": "The CSE department has an intake of 720 students per year."},
+    {"question": "Is there an ATM on campus?", "answer": "Yes, a Canara Bank extension counter and ATM are available on the RNSIT campus."},
+    {"question": "Where can I find the Toyota Center of Excellence?", "answer": "The Toyota Center of Excellence is located in the Mechanical Engineering department."},
+    {"question": "What are the library timings?", "answer": "The RNSIT Central Library is open from 9:00 AM to 8:00 PM."},
+    {"question": "Does the college provide transport?", "answer": "Yes, RNSIT operates a fleet of buses and a van for students."},
+    {"question": "Where is the placement cell?", "answer": "The placement cell is located on the ground floor of the Admin Block."},
+    {"question": "How many students can the girls hostel accommodate?", "answer": "The girls hostel can accommodate 300 students and offers amenities like Morning Yoga and Meditation sessions."},
+    {"question": "Is medical help available on campus?", "answer": "Yes, first-aid kits and 24/7 ambulance services are available on campus."},
+    {"question": "What is the COMEDK code for RNSIT?", "answer": "The COMEDK code for RNSIT is E104."},
+    {"question": "What is the CET code for RNSIT?", "answer": "The CET code for RNSIT is E118."},
+    {"question": "How many companies recruit from RNSIT?", "answer": "More than 200 companies recruit from RNSIT including Cognizant, Infosys, IBM, HCL, Tata Elxsi and many more."},
+    {"question": "Does RNSIT have PhD programs?", "answer": "Yes, RNSIT has VTU Research Centers in CSE, ECE, Mechanical, Civil, Chemistry, Physics, Math and MBA."},
+    {"question": "What are the student clubs at RNSIT?", "answer": "RNSIT has clubs including QuizCorp, Google DSC, AdroIT, Big O Coding Club, Placement Club and Aura cultural club."},
+    {"question": "What is the cultural fest of RNSIT?", "answer": "The cultural fest of RNSIT is called Aperture."},
+    {"question": "What departments does RNSIT have?", "answer": "RNSIT offers CSE, ECE, ISE, EEE, Mechanical, Civil, AI and ML, CSE Data Science, CSE Cyber Security, AI and DS at UG level, and MBA and MCA at PG level."},
+    {"question": "Where is RNSIT located?", "answer": "RNSIT is located at R R Nagar Post, Channasandra, Bengaluru - 560098."},
+    {"question": "What is the website of RNSIT?", "answer": "The official website of RNSIT is https://www.rnsit.ac.in"},
+    {"question": "What is the affiliation of RNSIT?", "answer": "RNSIT is affiliated to Visvesvaraya Technological University (VTU) and is an Autonomous institution."},
+    {"question": "How many placements in 2025?", "answer": "In 2025, RNSIT achieved 1060 placements with a highest CTC of 50 LPA and 426 internships."},
+    {"question": "Who is the HOD of CSE?", "answer": "Dr. Kiran Y.C. is the HOD of the CSE department at RNSIT."},
+    {"question": "Who is the HOD of AI ML?", "answer": "Dr. Andhe Pallavi is the HOD of the AI and ML department at RNSIT."},
+    {"question": "Where is admin block?", "answer": "The Administrative Block houses the Director and Principal offices, Accounts, Admissions, Placement Cell and the Dr. Shivaram Karanth Auditorium."}
+  ]
+}
