@@ -65,6 +65,8 @@ copy .env.example .env    # then edit
 
 ## 4. Run
 
+Normal operation: `venv\Scripts\python.exe run.py` starts everything — the steps below are for running services individually while debugging.
+
 ```powershell
 # Terminal 1 — backend (from repo root)
 venv\Scripts\python.exe -m uvicorn backend.main:app --reload
