@@ -1,28 +1,38 @@
-# ── VRK Kiosk — backend requirements ── Python 3.12 required ──
-# Policy: only direct imports are listed; pip resolves sub-dependencies.
+# ══════════════════════════════════════════════════════════════════
+#  VRK Kiosk — backend requirements (FINAL)          Python 3.12 ONLY
+# ══════════════════════════════════════════════════════════════════
+#  Policy: list ONLY packages the code imports directly; pip resolves
+#  the ~150 sub-dependencies itself. Do NOT pin sub-dependencies here
+#  (e.g. pymongo/dnspython — motor selects the compatible versions;
+#  pinning them caused a ResolutionImpossible conflict on 2026-07-12).
+#
+#  Install:  venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+# ══════════════════════════════════════════════════════════════════
 
-# Server & API
+# ── Server & API ──
 fastapi==0.136.1
-uvicorn[standard]==0.46.0
+uvicorn[standard]==0.46.0        # [standard] = websockets + watchfiles for /ws + --reload
 python-multipart==0.0.27
-httpx==0.28.1
+httpx==0.28.1                    # llm.py (Gemini API) + detection.py backend calls
 python-dotenv==1.2.2
 pydantic==2.13.4
 
-# STT pipeline (EP-03)
+# ── STT pipeline (EP-03) ──
 faster-whisper==1.2.1
-numpy
+numpy                            # unpinned on purpose: TF/mediapipe negotiate the version
 scipy==1.17.1
 
-# TTS pipeline (EP-04)
-kokoro==0.9.4
+# ── TTS pipeline (EP-04) ──
+kokoro==0.9.4                    # requires Python <3.13 — hence the 3.12 rule
 soundfile==0.13.1
 
-# Face recognition — visitor identification (EP-05)
+# ── Face recognition (visitor identification) ──
 deepface==0.0.100
+tf-keras                        # Keras-2 compat layer: retinaface needs it on TF>=2.16
+                                # but doesn't declare it (found at runtime, 2026-07-12)
 opencv-python==4.13.0.92
 mediapipe==0.10.35
 
-# Data layer
-motor==3.7.1
+# ── Data layer ──
+motor==3.7.1                     # async MongoDB (brings pymongo + dnspython itself)
 redis==7.4.0
