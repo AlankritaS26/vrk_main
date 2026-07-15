@@ -59,14 +59,16 @@ COSINE_THRESHOLD  = 0.30
 
 # ─── Tunable constants ────────────────────────────────────────────────────────
 _COOLDOWN:       float = 120.0  # seconds before same person can retrigger
-_DWELL_REQUIRED: float = 2.0    # seconds face must be present before triggering
+_DWELL_REQUIRED: float = 0.8    # seconds face must be present before triggering  # CHANGED was 2.0 — cut passerby-filter lag
 _GOODBYE_DELAY:  float = 3.0    # seconds face must be ABSENT before ending session
+_SESSION_RECHECK_INTERVAL: float = 5.0  # NEW — how often to verify active session's face_id still exists
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 _asking_name:         bool  = False
 _recognizing:         bool  = False   # background recognition in-flight
 _last_trigger_ts:     float = 0.0
 _last_known_identity: str   = ""
+_last_known_face_id:  str   = ""      # NEW — needed to check deletion mid-session
 _known_faces_cache:   list  = []
 _greeted:             bool  = False   # welcome greeting played this session
 
@@ -77,6 +79,10 @@ _face_present_last:  bool  = False
 # Goodbye detection
 _face_gone_ts:   float = 0.0
 _session_active: bool  = False
+
+# NEW — throttle + in-flight guard for the mid-session deletion check
+_last_session_recheck_ts: float = 0.0
+_rechecking_session:      bool  = False
 
 # Lock so only one background recognition/unknown-handler runs at a time
 _pipeline_lock = threading.Lock()
@@ -241,13 +247,49 @@ def recognize_face(face_crop: np.ndarray, known_faces: list) -> tuple:
 
 def _end_session_background():
     """Called in background thread when face has been gone for _GOODBYE_DELAY seconds."""
-    global _session_active, _last_known_identity, _last_trigger_ts, _greeted
+    global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
     logger.info("[DETECTION] Face gone — ending session")
     _post("/session/end")
     _session_active      = False
     _last_known_identity = ""
+    _last_known_face_id  = ""
     _last_trigger_ts     = 0.0
     _greeted             = False   # reset so next visitor gets greeting
+
+
+# NEW ─── Mid-session deletion check ────────────────────────────────────────────
+def _recheck_session_face_background():
+    """
+    Runs in a background thread while a session is active. Re-fetches /faces/all
+    and, if the current visitor's face_id is no longer present (i.e. they hit
+    Delete My Data while still standing in frame), force-ends the session
+    immediately instead of waiting for them to walk away + restart detection.py.
+    """
+    global _rechecking_session, _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
+
+    try:
+        if not _last_known_face_id:
+            # Guest / unsaved visitor — nothing to verify against
+            return
+
+        fresh_faces     = _load_known_faces()
+        still_exists    = any(f.get("face_id") == _last_known_face_id for f in fresh_faces)
+
+        if not still_exists:
+            logger.info(
+                f"[DETECTION] Active session's face_id={_last_known_face_id} "
+                f"no longer in DB (deleted) — ending session early"
+            )
+            _post("/session/end")
+            _session_active      = False
+            _last_known_identity = ""
+            _last_known_face_id  = ""
+            _last_trigger_ts     = 0.0
+            _greeted             = False
+    except Exception as e:
+        logger.error(f"[DETECTION] _recheck_session_face_background error: {e}")
+    finally:
+        _rechecking_session = False
 
 
 # ─── Background: recognition (non-blocking) ───────────────────────────────────
@@ -259,7 +301,7 @@ def _handle_recognition_background(face_crop: np.ndarray):
     No match  → fall through to unknown visitor flow.
     """
     global _recognizing, _asking_name, _known_faces_cache
-    global _last_known_identity, _last_trigger_ts, _session_active
+    global _last_known_identity, _last_known_face_id, _last_trigger_ts, _session_active
 
     try:
         # ── Always reload cache fresh before matching ─────────────────────────
@@ -271,6 +313,7 @@ def _handle_recognition_background(face_crop: np.ndarray):
 
         if verified and name:
             _last_known_identity = name
+            _last_known_face_id  = face_id
             _last_trigger_ts     = time.time()
             _session_active      = True
 
@@ -287,6 +330,7 @@ def _handle_recognition_background(face_crop: np.ndarray):
         else:
             # Unknown — hand off to name-asking flow
             _last_known_identity = ""
+            _last_known_face_id  = ""
             _last_trigger_ts     = time.time()
             _asking_name         = True
             _handle_unknown_visitor(face_crop)
@@ -304,7 +348,7 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
     Polls for visitor name entered on frontend, then registers face + starts session.
     Runs inside the already-backgrounded recognition thread — no extra thread needed.
     """
-    global _asking_name, _known_faces_cache, _last_known_identity, _last_trigger_ts, _session_active
+    global _asking_name, _known_faces_cache, _last_known_identity, _last_known_face_id, _last_trigger_ts, _session_active
     try:
         r = _post("/visitor/unknown")
         if not r or r.status_code != 200:
@@ -345,6 +389,7 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
                     logger.info(f"[DETECTION] Face registered: {visitor_name}")
                     _known_faces_cache   = _load_known_faces()
                     _last_known_identity = visitor_name
+                    _last_known_face_id  = new_face_id
                 else:
                     logger.warning(f"[DETECTION] /faces/register failed: {resp}")
             else:
@@ -372,6 +417,7 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
 def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) -> DetectionResult:
     global _asking_name, _recognizing, _last_trigger_ts, _known_faces_cache, _last_known_identity
     global _face_first_seen_ts, _face_present_last, _face_gone_ts, _session_active, _greeted
+    global _last_session_recheck_ts, _rechecking_session
 
     try:
         frame = _decode_frame(frame_data)
@@ -431,9 +477,18 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
         result.identity = "Identifying..."
         return result
 
-    # ─── Session active — lock to this person, skip all recognition ──────────
+    # ─── Session active — lock to this person, skip recognition ──────────────
     if _session_active:
-        if _last_known_identity:
+        # NEW — throttled background check that the active visitor's face_id
+        # hasn't just been deleted (e.g. Delete My Data while still in frame).
+        if (not _rechecking_session
+                and _last_known_face_id
+                and (now - _last_session_recheck_ts) >= _SESSION_RECHECK_INTERVAL):
+            _last_session_recheck_ts = now
+            _rechecking_session      = True
+            threading.Thread(target=_recheck_session_face_background, daemon=True).start()
+
+        if _session_active and _last_known_identity:
             result.identity = _last_known_identity
             result.verified = True
         return result
