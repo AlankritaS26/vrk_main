@@ -551,7 +551,7 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
             async function makeRequest(url, method, body = null) {{
                 const headers = {{
                     "Content-Type": "application/json",
-                    "Authorization": "Basic " + btoa("admin:123456")
+                    "Authorization": "Basic " + btoa("admin:111111")
                 }};
                 
                 const config = {{ method, headers }};
