@@ -83,7 +83,7 @@ db = mongo_client.rnsit_db if mongo_client else None
 # --- SECURITY GATE CONFIGURATION ---
 security = HTTPBasic()
 ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "123456"
+ADMIN_PASSWORD = "111111"
 
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
     correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
