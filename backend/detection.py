@@ -85,6 +85,7 @@ _session_active: bool  = False
 _last_session_recheck_ts: float = 0.0
 _rechecking_session:      bool  = False
 _session_anchor_embedding: Optional[list] = None  # anchor live embedding captured at session start
+_consecutive_mismatches:   int = 0  # NEW — Tracks consecutive face-swap failures to prevent false quick triggers
 
 # Lock so only one background recognition/unknown-handler runs at a time
 _pipeline_lock = threading.Lock()
@@ -224,6 +225,8 @@ def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResu
 
 def extract_embedding(face_crop: np.ndarray) -> Optional[list]:
     try:
+        if face_crop is None or face_crop.size == 0:
+            return None
         _, enc  = cv2.imencode(".jpg", face_crop)
         img_arr = cv2.imdecode(enc, cv2.IMREAD_COLOR)
         res = DeepFace.represent(
@@ -277,7 +280,7 @@ def recognize_face(face_crop: np.ndarray, known_faces: list) -> tuple:
 def _end_session_background():
     """Called to clean up and officially close a session."""
     global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
-    global _session_anchor_embedding
+    global _session_anchor_embedding, _consecutive_mismatches
     logger.info("[DETECTION] Ending active session.")
     _post("/session/end")
     _session_active           = False
@@ -286,6 +289,7 @@ def _end_session_background():
     _last_trigger_ts          = 0.0
     _greeted                  = False
     _session_anchor_embedding = None
+    _consecutive_mismatches   = 0
 
 
 # ─── Mid-session identity check (Instant termination on user swap) ───────────
@@ -298,36 +302,42 @@ def _recheck_session_face_background(face_crop: np.ndarray):
     """
     global _rechecking_session, _session_active, _last_known_identity, _last_known_face_id
     global _last_trigger_ts, _greeted, _known_faces_cache, _session_anchor_embedding
+    global _consecutive_mismatches
 
     try:
         if not _last_known_face_id and _session_anchor_embedding is None:
             return
 
+        # 1. Identity Continuity check (Instant swap detection)
+        # Evaluated instantly BEFORE doing blocking remote DB updates to handle immediate drift
+        if _session_anchor_embedding is not None:
+            probe_emb = extract_embedding(face_crop)
+            if probe_emb is not None:
+                sim = _cosine_similarity(probe_emb, _session_anchor_embedding)
+                still_same = sim >= (1.0 - SESSION_CONTINUITY_THRESHOLD)
+
+                if not still_same:
+                    _consecutive_mismatches += 1
+                    logger.warning(f"[DETECTION] Identity match alert ({_consecutive_mismatches}/3 consecutive anomalies). Sim={sim:.4f}")
+                    
+                    if _consecutive_mismatches >= 3:
+                        logger.info(f"[DETECTION] Face swap verified! Terminating session.")
+                        _end_session_background()
+                        return
+                else:
+                    # Reset counter immediately upon returning to valid frame readings
+                    _consecutive_mismatches = 0
+
+        # 2. Deterministic Deletion check
         fresh_faces        = _load_known_faces()
         _known_faces_cache = fresh_faces
 
-        # 1. Deterministic Deletion check
         if _last_known_face_id:
             still_exists = any(f.get("face_id") == _last_known_face_id for f in fresh_faces)
             if not still_exists:
                 logger.info(f"[DETECTION] Active face_id={_last_known_face_id} deleted — ending session immediately")
                 _end_session_background()
                 return
-
-        # 2. Identity Continuity check (Instant swap detection)
-        if _session_anchor_embedding is None:
-            return
-
-        probe_emb = extract_embedding(face_crop)
-        if probe_emb is None:
-            return  # Skip bad frames without penalizing
-
-        sim        = _cosine_similarity(probe_emb, _session_anchor_embedding)
-        still_same = sim >= (1.0 - SESSION_CONTINUITY_THRESHOLD)
-
-        if not still_same:
-            logger.info(f"[DETECTION] Face swap detected (similarity={sim:.4f})! Ending session immediately.")
-            _end_session_background()
 
     except Exception as e:
         logger.error(f"[DETECTION] _recheck_session_face_background error: {e}")
@@ -485,8 +495,6 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
     _face_present_last = True
 
     # ─── Bystander/Crowd Filter (NEW) ────────────────────────────────────────
-    # If multiple faces are detected, do not display the session owner's identity.
-    # Show "Identifying..." or "Unknown" to protect the interaction session.
     if result.multiple_faces:
         result.identity = "Unknown"
         result.verified = False
