@@ -59,16 +59,16 @@ COSINE_THRESHOLD  = 0.30
 
 # ─── Tunable constants ────────────────────────────────────────────────────────
 _COOLDOWN:       float = 120.0  # seconds before same person can retrigger
-_DWELL_REQUIRED: float = 0.8    # seconds face must be present before triggering  # CHANGED was 2.0 — cut passerby-filter lag
+_DWELL_REQUIRED: float = 0.8    # seconds face must be present before triggering
 _GOODBYE_DELAY:  float = 3.0    # seconds face must be ABSENT before ending session
-_SESSION_RECHECK_INTERVAL: float = 5.0  # NEW — how often to verify active session's face_id still exists
+_SESSION_RECHECK_INTERVAL: float = 5.0  # how often to verify active session's face_id still exists
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 _asking_name:         bool  = False
 _recognizing:         bool  = False   # background recognition in-flight
 _last_trigger_ts:     float = 0.0
 _last_known_identity: str   = ""
-_last_known_face_id:  str   = ""      # NEW — needed to check deletion mid-session
+_last_known_face_id:  str   = ""      # needed to check deletion mid-session
 _known_faces_cache:   list  = []
 _greeted:             bool  = False   # welcome greeting played this session
 
@@ -80,7 +80,7 @@ _face_present_last:  bool  = False
 _face_gone_ts:   float = 0.0
 _session_active: bool  = False
 
-# NEW — throttle + in-flight guard for the mid-session deletion check
+# Throttle + in-flight guard for the mid-session deletion check
 _last_session_recheck_ts: float = 0.0
 _rechecking_session:      bool  = False
 
@@ -101,11 +101,11 @@ class DetectionResult:
     present:       bool
     bbox:          Optional[BoundingBox]
     face_crop:     Optional[np.ndarray]
-    identity:      Optional[str]        = None
-    verified:      bool                 = False
-    confidence:    float                = 0.0
+    identity:      Optional[str]                 = None
+    verified:      bool                          = False
+    confidence:    float                         = 0.0
     landmarks_img: Optional[np.ndarray] = None
-    error:         Optional[str]        = None
+    error:         Optional[str]                 = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -257,7 +257,7 @@ def _end_session_background():
     _greeted             = False   # reset so next visitor gets greeting
 
 
-# NEW ─── Mid-session deletion check ────────────────────────────────────────────
+# ─── Mid-session deletion check ────────────────────────────────────────────
 def _recheck_session_face_background():
     """
     Runs in a background thread while a session is active. Re-fetches /faces/all
@@ -305,7 +305,6 @@ def _handle_recognition_background(face_crop: np.ndarray):
 
     try:
         # ── Always reload cache fresh before matching ─────────────────────────
-        # This is the fix for delete-not-working: deleted face won't be in fresh cache
         fresh_faces = _load_known_faces()
         _known_faces_cache = fresh_faces
 
@@ -317,12 +316,12 @@ def _handle_recognition_background(face_crop: np.ndarray):
             _last_trigger_ts     = time.time()
             _session_active      = True
 
-            _post("/session/start", params={
-                "user_name":    name,
+            # Trigger greet orchestrator for matching users
+            _post("/visitor/greet", json={
                 "face_id":      face_id,
+                "name":         name,
                 "is_returning": True,
                 "visit_count":  1,
-                "trigger":      "camera",
             })
             _post("/faces/visit", params={"face_id": face_id})
             logger.info(f"[DETECTION] Returning visitor: {name} (sim={confidence})")
@@ -376,7 +375,7 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
 
         logger.info(f"[DETECTION] Name received: '{visitor_name}' save={save_face}")
 
-        # ★ Save face FIRST so face_id exists before session references it
+        # Save face FIRST so face_id exists before session references it
         if save_face and visitor_name not in ("Guest", ""):
             embedding = extract_embedding(face_crop)
             if embedding:
@@ -395,13 +394,12 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
             else:
                 logger.warning("[DETECTION] Embedding failed — face not saved")
 
-        # ★ Start session AFTER face is saved
-        _post("/session/start", params={
-            "user_name":    visitor_name,
+        # Let greet block finalize routing session updates to frontend WS layers
+        _post("/visitor/greet", json={
             "face_id":      new_face_id if (save_face and visitor_name not in ("Guest", "")) else "",
+            "name":         visitor_name,
             "is_returning": False,
             "visit_count":  1,
-            "trigger":      "camera",
         })
         _session_active = True
 
@@ -457,13 +455,23 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
         return result
 
     # ─── Voice greeting — once per visitor arrival ────────────────────────────
+    # Fixed: Sends structured biometric payload context instead of raw text strings
     if not _greeted and not _session_active and not _asking_name and not _recognizing:
         _greeted = True
-        greeting = "Hello! Welcome to RNSIT Kiosk. Please say your name, or say Guest to continue."
+        
+        payload = {
+            "face_id": _last_known_face_id if _last_known_identity else "",
+            "name": _last_known_identity if _last_known_identity else "Unknown",
+            "is_returning": True if _last_known_identity else False,
+            "visit_count": 1
+        }
+        
+        logger.info(f"[PIPELINE] Offloading initial presence greeting payload to backend: {payload['name']}")
         threading.Thread(
-            target=lambda: _post("/visitor/greet", json={"text": greeting}),
+            target=lambda: _post("/visitor/greet", json=payload),
             daemon=True,
         ).start()
+        
         result.identity = "..."
         return result
 
@@ -479,8 +487,6 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
 
     # ─── Session active — lock to this person, skip recognition ──────────────
     if _session_active:
-        # NEW — throttled background check that the active visitor's face_id
-        # hasn't just been deleted (e.g. Delete My Data while still in frame).
         if (not _rechecking_session
                 and _last_known_face_id
                 and (now - _last_session_recheck_ts) >= _SESSION_RECHECK_INTERVAL):
