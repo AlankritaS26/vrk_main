@@ -2,7 +2,7 @@
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
-    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
 """
 
 import os
@@ -183,13 +183,22 @@ origins_raw = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [origin.strip() for origin in origins_raw.split(",") if origin.strip()]
 
 # 2. Add the middleware with the processed list
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=True,  # ALLOWED_ORIGINS is explicitly parsed as a list of real domains, you can safely set this to True 
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if not ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=".*",
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 
 # ==========================================
