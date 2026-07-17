@@ -2,7 +2,7 @@
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
-    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 """
 
 import os

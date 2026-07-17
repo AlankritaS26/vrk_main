@@ -166,7 +166,7 @@ def shutdown(*_):
         except Exception:
             pass
     # sweep anything that survived (npm spawns child node processes)
-    for port in (8000, 3000):
+    for port in (8001, 3000):
         for pid in pids_on_port(port):
             if process_name(pid) in KILLABLE:
                 kill_pid(pid)
@@ -180,14 +180,14 @@ def main():
     os.system("")                          # enable ANSI colors on Windows
 
     say("RUN", "Checking ports...")
-    if not free_port(8000, "backend"):
+    if not free_port(8001, "backend"):
         sys.exit(1)
     if not free_port(3000, "frontend"):
         sys.exit(1)
 
     say("RUN", "Starting backend...")
     start("BACKEND", [PY, "-m", "uvicorn", "backend.main:app",
-                      "--host", "127.0.0.1", "--port", "8000"])
+                      "--host", "127.0.0.1", "--port", "8001"])
 
     say("RUN", "Waiting for backend health (models loading — first boot takes longer)...")
     if not wait_for_backend():

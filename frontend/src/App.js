@@ -4,7 +4,7 @@ import WelcomeScreen from './WelcomeScreen';
 import GoodbyeScreen from './GoodbyeScreen';
 import './index.css';
 
-const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8000';
+const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
 export default function App() {
   const [screen,      setScreen]      = useState('idle');
