@@ -4,7 +4,7 @@ VRK Kiosk — one-command launcher (self-healing).
     venv\\Scripts\\python.exe run.py
 
 Starts, in one terminal with prefixed logs:
-  [BACKEND]   uvicorn backend.main:app     (port 8000)
+  [BACKEND]   uvicorn backend.main:app     (port 8001)
   [DETECT]    backend.detection            (only after backend is healthy)
   [FRONTEND]  npm start                    (./frontend, port 3000)
 
@@ -27,7 +27,7 @@ import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable                       # the venv python that launched us
-BACKEND_URL = "http://127.0.0.1:8000"
+BACKEND_URL = "http://127.0.0.1:8001"
 
 # process names we are allowed to auto-kill when they squat on our ports
 KILLABLE = {"python.exe", "pythonw.exe", "uvicorn.exe", "node.exe"}

@@ -33,14 +33,14 @@ First-time setup (fresh machine): see **docs/SETUP.md**. Summary: Python
 - **Kiosk-initiated conversation** — detection spots a visitor and the kiosk
   greets them by voice first (greeting audio is pre-cached per visitor for a
   sub-second start). Returning visitors are greeted by name.
-- **Speech-to-text (EP-03)** — Silero VAD in the browser segments speech;
+- **Speech-to-text** — Silero VAD in the browser segments speech;
   raw 16 kHz PCM streams to faster-whisper (`small.en` int8 on CPU dev,
   `large-v3-turbo` CUDA in production) with a bandpass + energy-gate DSP
   chain for lobby noise.
 - **Answer engine** — guardrails → RAG over the college knowledge base
   (Gemini embeddings + generation, MongoDB source, Redis hot cache). The
   query-condense step is skipped on early turns to save a network round-trip.
-- **Text-to-speech (EP-04)** — Kokoro-82M (`af_bella`, 1.05× pace) with:
+- **Text-to-speech** — Kokoro-82M (`af_bella`, 1.05× pace) with:
   silence-trimmed clips, ~2-sentence chunking, two-chunk prefetch, gapless
   Web Audio playback, per-sentence response cache, punctuation
   normalization (curly quotes/dashes), and browser-voice fallback so the
