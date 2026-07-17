@@ -9,7 +9,7 @@ from database import get_db_connection
 
 load_dotenv()
 
-BACKEND = os.getenv('BACKEND_URL', 'http://127.0.0.1:8000')
+BACKEND = os.getenv('BACKEND_URL', 'http://127.0.0.1:8001')
 
 def get_current_session():
     try:
