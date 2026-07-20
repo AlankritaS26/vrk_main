@@ -62,7 +62,8 @@ _DWELL_REQUIRED: float = 0.8    # seconds face must be present before triggering
 _GOODBYE_DELAY:  float = 3.0    # seconds face must be ABSENT before ending session
 _SESSION_RECHECK_INTERVAL: float = 1.0  # check active identity more frequently for fast swaps
 SESSION_CONTINUITY_THRESHOLD: float = 0.40  # loose threshold for frame-to-frame consistency
-_POST_SESSION_LOCKOUT: float = 8.0  # Seconds to block automatic re-greetings/re-auth after session drops
+_POST_SESSION_LOCKOUT: float = 0.0  # allow the next visitor to be re-identified immediately after session end
+_SWAP_MISMATCH_LIMIT: int = 3  # consecutive mismatched frames required before ending a session (debounce)
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 _asking_name:         bool  = False
@@ -86,6 +87,7 @@ _last_session_end_ts: float = 0.0  # Tracks absolute termination window epoch ti
 _last_session_recheck_ts: float = 0.0
 _rechecking_session:      bool  = False
 _session_anchor_embedding: Optional[list] = None  # anchor live embedding captured at session start
+_swap_mismatch_count:     int   = 0  # consecutive continuity mismatches seen this session (debounce counter)
 
 # Lock so only one background recognition/unknown-handler runs at a time
 _pipeline_lock = threading.Lock()
@@ -276,31 +278,83 @@ def recognize_face(face_crop: np.ndarray, known_faces: list) -> tuple:
 
 # ─── Goodbye & Cleanup ────────────────────────────────────────────────────────
 
-def _end_session_background():
-    """Called to clean up and officially close a session."""
+def _reset_local_session_state():
     global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
-    global _session_anchor_embedding, _last_session_end_ts
-    logger.info("[DETECTION] Ending active session.")
-    _post("/session/end")
+    global _session_anchor_embedding, _last_session_end_ts, _swap_mismatch_count
+    global _asking_name, _recognizing, _face_first_seen_ts, _face_present_last, _face_gone_ts
+    global _last_session_recheck_ts, _rechecking_session
     _session_active           = False
     _last_known_identity      = ""
     _last_known_face_id       = ""
     _last_trigger_ts          = 0.0
     _greeted                  = False
+    _asking_name              = False
+    _recognizing              = False
+    _face_first_seen_ts       = 0.0
+    _face_present_last        = False
+    _face_gone_ts             = 0.0
     _session_anchor_embedding = None
-    _last_session_end_ts      = time.time()  # Lock authorization loops immediately
+    _last_session_recheck_ts  = 0.0
+    _rechecking_session       = False
+    _last_session_end_ts      = time.time()
+    _swap_mismatch_count      = 0
 
 
-# ─── Mid-session identity check (Instant termination on user swap) ───────────
+def _sync_local_session_state_with_backend():
+    """If the backend already ended the session, clear the detector's stale local state."""
+    global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
+    global _session_anchor_embedding, _last_session_recheck_ts, _rechecking_session, _swap_mismatch_count
+    global _asking_name, _recognizing, _face_first_seen_ts, _face_present_last, _face_gone_ts, _last_session_end_ts
+
+    try:
+        r = _get("/session/current")
+        if not r or r.status_code != 200:
+            return False
+
+        data = r.json() or {}
+        backend_active = bool(data.get("active"))
+        if backend_active:
+            return False
+
+        if (_session_active or _last_known_identity or _last_known_face_id or _asking_name
+                or _recognizing or _greeted or _last_session_recheck_ts > 0.0
+                or _session_anchor_embedding is not None):
+            logger.info("[DETECTION] Backend session inactive; resetting local face state for next visitor")
+            _reset_local_session_state()
+            return True
+    except Exception as e:
+        logger.warning(f"[DETECTION] Could not sync session state with backend: {e}")
+    return False
+
+
+def _end_session_background():
+    """Called to clean up and officially close a session."""
+    global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
+    global _session_anchor_embedding, _last_session_end_ts, _swap_mismatch_count
+    global _asking_name, _recognizing, _face_first_seen_ts, _face_present_last, _face_gone_ts
+    global _last_session_recheck_ts, _rechecking_session
+    logger.info("[DETECTION] Ending active session.")
+    _post("/session/end")
+    _reset_local_session_state()
+
+
+# ─── Mid-session identity check (Debounced termination on user swap) ─────────
 
 def _recheck_session_face_background(face_crop: np.ndarray):
     """
     Runs in a background thread while a session is active.
-    If the current primary face does not match the active session user,
-    or if the face has been deleted, it immediately ends the session.
+    If the current primary face has been deleted from the DB, the session
+    ends immediately (deterministic — no ambiguity there).
+    If the current primary face does not match the active session's anchor
+    embedding, we require several CONSECUTIVE mismatched frames before
+    ending the session. This prevents single noisy frames (e.g. talking,
+    turning the head, motion blur) from tanking the embedding similarity
+    and causing a false termination mid-conversation. Any single matching
+    frame resets the counter back to zero.
     """
     global _rechecking_session, _session_active, _last_known_identity, _last_known_face_id
     global _last_trigger_ts, _greeted, _known_faces_cache, _session_anchor_embedding
+    global _swap_mismatch_count
 
     try:
         if not _last_known_face_id and _session_anchor_embedding is None:
@@ -309,7 +363,7 @@ def _recheck_session_face_background(face_crop: np.ndarray):
         fresh_faces        = _load_known_faces()
         _known_faces_cache = fresh_faces
 
-        # 1. Deterministic Deletion check
+        # 1. Deterministic Deletion check — always instant, no debounce needed
         if _last_known_face_id:
             still_exists = any(f.get("face_id") == _last_known_face_id for f in fresh_faces)
             if not still_exists:
@@ -317,7 +371,7 @@ def _recheck_session_face_background(face_crop: np.ndarray):
                 _end_session_background()
                 return
 
-        # 2. Identity Continuity check (Instant swap detection)
+        # 2. Identity Continuity check (debounced swap detection)
         if _session_anchor_embedding is None:
             return
 
@@ -329,8 +383,21 @@ def _recheck_session_face_background(face_crop: np.ndarray):
         still_same = sim >= (1.0 - SESSION_CONTINUITY_THRESHOLD)
 
         if not still_same:
-            logger.info(f"[DETECTION] Face swap detected (similarity={sim:.4f})! Ending session immediately.")
-            _end_session_background()
+            _swap_mismatch_count += 1
+            logger.info(
+                f"[DETECTION] Continuity mismatch {_swap_mismatch_count}/{_SWAP_MISMATCH_LIMIT} "
+                f"(similarity={sim:.4f})"
+            )
+            if _swap_mismatch_count >= _SWAP_MISMATCH_LIMIT:
+                logger.info(
+                    f"[DETECTION] Face swap confirmed after {_SWAP_MISMATCH_LIMIT} consecutive "
+                    f"mismatches — ending session immediately."
+                )
+                _end_session_background()
+        else:
+            if _swap_mismatch_count:
+                logger.info("[DETECTION] Continuity match recovered — resetting mismatch counter")
+            _swap_mismatch_count = 0
 
     except Exception as e:
         logger.error(f"[DETECTION] _recheck_session_face_background error: {e}")
@@ -343,7 +410,7 @@ def _recheck_session_face_background(face_crop: np.ndarray):
 def _handle_recognition_background(face_crop: np.ndarray):
     global _recognizing, _asking_name, _known_faces_cache
     global _last_known_identity, _last_known_face_id, _last_trigger_ts, _session_active
-    global _last_session_recheck_ts, _session_anchor_embedding
+    global _last_session_recheck_ts, _session_anchor_embedding, _swap_mismatch_count
 
     try:
         fresh_faces = _load_known_faces()
@@ -358,6 +425,7 @@ def _handle_recognition_background(face_crop: np.ndarray):
             _session_active           = True
             _last_session_recheck_ts  = time.time()
             _session_anchor_embedding = probe_emb
+            _swap_mismatch_count      = 0  # fresh session — reset debounce counter
 
             _post("/session/start", params={
                 "user_name":    name,
@@ -384,7 +452,7 @@ def _handle_recognition_background(face_crop: np.ndarray):
 
 def _handle_unknown_visitor(face_crop: np.ndarray):
     global _asking_name, _known_faces_cache, _last_known_identity, _last_known_face_id, _last_trigger_ts, _session_active
-    global _last_session_recheck_ts, _session_anchor_embedding
+    global _last_session_recheck_ts, _session_anchor_embedding, _swap_mismatch_count
     try:
         r = _post("/visitor/unknown")
         if not r or r.status_code != 200:
@@ -441,6 +509,7 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
         _session_active           = True
         _last_session_recheck_ts  = time.time()
         _session_anchor_embedding = embedding
+        _swap_mismatch_count      = 0  # fresh session — reset debounce counter
 
     except Exception as e:
         logger.error(f"[DETECTION] _handle_unknown_visitor error: {e}")
@@ -461,6 +530,7 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
     except Exception as e:
         return DetectionResult(present=False, bbox=None, face_crop=None, error=str(e))
 
+    _sync_local_session_state_with_backend()
     now = time.time()
     
     # Process core visibility presence tracking normally so state variables match frames perfectly
@@ -489,13 +559,9 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
 
     _face_present_last = True
 
-    # ─── Post-Session Lockout Hook ───────────────────────────────────────────
-    # If a session just closed, keep drawing boxes and tracking frames, but completely 
-    # block the backend recognition loop, DB calls, and greetings from restarting.
-    if (now - _last_session_end_ts) < _POST_SESSION_LOCKOUT:
-        result.identity = "Clearing Session..."
-        result.verified = False
-        return result
+    # ─── Session teardown reset ─────────────────────────────────────────────
+    # Allow the next visitor to be detected immediately after the goodbye
+    # transition by clearing the prior session state above.
 
     # ─── Bystander/Crowd Filter ──────────────────────────────────────────────
     if result.multiple_faces:
