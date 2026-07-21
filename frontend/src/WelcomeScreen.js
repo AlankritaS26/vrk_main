@@ -66,11 +66,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isReturning = session?.is_returning || false;
   const visitCount  = session?.visit_count  || 1;
 
-  const greeting = isReturning
-    ? visitCount > 2
-      ? 'Welcome back, ' + visitorName + '! Great to see you again.'
-      : 'Welcome back, ' + visitorName + '!'
-    : 'Welcome, ' + visitorName + '! How may I assist you today?';
+  // The backend composes the greeting (it knows resume-vs-new and the
+  // institute intro line); these local strings are only a fallback.
+  const greeting = session?.greeting || (isReturning
+    ? (visitCount > 2
+        ? 'Welcome back, ' + visitorName + '! Great to see you again. How may I assist you today?'
+        : 'Welcome back, ' + visitorName + '! How may I assist you today?')
+    : 'Welcome, ' + visitorName + '! I am the digital receptionist of R N S Institute of Technology. '
+      + 'I can help you with admissions, departments, placements, fees, and directions. '
+      + 'How may I assist you today?');
 
   useEffect(() => { statusRef.current = status; }, [status]);
 
@@ -441,8 +445,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   useEffect(() => {
     if (askingName) return;
     const sid = session?.session_id;
-    if (!sid || greetedRef.current === sid) return;
-    greetedRef.current = sid;
+    // Day-2 resume reuses the SAME session_id, so key the guard on the
+    // visit instant too — otherwise a resumed visitor is never greeted.
+    const visitKey = sid ? sid + '|' + (session?.resumed_at || '') : null;
+    if (!visitKey || greetedRef.current === visitKey) return;
+    greetedRef.current = visitKey;
 
     // Even if the session id churns (detection re-firing), never repeat
     // the same greeting within 20s — kills the double "welcome back"
@@ -462,7 +469,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       speak(greeting, () => addMessage(greeting, 'kiosk'));
     }, 250);
     return () => clearTimeout(t);
-  }, [session?.session_id, askingName]);
+  }, [session?.session_id, session?.resumed_at, askingName]);
 
   const handleSubmitName = async (overrideName, overrideSave) => {
     const finalName = (overrideName ?? name).trim() || 'Guest';
@@ -536,12 +543,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       </header>
 
-      {!askingName && (
-        <div style={{ background: 'linear-gradient(90deg, #1a237e, #283593)', color: '#fff', padding: '11px 32px', fontSize: '14px', fontWeight: '500', display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#90caf9" strokeWidth="2"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
-          {greeting}
-        </div>
-      )}
+      {/* The greeting is SPOKEN, not printed. It also appears as the first
+          chat bubble via speak(greeting, () => addMessage(...)), so showing
+          it again in a banner was duplicate clutter. */}
 
       {deleteMode && (
         <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}

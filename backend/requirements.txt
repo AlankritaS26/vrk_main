@@ -36,3 +36,15 @@ mediapipe==0.10.35
 # ── Data layer ──
 motor==3.7.1                     # async MongoDB (brings pymongo + dnspython itself)
 redis==7.4.0
+
+# ── Face recognition: SCRFD + ArcFace (buffalo_l ONNX) ──────────────
+# Run directly on onnxruntime by backend/recognition.py. We deliberately do
+# NOT install the `insightface` package: it compiles a Cython 3D-mesh module
+# we never use and therefore demands MS C++ Build Tools on Windows.
+# onnxruntime ships prebuilt wheels for Windows/Linux/macOS — no compiler.
+onnxruntime==1.20.1
+
+# Legacy fallback engine — safe to remove once InsightFace is verified
+# working on every machine (dropping these also removes TensorFlow,
+# ~350 MB, and the tf-keras/GL headaches on Linux/WSL):
+#   deepface, tf-keras

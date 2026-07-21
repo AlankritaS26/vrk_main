@@ -9,7 +9,7 @@ Starts, in one terminal with prefixed logs:
   [FRONTEND]  npm start                    (./frontend, port 3000)
 
 Self-healing:
-  * If ports 8000/3000 are held by a STALE python/node process from a
+  * If ports 8001/3000 are held by a STALE python/node process from a
     previous run, it is killed automatically — no manual taskkill.
   * If a port is held by some unrelated program, we refuse (safely) and
     tell you which program it is.

@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 
@@ -37,7 +37,9 @@ async def get_kiosk_data():
 # SESSION MANAGEMENT (Replaces PostgreSQL tables)
 # ==========================================
 
-async def save_session(session_id: str, face_id: str | None, user_name: str, is_returning: bool, visit_count: int):
+async def save_session(session_id: str, face_id: str | None, user_name: str,
+                       is_returning: bool, visit_count: int,
+                       continued_from: str | None = None):
     """
     Saves or logs a kiosk session. 
     MongoDB handles creating the session record dynamically without a strict schema definition.
@@ -52,7 +54,8 @@ async def save_session(session_id: str, face_id: str | None, user_name: str, is_
                     "is_returning": is_returning,
                     "visit_count": visit_count,
                     "is_active": True,
-                    "last_activity": datetime.now().isoformat()
+                    "last_activity": datetime.now().isoformat(),
+                    **({"continued_from": continued_from} if continued_from else {}),
                 },
                 "$setOnInsert": {
                     "started_at": datetime.now().isoformat()
@@ -80,7 +83,8 @@ async def save_interaction(session_id: str, question: str, answer: str):
 # BIOMETRICS & FACE RETRIEVAL HANDLERS
 # ==========================================
 
-async def save_face_encoding(face_id: str, name: str, encoding: list):
+async def save_face_encoding(face_id: str, name: str, encoding: list,
+                             encodings: list | None = None):
     """Saves or updates a biometric profile mapping vector representations directly."""
     try:
         await faces_collection.update_one(
@@ -89,6 +93,7 @@ async def save_face_encoding(face_id: str, name: str, encoding: list):
                 "$set": {
                     "name": name,
                     "encoding": encoding,
+                    "encodings": (encodings or [encoding]),
                     "last_seen": datetime.now().isoformat()
                 },
                 "$setOnInsert": {
@@ -153,3 +158,60 @@ async def delete_face_by_name(name: str):
     except Exception as e:
         logger.error(f"MongoDB Error deleting faces for '{name}': {e}")
         return []
+
+
+# ==========================================
+# SESSION CONTINUITY (30-day resume)
+# ==========================================
+
+async def find_recent_session_by_face(face_id: str, days: int = 30):
+    """
+    Most recent session for this PERSON within `days`.
+    This is what makes a returning visitor continue their existing
+    session_id instead of getting a brand-new one. Mongo is the source
+    of truth here; Redis (if present) is only ever a cache in front.
+    """
+    if not face_id:
+        return None
+    try:
+        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        return await sessions_collection.find_one(
+            {"face_id": face_id, "last_activity": {"$gte": cutoff}},
+            sort=[("last_activity", -1)],
+        )
+    except Exception as e:
+        logger.error(f"[DB] find_recent_session_by_face failed: {e}")
+        return None
+
+
+async def touch_session(session_id: str):
+    """Bump last_activity so the 30-day window is measured from real use."""
+    try:
+        await sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"last_activity": datetime.now().isoformat()}},
+        )
+    except Exception as e:
+        logger.error(f"[DB] touch_session failed: {e}")
+
+
+async def deactivate_session(session_id: str):
+    try:
+        await sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"is_active": False,
+                      "last_activity": datetime.now().isoformat()}},
+        )
+    except Exception as e:
+        logger.error(f"[DB] deactivate_session failed: {e}")
+
+
+async def ensure_indexes():
+    """Called once at startup — keeps face/session lookups fast."""
+    try:
+        await faces_collection.create_index("face_id", unique=True)
+        await sessions_collection.create_index("session_id", unique=True)
+        await sessions_collection.create_index([("face_id", 1), ("last_activity", -1)])
+        logger.info("[DB] Indexes ensured.")
+    except Exception as e:
+        logger.warning(f"[DB] ensure_indexes: {e}")
