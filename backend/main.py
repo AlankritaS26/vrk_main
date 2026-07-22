@@ -1,4 +1,4 @@
-"""
+﻿"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
