@@ -40,7 +40,9 @@ def _ensure_model():
 
 _ensure_model()
 
-# ─── MediaPipe FaceLandmarker (Allows tracking multiple faces to prevent intrusion) ─
+# ─── MediaPipe FaceLandmarker (tracks multiple faces so bystanders can be
+#     detected AND ignored, instead of being detected and treated as a reason
+#     to stop recognizing the primary/closest visitor) ─────────────────────
 _base_opts = mp_tasks.BaseOptions(model_asset_path=_MODEL_PATH)
 _lm_opts   = mp_vision.FaceLandmarkerOptions(
     base_options=_base_opts,
@@ -57,21 +59,22 @@ DEEPFACE_MODEL    = "Facenet512"
 COSINE_THRESHOLD  = 0.30
 
 # ─── Tunable constants ────────────────────────────────────────────────────────
-_COOLDOWN:        float = 120.0  # seconds before same person can retrigger
-_DWELL_REQUIRED: float = 0.8    # seconds face must be present before triggering
-_GOODBYE_DELAY:  float = 3.0    # seconds face must be ABSENT before ending session
-_SESSION_RECHECK_INTERVAL: float = 1.0  # check active identity more frequently for fast swaps
+_COOLDOWN:                 float = 120.0  # seconds before same person can retrigger
+_DWELL_REQUIRED:           float = 0.8    # seconds face must be present before triggering
+_GOODBYE_DELAY:            float = 3.0    # seconds face must be ABSENT/SWAPPED before ending session
+_SESSION_RECHECK_INTERVAL: float = 1.0    # how often we re-check the active identity
 SESSION_CONTINUITY_THRESHOLD: float = 0.40  # loose threshold for frame-to-frame consistency
-_POST_SESSION_LOCKOUT: float = 8.0  # Seconds to block automatic re-greetings/re-auth after session drops
+_POST_SESSION_LOCKOUT:     float = 0.0    # allow the next visitor to be re-identified immediately after session end
+_SWAP_MISMATCH_LIMIT:      int   = 3      # backup: consecutive mismatched rechecks before ending a session
+_SYNC_INTERVAL:            float = 2.0    # how often we poll the backend to see if it ended our session
 
 # ─── Global state ─────────────────────────────────────────────────────────────
 _asking_name:         bool  = False
 _recognizing:         bool  = False  # background recognition in-flight
 _last_trigger_ts:      float = 0.0
 _last_known_identity: str   = ""
-_last_known_face_id:  str   = ""      
+_last_known_face_id:  str   = ""
 _known_faces_cache:    list  = []
-_greeted:              bool  = False  # welcome greeting played this session
 
 # Passerby filter
 _face_first_seen_ts: float = 0.0
@@ -82,12 +85,34 @@ _face_gone_ts:        float = 0.0
 _session_active:      bool  = False
 _last_session_end_ts: float = 0.0  # Tracks absolute termination window epoch timestamp
 
-# Throttle + in-flight guard for the mid-session deletion check
+# Throttle + in-flight guard for the mid-session identity recheck
 _last_session_recheck_ts: float = 0.0
 _rechecking_session:      bool  = False
 _session_anchor_embedding: Optional[list] = None  # anchor live embedding captured at session start
+_swap_mismatch_count:     int   = 0    # consecutive continuity mismatches seen this session (backup debounce)
+_mismatch_since_ts:       float = 0.0  # wall-clock time the FIRST mismatch was seen (primary debounce)
 
-# Lock so only one background recognition/unknown-handler runs at a time
+# What the UI/caller should currently show while a session is active.
+# Kept separate from _last_known_identity so a mismatched (e.g. a friend's)
+# face is displayed correctly instead of being mislabeled with the
+# original visitor's name until the session finally ends.
+_current_display_identity: str   = ""
+_current_display_verified: bool  = False
+_current_display_confidence: float = 0.0
+
+# Throttle for the (now background, non-blocking) backend session sync
+_last_sync_ts: float = 0.0
+_syncing:      bool  = False
+
+# Spatial continuity tracking for the "primary" face. Picking the largest
+# face fresh every single frame causes flicker when two people are close in
+# size/distance (e.g. a friend standing next to you) — one noisy frame can
+# make their face briefly "win", which then poisons the session's embedding
+# checks. Instead we track the same physical position frame-to-frame and
+# only re-lock onto "largest face" when nobody was being tracked yet.
+_primary_track_center: Optional[tuple] = None  # normalized (cx, cy) of tracked primary face
+
+# Lock so mutations of shared session state don't race across threads
 _pipeline_lock = threading.Lock()
 
 
@@ -109,7 +134,8 @@ class DetectionResult:
     confidence:     float                = 0.0
     landmarks_img: Optional[np.ndarray] = None
     error:          Optional[str]        = None
-    multiple_faces: bool                 = False  # Flag indicating if bystanders are present
+    multiple_faces: bool                 = False  # informational only — bystanders present
+    bystander_count: int                 = 0       # how many extra faces besides the primary one
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -131,6 +157,11 @@ def _get_bbox(landmarks, img_w, img_h, pad=20) -> BoundingBox:
     x2 = min(img_w, int(max(xs)) + pad)
     y2 = min(img_h, int(max(ys)) + pad)
     return BoundingBox(x=x1, y=y1, w=x2 - x1, h=y2 - y1)
+
+def _bbox_center_norm(bbox: BoundingBox, img_w, img_h) -> tuple:
+    cx = (bbox.x + bbox.w / 2) / img_w
+    cy = (bbox.y + bbox.h / 2) / img_h
+    return (cx, cy)
 
 def _draw_landmarks(frame, landmarks, img_w, img_h) -> np.ndarray:
     out = frame.copy()
@@ -179,6 +210,8 @@ def _load_known_faces() -> list:
 # ─── Step 1: Presence ─────────────────────────────────────────────────────────
 
 def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResult:
+    global _primary_track_center
+
     rgb       = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
     detection = FACE_LANDMARKER.detect(mp_image)
@@ -186,26 +219,50 @@ def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResu
     if not detection.face_landmarks:
         return DetectionResult(present=False, bbox=None, face_crop=None, multiple_faces=False)
 
-    num_detected = len(detection.face_landmarks)
-    multiple_faces = num_detected > 1
+    num_detected    = len(detection.face_landmarks)
+    multiple_faces  = num_detected > 1
+    bystander_count = max(0, num_detected - 1)
 
-    h, w      = frame.shape[:2]
-    
-    # Track the largest face (closest to the kiosk) as the primary user
-    primary_landmarks = None
-    primary_bbox = None
-    max_area = -1
+    h, w = frame.shape[:2]
 
+    candidates = []
     for landmarks in detection.face_landmarks:
-        bbox = _get_bbox(landmarks, w, h)
-        area = bbox.w * bbox.h
-        if area > max_area:
-            max_area = area
-            primary_bbox = bbox
-            primary_landmarks = landmarks
+        bbox   = _get_bbox(landmarks, w, h)
+        center = _bbox_center_norm(bbox, w, h)
+        area   = bbox.w * bbox.h
+        candidates.append((bbox, center, area))
+
+    primary_bbox   = None
+    primary_center = None
+
+    if _primary_track_center is not None:
+        # Someone is already being tracked (a session may be starting or
+        # active). Keep following the SAME physical position frame-to-frame
+        # instead of re-picking "largest face" every frame — this is what
+        # stops a nearby bystander from momentarily stealing the primary
+        # slot just because they were fractionally bigger in one frame.
+        best_dist = None
+        for bbox, center, area in candidates:
+            dist = ((center[0] - _primary_track_center[0]) ** 2
+                    + (center[1] - _primary_track_center[1]) ** 2) ** 0.5
+            if best_dist is None or dist < best_dist:
+                best_dist      = dist
+                primary_bbox   = bbox
+                primary_center = center
+    else:
+        # Nobody being tracked yet — lock onto whoever is largest/closest,
+        # i.e. treat this as a brand-new visitor initiating.
+        max_area = -1
+        for bbox, center, area in candidates:
+            if area > max_area:
+                max_area       = area
+                primary_bbox   = bbox
+                primary_center = center
+
+    _primary_track_center = primary_center
 
     face_crop = frame[primary_bbox.y : primary_bbox.y + primary_bbox.h, primary_bbox.x : primary_bbox.x + primary_bbox.w].copy()
-    
+
     # Draw landmarks on all detected faces if requested
     mesh_img = frame.copy() if draw_mesh else None
     if draw_mesh:
@@ -213,11 +270,12 @@ def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResu
             mesh_img = _draw_landmarks(mesh_img, landmarks, w, h)
 
     return DetectionResult(
-        present=True, 
-        bbox=primary_bbox, 
-        face_crop=face_crop, 
+        present=True,
+        bbox=primary_bbox,
+        face_crop=face_crop,
         landmarks_img=mesh_img,
-        multiple_faces=multiple_faces
+        multiple_faces=multiple_faces,
+        bystander_count=bystander_count,
     )
 
 
@@ -276,31 +334,112 @@ def recognize_face(face_crop: np.ndarray, known_faces: list) -> tuple:
 
 # ─── Goodbye & Cleanup ────────────────────────────────────────────────────────
 
+def _reset_local_session_state():
+    global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts
+    global _session_anchor_embedding, _last_session_end_ts, _swap_mismatch_count, _mismatch_since_ts
+    global _asking_name, _recognizing, _face_first_seen_ts, _face_present_last, _face_gone_ts
+    global _last_session_recheck_ts, _rechecking_session
+    global _current_display_identity, _current_display_verified, _current_display_confidence
+    global _primary_track_center
+
+    _session_active             = False
+    _primary_track_center       = None
+    _last_known_identity        = ""
+    _last_known_face_id         = ""
+    _last_trigger_ts            = 0.0
+    _asking_name                = False
+    _recognizing                = False
+    _face_first_seen_ts         = 0.0
+    _face_present_last          = False
+    _face_gone_ts               = 0.0
+    _session_anchor_embedding   = None
+    _last_session_recheck_ts    = 0.0
+    _rechecking_session         = False
+    _last_session_end_ts        = time.time()
+    _swap_mismatch_count        = 0
+    _mismatch_since_ts          = 0.0
+    _current_display_identity   = ""
+    _current_display_verified   = False
+    _current_display_confidence = 0.0
+
+
+def _sync_local_session_state_with_backend():
+    """If the backend already ended the session, clear the detector's stale local state.
+    Runs in a background thread (throttled) — never blocks the frame loop."""
+    global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts
+    global _session_anchor_embedding, _last_session_recheck_ts, _rechecking_session, _swap_mismatch_count
+    global _asking_name, _recognizing, _face_first_seen_ts, _face_present_last, _face_gone_ts, _last_session_end_ts
+    global _syncing
+
+    try:
+        r = _get("/session/current")
+        if not r or r.status_code != 200:
+            return False
+
+        data = r.json() or {}
+        backend_active = bool(data.get("active"))
+        if backend_active:
+            return False
+
+        with _pipeline_lock:
+            # IMPORTANT: if recognition or the "ask for name" flow is
+            # currently in flight locally, the backend simply hasn't caught
+            # up yet (it only learns about a session once /session/start or
+            # /visitor/unknown actually completes, which can take a couple
+            # of seconds for embedding extraction + HTTP round trips). Do
+            # NOT treat that in-progress window as a "stale session" — doing
+            # so was cancelling recognition mid-run and immediately kicking
+            # off a duplicate, causing continuous re-loading and never
+            # actually reaching a result.
+            if _recognizing or _asking_name or _rechecking_session:
+                return False
+
+            if (_session_active or _last_known_identity or _last_known_face_id
+                    or _last_session_recheck_ts > 0.0
+                    or _session_anchor_embedding is not None):
+                logger.info("[DETECTION] Backend session inactive; resetting local face state for next visitor")
+                _reset_local_session_state()
+                return True
+    except Exception as e:
+        logger.warning(f"[DETECTION] Could not sync session state with backend: {e}")
+    finally:
+        _syncing = False
+    return False
+
+
 def _end_session_background():
     """Called to clean up and officially close a session."""
-    global _session_active, _last_known_identity, _last_known_face_id, _last_trigger_ts, _greeted
-    global _session_anchor_embedding, _last_session_end_ts
     logger.info("[DETECTION] Ending active session.")
     _post("/session/end")
-    _session_active           = False
-    _last_known_identity      = ""
-    _last_known_face_id       = ""
-    _last_trigger_ts          = 0.0
-    _greeted                  = False
-    _session_anchor_embedding = None
-    _last_session_end_ts      = time.time()  # Lock authorization loops immediately
+    with _pipeline_lock:
+        _reset_local_session_state()
 
 
-# ─── Mid-session identity check (Instant termination on user swap) ───────────
+# ─── Mid-session identity check (Debounced termination + swap identification) ─
 
 def _recheck_session_face_background(face_crop: np.ndarray):
     """
     Runs in a background thread while a session is active.
-    If the current primary face does not match the active session user,
-    or if the face has been deleted, it immediately ends the session.
+
+    - If the current primary face has been deleted from the DB, the session
+      ends immediately (deterministic — no ambiguity there).
+    - If the current primary face does not match the active session's
+      anchor embedding, we've most likely got a different person in frame
+      (e.g. a friend). We:
+        1. Try to recognize THEM against the known-faces DB so the UI shows
+           their real name (or "Unknown" if they're not registered) instead
+           of continuing to show the original visitor's name.
+        2. Start (or continue) a wall-clock timer. Once the original
+           visitor has been missing for >= _GOODBYE_DELAY seconds (~3s),
+           the session ends — regardless of whether the new face was
+           recognized or not.
+      A single matching frame (original visitor back in view) resets the
+      timer/counter back to zero.
     """
     global _rechecking_session, _session_active, _last_known_identity, _last_known_face_id
-    global _last_trigger_ts, _greeted, _known_faces_cache, _session_anchor_embedding
+    global _last_trigger_ts, _known_faces_cache, _session_anchor_embedding
+    global _swap_mismatch_count, _mismatch_since_ts
+    global _current_display_identity, _current_display_verified, _current_display_confidence
 
     try:
         if not _last_known_face_id and _session_anchor_embedding is None:
@@ -309,7 +448,7 @@ def _recheck_session_face_background(face_crop: np.ndarray):
         fresh_faces        = _load_known_faces()
         _known_faces_cache = fresh_faces
 
-        # 1. Deterministic Deletion check
+        # 1. Deterministic deletion check — always instant, no debounce needed
         if _last_known_face_id:
             still_exists = any(f.get("face_id") == _last_known_face_id for f in fresh_faces)
             if not still_exists:
@@ -317,7 +456,7 @@ def _recheck_session_face_background(face_crop: np.ndarray):
                 _end_session_background()
                 return
 
-        # 2. Identity Continuity check (Instant swap detection)
+        # 2. Identity continuity check (time-debounced swap detection)
         if _session_anchor_embedding is None:
             return
 
@@ -328,8 +467,47 @@ def _recheck_session_face_background(face_crop: np.ndarray):
         sim        = _cosine_similarity(probe_emb, _session_anchor_embedding)
         still_same = sim >= (1.0 - SESSION_CONTINUITY_THRESHOLD)
 
-        if not still_same:
-            logger.info(f"[DETECTION] Face swap detected (similarity={sim:.4f})! Ending session immediately.")
+        if still_same:
+            with _pipeline_lock:
+                if _swap_mismatch_count or _mismatch_since_ts:
+                    logger.info("[DETECTION] Continuity match recovered — resetting mismatch state")
+                _swap_mismatch_count        = 0
+                _mismatch_since_ts          = 0.0
+                _current_display_identity   = _last_known_identity
+                _current_display_verified   = True
+                _current_display_confidence = round(max(0.0, sim), 4)
+            return
+
+        # ── Mismatch: a different face is in frame. Try to recognize THEM. ──
+        now = time.time()
+        with _pipeline_lock:
+            _swap_mismatch_count += 1
+            if _mismatch_since_ts == 0.0:
+                _mismatch_since_ts = now
+            elapsed = now - _mismatch_since_ts
+
+        verified, name, _fid, conf, _ = recognize_face(face_crop, fresh_faces)
+        with _pipeline_lock:
+            if verified and name:
+                _current_display_identity   = name          # friend, recognized by their own face
+                _current_display_verified   = True
+                _current_display_confidence = conf
+                logger.info(f"[DETECTION] Different face in frame, recognized as '{name}' (sim={conf})")
+            else:
+                _current_display_identity   = "Unknown"      # friend, not registered
+                _current_display_verified   = False
+                _current_display_confidence = conf
+
+        logger.info(
+            f"[DETECTION] Continuity mismatch {_swap_mismatch_count}/{_SWAP_MISMATCH_LIMIT} "
+            f"(similarity={sim:.4f}, original visitor absent {elapsed:.1f}s)"
+        )
+
+        if elapsed >= _GOODBYE_DELAY or _swap_mismatch_count >= _SWAP_MISMATCH_LIMIT:
+            logger.info(
+                f"[DETECTION] Original visitor gone ~{_GOODBYE_DELAY:.0f}s — ending session "
+                f"(new face displayed as '{_current_display_identity}')"
+            )
             _end_session_background()
 
     except Exception as e:
@@ -343,7 +521,8 @@ def _recheck_session_face_background(face_crop: np.ndarray):
 def _handle_recognition_background(face_crop: np.ndarray):
     global _recognizing, _asking_name, _known_faces_cache
     global _last_known_identity, _last_known_face_id, _last_trigger_ts, _session_active
-    global _last_session_recheck_ts, _session_anchor_embedding
+    global _last_session_recheck_ts, _session_anchor_embedding, _swap_mismatch_count, _mismatch_since_ts
+    global _current_display_identity, _current_display_verified, _current_display_confidence
 
     try:
         fresh_faces = _load_known_faces()
@@ -352,12 +531,18 @@ def _handle_recognition_background(face_crop: np.ndarray):
         verified, name, face_id, confidence, probe_emb = recognize_face(face_crop, fresh_faces)
 
         if verified and name:
-            _last_known_identity      = name
-            _last_known_face_id       = face_id
-            _last_trigger_ts          = time.time()
-            _session_active           = True
-            _last_session_recheck_ts  = time.time()
-            _session_anchor_embedding = probe_emb
+            with _pipeline_lock:
+                _last_known_identity        = name
+                _last_known_face_id         = face_id
+                _last_trigger_ts            = time.time()
+                _session_active             = True
+                _last_session_recheck_ts    = time.time()
+                _session_anchor_embedding   = probe_emb
+                _swap_mismatch_count        = 0  # fresh session — reset debounce
+                _mismatch_since_ts          = 0.0
+                _current_display_identity   = name
+                _current_display_verified   = True
+                _current_display_confidence = confidence
 
             _post("/session/start", params={
                 "user_name":    name,
@@ -370,10 +555,11 @@ def _handle_recognition_background(face_crop: np.ndarray):
             logger.info(f"[DETECTION] Returning visitor: {name} (sim={confidence})")
 
         else:
-            _last_known_identity = ""
-            _last_known_face_id  = ""
-            _last_trigger_ts     = time.time()
-            _asking_name         = True
+            with _pipeline_lock:
+                _last_known_identity = ""
+                _last_known_face_id  = ""
+                _last_trigger_ts     = time.time()
+                _asking_name         = True
             _handle_unknown_visitor(face_crop)
 
     except Exception as e:
@@ -384,7 +570,8 @@ def _handle_recognition_background(face_crop: np.ndarray):
 
 def _handle_unknown_visitor(face_crop: np.ndarray):
     global _asking_name, _known_faces_cache, _last_known_identity, _last_known_face_id, _last_trigger_ts, _session_active
-    global _last_session_recheck_ts, _session_anchor_embedding
+    global _last_session_recheck_ts, _session_anchor_embedding, _swap_mismatch_count, _mismatch_since_ts
+    global _current_display_identity, _current_display_verified, _current_display_confidence
     try:
         r = _post("/visitor/unknown")
         if not r or r.status_code != 200:
@@ -438,9 +625,15 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
             "visit_count":  1,
             "trigger":      "camera",
         })
-        _session_active           = True
-        _last_session_recheck_ts  = time.time()
-        _session_anchor_embedding = embedding
+        with _pipeline_lock:
+            _session_active              = True
+            _last_session_recheck_ts     = time.time()
+            _session_anchor_embedding    = embedding
+            _swap_mismatch_count         = 0  # fresh session — reset debounce
+            _mismatch_since_ts           = 0.0
+            _current_display_identity    = visitor_name
+            _current_display_verified    = bool(save_face and visitor_name not in ("Guest", ""))
+            _current_display_confidence  = 0.0
 
     except Exception as e:
         logger.error(f"[DETECTION] _handle_unknown_visitor error: {e}")
@@ -453,8 +646,11 @@ def _handle_unknown_visitor(face_crop: np.ndarray):
 
 def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) -> DetectionResult:
     global _asking_name, _recognizing, _last_trigger_ts, _known_faces_cache, _last_known_identity
-    global _face_first_seen_ts, _face_present_last, _face_gone_ts, _session_active, _greeted
+    global _face_first_seen_ts, _face_present_last, _face_gone_ts, _session_active
     global _last_session_recheck_ts, _rechecking_session, _session_anchor_embedding, _last_session_end_ts
+    global _last_sync_ts, _syncing
+    global _current_display_identity, _current_display_verified, _current_display_confidence
+    global _primary_track_center
 
     try:
         frame = _decode_frame(frame_data)
@@ -462,11 +658,20 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
         return DetectionResult(present=False, bbox=None, face_crop=None, error=str(e))
 
     now = time.time()
-    
+
+    # ─── Throttled, non-blocking backend sync ────────────────────────────────
+    # This used to run synchronously on EVERY frame (a blocking HTTP call),
+    # which was the main source of camera lag. Now it runs in the background
+    # at most once every _SYNC_INTERVAL seconds.
+    if not _syncing and (now - _last_sync_ts) >= _SYNC_INTERVAL:
+        _last_sync_ts = now
+        _syncing      = True
+        threading.Thread(target=_sync_local_session_state_with_backend, daemon=True).start()
+
     # Process core visibility presence tracking normally so state variables match frames perfectly
     result = detect_presence(frame, draw_mesh=draw_mesh)
 
-    # ─── Goodbye detection ───────────────────────────────────────────────────
+    # ─── Goodbye detection (nobody in frame at all) ──────────────────────────
     if not result.present:
         if _face_present_last:
             _face_gone_ts = now
@@ -489,34 +694,18 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
 
     _face_present_last = True
 
-    # ─── Post-Session Lockout Hook ───────────────────────────────────────────
-    # If a session just closed, keep drawing boxes and tracking frames, but completely 
-    # block the backend recognition loop, DB calls, and greetings from restarting.
-    if (now - _last_session_end_ts) < _POST_SESSION_LOCKOUT:
-        result.identity = "Clearing Session..."
-        result.verified = False
-        return result
-
-    # ─── Bystander/Crowd Filter ──────────────────────────────────────────────
+    # ─── Bystander info ──────────────────────────────────────────────────────
+    # Bystanders are recorded on the result (result.multiple_faces /
+    # result.bystander_count) for logging/UI purposes, but they no longer
+    # block recognition of the primary (largest/closest) face below. A
+    # friend standing nearby is politely ignored rather than freezing
+    # identification of the actual visitor.
     if result.multiple_faces:
-        result.identity = "Unknown"
-        result.verified = False
-        return result
+        logger.info(f"[DETECTION] {result.bystander_count} bystander face(s) present — ignoring, tracking primary face")
 
     # ─── Passerby filter ─────────────────────────────────────────────────────
     dwell_time = now - _face_first_seen_ts if _face_first_seen_ts > 0 else 0.0
     if dwell_time < _DWELL_REQUIRED:
-        result.identity = "..."
-        return result
-
-    # ─── Voice greeting ──────────────────────────────────────────────────────
-    if not _greeted and not _session_active and not _asking_name and not _recognizing:
-        _greeted = True
-        greeting = "Hello! Welcome to RNSIT Kiosk. Please say your name, or say Guest to continue."
-        threading.Thread(
-            target=lambda: _post("/visitor/greet", json={"text": greeting}),
-            daemon=True,
-        ).start()
         result.identity = "..."
         return result
 
@@ -525,7 +714,7 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
         result.identity = "Identifying..."
         return result
 
-    # ─── Session active — verification & instantaneous swap termination ────────
+    # ─── Session active — verification & swap identification ────────────────
     if _session_active:
         if (not _rechecking_session
                 and (_last_known_face_id or _session_anchor_embedding is not None)
@@ -539,9 +728,13 @@ def run_pipeline(frame_data, known_faces: list = None, draw_mesh: bool = False) 
                 daemon=True,
             ).start()
 
-        if _session_active and _last_known_identity:
-            result.identity = _last_known_identity
-            result.verified = True
+        # Show whoever is currently confirmed to be in frame — the original
+        # visitor, or (mid-swap, before the 3s grace period elapses) whoever
+        # has replaced them, recognized by their own face.
+        if _session_active:
+            result.identity   = _current_display_identity or _last_known_identity or "..."
+            result.verified   = _current_display_verified
+            result.confidence = _current_display_confidence
         return result
 
     # ─── Cooldown ─────────────────────────────────────────────────────────────
@@ -597,6 +790,8 @@ if __name__ == "__main__":
             color = (0, 255, 0) if result.verified else (0, 165, 255)
             cv2.rectangle(display, (b.x, b.y), (b.x + b.w, b.y + b.h), color, 2)
             label = result.identity or "Unknown"
+            if result.multiple_faces:
+                label += f"  (+{result.bystander_count} bystander)"
             cv2.putText(display, label, (b.x, b.y - 10),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
         else:

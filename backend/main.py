@@ -1,4 +1,4 @@
-"""
+﻿"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
@@ -733,7 +733,7 @@ async def post_message(payload: MessagePayload):
 
 # ==========================================
 # CORE WORKFLOW ROUTING ENGINE (ASK)
-# ==========================================
+# =========================================
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     global _last_activity_ts, active_session
@@ -774,7 +774,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         "ok thanks", "okay thanks", "ok thank you", "okay thank you",
         "thats all", "thats all thanks", "bye", "goodbye", "that is all",
     }
-    # ─── Thank you check & session cleanup execution routing ───────────────────
     if any(phrase in q_normalized for phrase in THANK_YOU_PHRASES):
         farewell = (
             f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
@@ -789,16 +788,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         })
         return await _respond(farewell)
 
-    # ─── Dynamic Cloud MongoDB Lookup ─────────────────────────────────────────
-    try:
-        kiosk_cloud_data = await get_kiosk_data()
-        if kiosk_cloud_data and "faqs" in kiosk_cloud_data:
-            for faq in kiosk_cloud_data["faqs"]:
-                if faq.get("question", "").lower() in q_normalized:
-                    return await _respond(faq["answer"], source="mongodb_atlas")
-    except Exception as e:
-        logger.error(f"[MONGO LOOKUP ERROR] Cloud fetch routing failed: {e}")
-
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
     if redis_client:
@@ -810,25 +799,29 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── RAG Intelligent GenAI Fallback ─────────────────────────────────────────
-    logger.info("[CACHE MISS] Running RAG for processed string: '%s'", q_normalized)
+    # ─── External Team LLM RAG Pipeline Handoff ─────────────────────────────────
+    logger.info("[CACHE MISS] Invoking external team's custom RAG pipeline for: '%s'", q_normalized)
+    
+    # Process memory bounds safely matching the structure they parse
+    safe_history = message_log[-6:] if len(message_log) > 0 else []
+    
     try:
-        # Fixed: Boundary-safe slicing logic to prevent syntax exceptions on sparse histories
-        safe_history = message_log[-6:] if len(message_log) > 0 else []
+        # Call the other team's function directly. It reads its own env vars, 
+        # manages context from college_info.json, and contacts their LLM platform.
         answer = await generate_rag_kiosk_response(q_normalized, history=safe_history)
         
+        # Cache the successful response back in Redis
         if redis_client and answer:
             try:
                 redis_client.set(cache_key, answer, ex=3600)
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
+                
     except Exception as exc:
-        logger.error("RAG inference failed: %s", exc)
-        answer = "I'm having trouble processing that. Please visit the Admin Block for assistance."
+        logger.error("External team's LLM engine failed or threw an exception: %s", exc)
+        answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="local_llm")
-
-
+    return await _respond(answer, source="external_team_llm")
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
