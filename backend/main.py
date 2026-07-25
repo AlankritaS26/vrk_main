@@ -39,6 +39,7 @@ from backend.database import (
     save_session, save_interaction,
     update_face_seen, save_face_encoding, get_all_face_encodings,
     delete_face_by_name,
+    find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
 from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
 from backend.stt import transcribe_audio, transcribe_pcm
@@ -155,6 +156,7 @@ def verify_input_safety(query: str) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("[SYSTEM] Booting server resources...")
+    await ensure_indexes()
     try:
         await initialize_rag_knowledge_base()
         logger.info("[SYSTEM] RAG vector cache loaded successfully.")
@@ -645,6 +647,72 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
 # ==========================================
 # SESSION MANAGEMENT ENDPOINTS
 # ==========================================
+# ==========================================
+# IDENTITY / SESSION CORE
+#   person (face_id)  1 --- N  visit threads (session_id)
+#   Same person back within 30 days -> RESUME the same session_id.
+# ==========================================
+
+INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
+
+def build_greeting(name: str, is_returning: bool, resumed: bool) -> str:
+    """The exact spoken lines for first-time vs returning visitors."""
+    who = name if name and name not in ("Guest", "Unknown", "") else "there"
+    if not is_returning:
+        return (f"Welcome {who}! I am the digital receptionist of {INSTITUTE_NAME}. "
+                f"I can help you with admissions, departments, placements, fees, "
+                f"and finding your way around campus. How may I assist you today?")
+    if resumed:
+        return (f"Welcome back, {who}! Good to see you again. "
+                f"We can continue where we left off. How may I assist you today?")
+    return f"Welcome back, {who}! How may I assist you today?"
+
+
+async def resume_or_create_session(face_id: str, user_name: str,
+                                   is_returning: bool, visit_count: int,
+                                   trigger: str = "camera") -> dict:
+    """
+    THE fix for the session_id == face_id bug.
+      * face_id  = the PERSON  (minted once, by detection, at enrolment)
+      * session_id = the VISIT THREAD (its own uuid, never the face_id)
+    A known face returning inside 30 days resumes its previous session_id.
+    """
+    resumed = False
+    continued_from = None
+    session_id = None
+
+    if face_id:
+        prev = await find_recent_session_by_face(face_id, days=30)
+        if prev and prev.get("session_id"):
+            session_id = prev["session_id"]          # SAME thread continues
+            continued_from = prev.get("continued_from") or prev["session_id"]
+            resumed = True
+            visit_count = max(visit_count, int(prev.get("visit_count") or 1) + 1)
+
+    if not session_id:
+        session_id = str(uuid.uuid4())               # never face_id
+
+    sess = {
+        "session_id":   session_id,
+        "user_name":    user_name,
+        "is_returning": is_returning,
+        "visit_count":  visit_count,
+        "face_id":      face_id or "",
+        "trigger":      trigger,
+        "asking_name":  False,
+        "resumed":      resumed,
+        "resumed_at":   datetime.now().isoformat(),
+        "greeting":     build_greeting(user_name, is_returning, resumed),
+    }
+
+    await save_session(session_id, face_id or None, user_name,
+                       is_returning, visit_count,
+                       continued_from=continued_from if resumed else None)
+    logger.info(f"[SESSION] {'RESUMED' if resumed else 'NEW'} {session_id[:8]} "
+                f"face={face_id[:8] if face_id else '-'} name={user_name}")
+    return sess
+
+
 @app.post("/session/start")
 async def start_session(
     trigger: str = "camera",
@@ -655,33 +723,40 @@ async def start_session(
     session_id: str = "",
 ):
     global active_session, message_log, _last_activity_ts
-    final_session_id = face_id or session_id or str(uuid.uuid4())
+
+    # Resume this PERSON's thread if seen in the last 30 days, else mint a
+    # fresh session_id. session_id is NEVER face_id (that bug overwrote the
+    # previous session record on every visit).
+    new_sess = await resume_or_create_session(
+        face_id=(face_id or "").strip(),
+        user_name=user_name,
+        is_returning=is_returning,
+        visit_count=visit_count,
+        trigger=trigger,
+    )
+    final_session_id = new_sess["session_id"]
 
     if active_session and active_session.get("session_id") == final_session_id:
         _last_activity_ts = datetime.now().timestamp()
+        active_session["resumed_at"] = new_sess["resumed_at"]
+        active_session["greeting"]   = new_sess["greeting"]
+        await touch_session(final_session_id)
         return {
             "status":     "already_active",
             "session_id": final_session_id,
-            "session":     active_session,
+            "session":    active_session,
         }
 
-    active_session = {
-        "session_id":   final_session_id,
-        "user_name":    user_name,
-        "is_returning": is_returning,
-        "visit_count":  visit_count,
-        "face_id":      face_id,
-        "trigger":      trigger,
-        "asking_name":  False,
-    }
+    active_session    = new_sess
     message_log       = []
     _last_activity_ts = datetime.now().timestamp()
 
-    db_face_id = face_id.strip() if face_id and face_id.strip() else None
-    
-    # Executed asynchronously matching your new async MongoDB driver configuration
-    await save_session(final_session_id, db_face_id, user_name, is_returning, visit_count)
-    await manager.broadcast({"type": "session_start", "session": active_session})
+    # NOTE: resume_or_create_session() already persisted this session.
+    await manager.broadcast({
+        "type": "session_start",
+        "session": active_session,
+        "tts_text": active_session.get("greeting", ""),
+    })
     return {"status": "success", "session_id": final_session_id, "session": active_session}
 
 
@@ -733,7 +808,7 @@ async def post_message(payload: MessagePayload):
 
 # ==========================================
 # CORE WORKFLOW ROUTING ENGINE (ASK)
-# ==========================================
+# =========================================
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     global _last_activity_ts, active_session
@@ -774,7 +849,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         "ok thanks", "okay thanks", "ok thank you", "okay thank you",
         "thats all", "thats all thanks", "bye", "goodbye", "that is all",
     }
-    # ─── Thank you check & session cleanup execution routing ───────────────────
     if any(phrase in q_normalized for phrase in THANK_YOU_PHRASES):
         farewell = (
             f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
@@ -789,16 +863,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         })
         return await _respond(farewell)
 
-    # ─── Dynamic Cloud MongoDB Lookup ─────────────────────────────────────────
-    try:
-        kiosk_cloud_data = await get_kiosk_data()
-        if kiosk_cloud_data and "faqs" in kiosk_cloud_data:
-            for faq in kiosk_cloud_data["faqs"]:
-                if faq.get("question", "").lower() in q_normalized:
-                    return await _respond(faq["answer"], source="mongodb_atlas")
-    except Exception as e:
-        logger.error(f"[MONGO LOOKUP ERROR] Cloud fetch routing failed: {e}")
-
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
     if redis_client:
@@ -810,25 +874,29 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── RAG Intelligent GenAI Fallback ─────────────────────────────────────────
-    logger.info("[CACHE MISS] Running RAG for processed string: '%s'", q_normalized)
+    # ─── External Team LLM RAG Pipeline Handoff ─────────────────────────────────
+    logger.info("[CACHE MISS] Invoking external team's custom RAG pipeline for: '%s'", q_normalized)
+    
+    # Process memory bounds safely matching the structure they parse
+    safe_history = message_log[-6:] if len(message_log) > 0 else []
+    
     try:
-        # Fixed: Boundary-safe slicing logic to prevent syntax exceptions on sparse histories
-        safe_history = message_log[-6:] if len(message_log) > 0 else []
+        # Call the other team's function directly. It reads its own env vars, 
+        # manages context from college_info.json, and contacts their LLM platform.
         answer = await generate_rag_kiosk_response(q_normalized, history=safe_history)
         
+        # Cache the successful response back in Redis
         if redis_client and answer:
             try:
                 redis_client.set(cache_key, answer, ex=3600)
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
+                
     except Exception as exc:
-        logger.error("RAG inference failed: %s", exc)
-        answer = "I'm having trouble processing that. Please visit the Admin Block for assistance."
+        logger.error("External team's LLM engine failed or threw an exception: %s", exc)
+        answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="local_llm")
-
-
+    return await _respond(answer, source="external_team_llm")
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
@@ -836,6 +904,8 @@ class RegisterFacePayload(BaseModel):
     face_id:  str         = Field(..., description="Unique face id")
     name:     str         = Field(..., description="Person's name")
     encoding: List[float] = Field(..., description="Face encoding vector")
+    encodings: List[List[float]] = Field(default_factory=list,
+                                         description="Multi-template encodings (preferred)")
 
     @field_validator("name")
     @classmethod
@@ -852,7 +922,8 @@ async def get_all_faces_endpoint():
 
 @app.post("/faces/register")
 async def register_face(payload: RegisterFacePayload):
-    await save_face_encoding(payload.face_id, payload.name, payload.encoding)
+    await save_face_encoding(payload.face_id, payload.name, payload.encoding,
+                             payload.encodings or [payload.encoding])
     logger.info(f"[FACE] Registered in MongoDB: {payload.name} ({payload.face_id})")
     return {"status": "ok", "face_id": payload.face_id}
 
@@ -959,22 +1030,24 @@ async def greet_visitor(payload: GreetVisitorPayload):
         })
         return {"status": "asking", "session_id": active_session["session_id"]}
 
-    # Processing state metrics for verified returning users
-    final_session_id = payload.face_id
-    active_session = {
-        "session_id": final_session_id,
-        "user_name": payload.name,
-        "is_returning": payload.is_returning,
-        "visit_count": payload.visit_count,
-        "face_id": payload.face_id,
-        "trigger": "camera",
-        "asking_name": False,
-    }
-    
+    # Recognised visitor: resume the 30-day thread (or start one) AND persist.
+    # The old code built an in-memory session that never reached MongoDB and
+    # used face_id as session_id.
+    active_session = await resume_or_create_session(
+        face_id=(payload.face_id or "").strip(),
+        user_name=payload.name,
+        is_returning=payload.is_returning,
+        visit_count=payload.visit_count,
+        trigger="camera",
+    )
+    final_session_id = active_session["session_id"]
+    message_log = []
+    _last_activity_ts = datetime.now().timestamp()
+
     await manager.broadcast({
-        "type": "session_start", 
+        "type": "session_start",
         "session": active_session,
-        "tts_text": f"Welcome back, {payload.name}! How can I help you today?"
+        "tts_text": active_session["greeting"],
     })
     
     logger.info(f"[GREET SUCCESS] Session established for user context: '{payload.name}'")
