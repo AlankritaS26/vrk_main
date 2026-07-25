@@ -28,6 +28,11 @@ export function float32ToInt16(f32) {
 }
 
 export async function createKioskMic({ onSpeechStart, onSpeechEnd, onMisfire, onStream }) {
+  // navigator.mediaDevices requires a secure context (https or localhost).
+  if (!navigator.mediaDevices?.getUserMedia) {
+    throw new Error(
+      'Microphone API unavailable: open the kiosk at http://localhost:3000 (not the machine hostname).');
+  }
   // One persistent stream for the whole session (no per-turn getUserMedia).
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -35,7 +40,7 @@ export async function createKioskMic({ onSpeechStart, onSpeechEnd, onMisfire, on
       noiseSuppression: true,
       echoCancellation: true,   // stops kiosk TTS re-triggering the mic
       autoGainControl: false,   // AGC amplifies crowd noise during silence —
-                                // it defeats the backend energy gate. Keep OFF.
+      // it defeats the backend energy gate. Keep OFF.
     },
   });
   onStream?.(stream);

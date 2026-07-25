@@ -4,19 +4,21 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
-  const scrollRef      = useRef(null);
-  const inputRef       = useRef(null);
-  const isMounted      = useRef(true);
-  const isSpeaking     = useRef(false);
-  const isListening    = useRef(false);
-  const analyserRef    = useRef(null);
-  const animFrameRef   = useRef(null);
-  const canvasRef      = useRef(null);
-  const audioCtxRef    = useRef(null);
-  const statusRef      = useRef('ready');        // readable inside callbacks
-  const streamRef      = useRef(null);           // persistent mic stream
+  const scrollRef = useRef(null);
+  const inputRef = useRef(null);
+  const camVideoRef = useRef(null);
+  const camStreamRef = useRef(null);
+  const isMounted = useRef(true);
+  const isSpeaking = useRef(false);
+  const isListening = useRef(false);
+  const analyserRef = useRef(null);
+  const animFrameRef = useRef(null);
+  const canvasRef = useRef(null);
+  const audioCtxRef = useRef(null);
+  const statusRef = useRef('ready');        // readable inside callbacks
+  const streamRef = useRef(null);           // persistent mic stream
   const pendingUtteranceRef = useRef(null);
-  const playCtxRef  = useRef(null);              // Web Audio playback context
+  const playCtxRef = useRef(null);              // Web Audio playback context
   const playCursorRef = useRef(0);               // schedule cursor for gapless clips
   const pendingSpeechRef = useRef(null);         // speech blocked by autoplay policy
 
@@ -24,7 +26,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // Unlock on the first pointer/key event and replay anything pending.
   useEffect(() => {
     const unlock = async () => {
-      try { await playCtxRef.current?.resume(); } catch (e) {}
+      try { await playCtxRef.current?.resume(); } catch (e) { }
       if (pendingSpeechRef.current) {
         const { text, onStart } = pendingSpeechRef.current;
         pendingSpeechRef.current = null;
@@ -40,12 +42,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);      // speech captured while busy
 
-  const [name,       setName]       = useState('');
-  const [saveData,   setSaveData]   = useState(true);
-  const [submitted,  setSubmitted]  = useState(false);
+  const [name, setName] = useState('');
+  const [saveData, setSaveData] = useState(true);
+  const [submitted, setSubmitted] = useState(false);
   const [deleteMode, setDeleteMode] = useState(false);
   const [deleteName, setDeleteName] = useState('');
-  const [deleted,    setDeleted]    = useState(false);
+  const [deleted, setDeleted] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
     'Try asking: "What courses does RNSIT offer?"',
@@ -58,23 +60,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const t = setInterval(() => setHintIndex(i => (i + 1) % 5), 6500);
     return () => clearInterval(t);
   }, []);
-  const [liveText,   setLiveText]   = useState('');
-  const [listening,  setListening]  = useState(false);
-  const [status,     setStatus]     = useState('ready');
+  const [liveText, setLiveText] = useState('');
+  const [listening, setListening] = useState(false);
+  const [status, setStatus] = useState('ready');
 
-  const visitorName = session?.user_name    || 'Guest';
+  const visitorName = session?.user_name || 'Guest';
   const isReturning = session?.is_returning || false;
-  const visitCount  = session?.visit_count  || 1;
+  const visitCount = session?.visit_count || 1;
 
   // The backend composes the greeting (it knows resume-vs-new and the
   // institute intro line); these local strings are only a fallback.
   const greeting = session?.greeting || (isReturning
     ? (visitCount > 2
-        ? 'Welcome back, ' + visitorName + '! Great to see you again. How may I assist you today?'
-        : 'Welcome back, ' + visitorName + '! How may I assist you today?')
+      ? 'Welcome back, ' + visitorName + '! Great to see you again. How may I assist you today?'
+      : 'Welcome back, ' + visitorName + '! How may I assist you today?')
     : 'Welcome, ' + visitorName + '! I am the digital receptionist of R N S Institute of Technology. '
-      + 'I can help you with admissions, departments, placements, fees, and directions. '
-      + 'How may I assist you today?');
+    + 'I can help you with admissions, departments, placements, fees, and directions. '
+    + 'How may I assist you today?');
 
   useEffect(() => { statusRef.current = status; }, [status]);
 
@@ -86,6 +88,47 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   useEffect(() => {
     isMounted.current = true;
     return () => { isMounted.current = false; stopWaveform(); };
+  }, []);
+
+  // ── Backend event WebSocket — server-pushed session_end ─────────────────
+  // Handles inactivity timeout and detection-triggered session ends so the
+  // goodbye screen appears immediately without waiting for the poll heartbeat.
+  useEffect(() => {
+    const WS = BACKEND.replace(/^http/, 'ws');
+    let ws;
+    let dead = false;
+    function connect() {
+      if (dead) return;
+      ws = new WebSocket(WS + '/ws');
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'session_end') {
+            window.dispatchEvent(new Event('vrk-session-ended'));
+          }
+        } catch (_) { }
+      };
+      ws.onclose = () => { if (!dead) setTimeout(connect, 3000); };
+    }
+    connect();
+    return () => { dead = true; ws?.close(); };
+  }, []);
+
+  // ── Camera sidebar ────────────────────────────────────────────────────────
+  useEffect(() => {
+    let active = true;
+    navigator.mediaDevices?.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+      .then(stream => {
+        if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
+        camStreamRef.current = stream;
+        if (camVideoRef.current) camVideoRef.current.srcObject = stream;
+      })
+      .catch(() => { }); // camera unavailable — sidebar just stays blank
+    return () => {
+      active = false;
+      camStreamRef.current?.getTracks().forEach(t => t.stop());
+      camStreamRef.current = null;
+    };
   }, []);
 
   useEffect(() => {
@@ -112,7 +155,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       animFrameRef.current = null;
     }
     if (audioCtxRef.current) {
-      try { audioCtxRef.current.close(); } catch(e) {}
+      try { audioCtxRef.current.close(); } catch (e) { }
       audioCtxRef.current = null;
     }
     analyserRef.current = null;
@@ -208,10 +251,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const startListening = useCallback(async () => {
     if (!isMounted.current || askingName) return;
 
-    // Mic already initialized — just resume the VAD (e.g. after TTS finished)
+    // Mic already initialized — just resume the VAD (e.g. after TTS finished).
+    // Only mark status 'ready' if TTS is not currently playing; when called from
+    // inside finish() isSpeaking is already false and finish() itself sets 'ready'
+    // first, so either way the state transition is correct.
     if (micRef.current) {
-      micRef.current.resume();
-      setStatus('ready');
+      if (!isSpeaking.current) {
+        micRef.current.resume();
+        setStatus('ready');
+      }
       return;
     }
 
@@ -233,10 +281,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         },
       });
       micRef.current = mic;
-      setStatus('ready');
+      // If TTS is already playing (greeting started before mic was ready),
+      // immediately park the VAD so it doesn't pick up TTS audio.  finish()
+      // will call startListening() again once speaking is done, at which point
+      // isSpeaking will be false and we take the resume path above.
+      if (isSpeaking.current) {
+        mic.pause();
+      } else {
+        setStatus('ready');
+      }
     } catch (err) {
       console.error('[MIC] Error:', err);
-      setStatus('ready');
+      if (!isSpeaking.current) setStatus('ready');
     }
   }, [askingName, startWaveform, handleUtterance]);
 
@@ -273,11 +329,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       const farewell = 'You are most welcome! Have a wonderful day. Goodbye!';
       micRef.current?.pause();
       speak(farewell);                       // WebAudio keeps playing across unmount
-      try { await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }); } catch(e) {}
+      try { await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }); } catch (e) { }
       window.dispatchEvent(new Event('vrk-session-ended'));   // App switches NOW
       return;
     }
 
+    // 35 s hard cap — prevents status getting stuck at 'processing' if the
+    // LLM is slow or the network drops after the request was sent.
+    const askController = new AbortController();
+    const askTimeout = setTimeout(() => askController.abort(), 35000);
     try {
       const [, askRes] = await Promise.all([
         fetch(BACKEND + '/message', {
@@ -285,9 +345,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
         }),
-        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text))
+        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text),
+          { signal: askController.signal })
       ]);
-      const data   = await askRes.json();
+      clearTimeout(askTimeout);
+      const data = await askRes.json();
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
       fetch(BACKEND + '/message', {
         method: 'POST',
@@ -295,11 +357,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
       });
       speak(answer, () => addMessage(answer, 'kiosk'));
-    } catch(e) {
+    } catch (e) {
+      clearTimeout(askTimeout);
       console.error('[sendToBackend]', e);
-      isSpeaking.current = false;
-      setStatus('ready');
-      if (isMounted.current) startListening();
+      const fallback = e.name === 'AbortError'
+        ? "I'm sorry, that's taking longer than expected. Please try asking again."
+        : 'Sorry, something went wrong. Please try again.';
+      speak(fallback, () => addMessage(fallback, 'kiosk'));
     }
   }, [session, addMessage]);
 
@@ -321,11 +385,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // Fallback: robotic browser voice, only if backend TTS is unavailable
     const browserSpeak = () => {
       fireStart();
-      const utter  = new SpeechSynthesisUtterance(text);
-      utter.lang   = 'en-US';
-      utter.rate   = 1.0;
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = 'en-US';
+      utter.rate = 1.0;
       utter.volume = 1;
-      utter.onend   = finish;
+      utter.onend = finish;
       utter.onerror = finish;
       window.speechSynthesis.speak(utter);
     };
@@ -345,12 +409,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
     }
     const pctx = playCtxRef.current;
-    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) {} }
+    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
     if (pctx.state === 'suspended') {
       // Autoplay policy blocked us (no user gesture yet, e.g. the very
       // first greeting). speechSynthesis is exempt — never stay silent.
       console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice. ' +
-                   'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
+        'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
       browserSpeak();
       return;
     }
@@ -462,7 +526,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     fetch(BACKEND + '/tts', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text: greeting })
-    }).catch(() => {});
+    }).catch(() => { });
 
     const t = setTimeout(() => {
       if (isSpeaking.current) return;     // something else already talking
@@ -477,7 +541,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setSubmitted(true);
     try {
       await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) + '&save=' + finalSave, { method: 'POST' });
-    } catch(e) { console.error(e); }
+    } catch (e) { console.error(e); }
   };
 
   const handleDeleteData = async () => {
@@ -487,21 +551,21 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       await fetch(BACKEND + '/visitor/delete_my_data?name=' + encodeURIComponent(trimmed), { method: 'POST' });
       setDeleted(true);
       setTimeout(() => { setDeleteMode(false); setDeleted(false); setDeleteName(''); }, 3500);
-    } catch(e) { console.error(e); }
+    } catch (e) { console.error(e); }
   };
 
   const statusLabel = {
-    ready:      'Ready',
-    listening:  'Listening',
+    ready: 'Ready',
+    listening: 'Listening',
     processing: 'Thinking',
-    speaking:   'Speaking'
+    speaking: 'Speaking'
   }[status] || 'Ready';
 
   const statusColor = {
-    ready:      '#ffb300',
-    listening:  '#43a047',
+    ready: '#ffb300',
+    listening: '#43a047',
     processing: '#7e57c2',
-    speaking:   '#ef5350'
+    speaking: '#ef5350'
   }[status] || '#ffb300';
 
   const inputStyle = {
@@ -554,7 +618,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             {deleted ? (
               <div style={{ textAlign: 'center' }}>
                 <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
                 </div>
                 <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted Successfully</div>
                 <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed from the system.</p>
@@ -563,7 +627,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
                   <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>
                   </div>
                   <div>
                     <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
@@ -590,7 +654,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             {submitted ? (
               <div style={{ textAlign: 'center' }}>
                 <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2.5"><polyline points="20 6 9 17 4 12"/></svg>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
                 </div>
                 <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>
                   {saveData ? 'Welcome, ' + (name || 'Guest') + '!' : 'Welcome, Guest!'}
@@ -603,7 +667,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
                   <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
                   </div>
                   <div>
                     <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hello! Welcome to RNSIT</div>
@@ -637,67 +701,94 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
-      <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '900px', width: '100%', margin: '0 auto', alignSelf: 'stretch' }}>
-        {messages.length === 0 && !liveText ? (
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '40px' }}>
-            <div style={{ width: '340px', height: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              <div style={{ position: 'relative', width: '130px', height: '130px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
+
+        {/* ── Camera sidebar ── */}
+        <div style={{ width: '220px', flexShrink: 0, background: '#fff', borderRight: '1.5px solid #e8eaf6', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '20px 14px', gap: '14px', boxShadow: '2px 0 8px rgba(26,35,126,0.04)' }}>
+          <div style={{ position: 'relative', width: '100%', borderRadius: '14px', overflow: 'hidden', boxShadow: '0 4px 18px rgba(26,35,126,0.15)', border: '2.5px solid #1a237e', background: '#1a237e22' }}>
+            <video ref={camVideoRef} autoPlay playsInline muted
+              style={{ display: 'block', width: '100%', aspectRatio: '4/3', objectFit: 'cover', transform: 'scaleX(-1)' }} />
+            <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(26,35,126,0.72)', backdropFilter: 'blur(4px)', padding: '6px 10px', textAlign: 'center' }}>
+              <span style={{ fontSize: '12px', color: '#fff', fontWeight: '600' }}>Live Camera</span>
+            </div>
+          </div>
+          <div style={{ textAlign: 'center', width: '100%' }}>
+            <div style={{ fontSize: '15px', fontWeight: '700', color: '#1a237e', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{visitorName}</div>
+            <div style={{ fontSize: '11px', color: isReturning ? '#43a047' : '#888', marginTop: '3px', fontWeight: '600', letterSpacing: '0.3px', textTransform: 'uppercase' }}>
+              {isReturning ? `Visit #${visitCount} · Returning` : 'New Visitor'}
+            </div>
+          </div>
+          <div style={{ width: '100%', background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '10px 12px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
+              <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: statusColor, flexShrink: 0, transition: 'background 0.3s' }} />
+              <span style={{ fontSize: '12px', color: statusColor, fontWeight: '700' }}>{statusLabel}</span>
+            </div>
+          </div>
+        </div>
+
+        <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+          {messages.length === 0 && !liveText ? (
+            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '40px' }}>
+              <div style={{ width: '340px', height: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <div style={{ position: 'relative', width: '130px', height: '130px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                   {/* expanding rings — the kiosk visibly "breathes" while waiting */}
                   <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.25)', animation: status === 'ready' ? 'ring 3.6s ease-out infinite' : 'none' }} />
                   <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.18)', animation: status === 'ready' ? 'ring 3.6s ease-out infinite 1.2s' : 'none' }} />
                   <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.10)', animation: status === 'ready' ? 'ring 3.6s ease-out infinite 2.4s' : 'none' }} />
                   <div style={{ width: '84px', height: '84px', borderRadius: '50%', background: 'linear-gradient(135deg, #1a237e, #3949ab)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 28px rgba(26,35,126,0.35)', animation: status === 'ready' ? 'breathe 3.6s ease-in-out infinite' : 'none' }}>
                     <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="1.7">
-                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-                      <line x1="12" y1="19" x2="12" y2="23"/>
-                      <line x1="8" y1="23" x2="16" y2="23"/>
+                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                      <line x1="12" y1="19" x2="12" y2="23" />
+                      <line x1="8" y1="23" x2="16" y2="23" />
                     </svg>
                   </div>
                 </div>
-            </div>
-            <div style={{ fontSize: '26px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.2px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-              {status === 'listening'   && 'Listening'}
-              {status === 'processing'  && <>Thinking<span className="dots"><i/><i/><i/></span></>}
-              {status === 'speaking'    && 'Speaking'}
-              {status === 'ready'       && 'How may I help you?'}
-            </div>
-            <div style={{ fontSize: '16px', color: '#9aa0b4', textAlign: 'center', maxWidth: '380px', lineHeight: '1.6' }}>
-              {status === 'listening' ? 'Please speak your question clearly' : hints[hintIndex]}
-            </div>
-          </div>
-        ) : (
-          <>
-            {messages.map((msg, i) => (
-              <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
-                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
-                  {msg.speaker === 'kiosk' ? 'RNSIT Kiosk' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
-                </div>
-                <div style={{
-                  animation: 'fadeUp 0.3s ease',
-                  maxWidth: '70%', padding: '15px 19px',
-                  borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
-                  background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
-                  color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
-                  border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
-                  fontSize: '17px', lineHeight: '1.6',
-                  boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
-                }}>
-                  {msg.text}
-                </div>
               </div>
-            ))}
-            {liveText && (
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                  {liveText}
-                </div>
+              <div style={{ fontSize: '26px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.2px', display: 'flex', alignItems: 'center', gap: '10px' }}>
+                {status === 'listening' && 'Listening'}
+                {status === 'processing' && <>Thinking<span className="dots"><i /><i /><i /></span></>}
+                {status === 'speaking' && 'Speaking'}
+                {status === 'ready' && 'How may I help you?'}
               </div>
-            )}
-          </>
-        )}
-      </div>
+              <div style={{ fontSize: '16px', color: '#9aa0b4', textAlign: 'center', maxWidth: '380px', lineHeight: '1.6' }}>
+                {status === 'listening' ? 'Please speak your question clearly' : hints[hintIndex]}
+              </div>
+            </div>
+          ) : (
+            <>
+              {messages.map((msg, i) => (
+                <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
+                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
+                    {msg.speaker === 'kiosk' ? 'RNSIT Kiosk' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
+                  </div>
+                  <div style={{
+                    animation: 'fadeUp 0.3s ease',
+                    maxWidth: '70%', padding: '15px 19px',
+                    borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
+                    background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
+                    color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
+                    border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
+                    fontSize: '17px', lineHeight: '1.6',
+                    boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
+                  }}>
+                    {msg.text}
+                  </div>
+                </div>
+              ))}
+              {liveText && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                    {liveText}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+      </div>{/* end flex row */}
 
       <footer style={{ background: '#ffffff', borderTop: '1.5px solid #e8eaf6', padding: '10px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 -2px 8px rgba(26,35,126,0.05)', minHeight: '64px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>

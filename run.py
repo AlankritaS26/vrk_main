@@ -187,15 +187,14 @@ def main():
 
     say("RUN", "Starting backend...")
     start("BACKEND", [PY, "-m", "uvicorn", "backend.main:app",
-                      "--host", "127.0.0.1", "--port", "8001"])
+                      "--host", "0.0.0.0", "--port", "8001"])
 
     say("RUN", "Waiting for backend health (models loading — first boot takes longer)...")
     if not wait_for_backend():
         say("RUN", "Backend never became healthy — check [BACKEND] logs above.")
         shutdown()
 
-    say("RUN", "Backend healthy. Starting camera detection...")
-    start("DETECT", [PY, "-m", "backend.detection"])
+    say("RUN", "Backend healthy. Camera detection runs in the browser — no separate process needed.")
 
     say("RUN", "Starting frontend (npm start)...")
     env = os.environ.copy()
@@ -207,15 +206,30 @@ def main():
     # before any user gesture — this is the standard kiosk deployment flag.
     def open_kiosk_browser():
         time.sleep(10)                 # let the CRA dev server come up
-        flags = "--autoplay-policy=no-user-gesture-required --app=http://localhost:3000"
-        for browser in ("chrome", "msedge"):
-            try:
-                subprocess.Popen(f'start "" {browser} {flags}', shell=True)
-                say("RUN", f"Opened kiosk window in {browser} (autoplay enabled).")
-                return
-            except Exception:
-                continue
-        say("RUN", "Could not auto-open a browser — open http://localhost:3000 manually.")
+        url   = "http://localhost:3000"
+        flags = ["--autoplay-policy=no-user-gesture-required", f"--app={url}"]
+
+        if sys.platform == "win32":
+            # Windows: use 'start "" <browser> <flags>'
+            flag_str = " ".join(flags)
+            for browser in ("chrome", "msedge"):
+                try:
+                    subprocess.Popen(f'start "" {browser} {flag_str}', shell=True)
+                    say("RUN", f"Opened kiosk window in {browser} (autoplay enabled).")
+                    return
+                except Exception:
+                    continue
+        else:
+            # Linux / macOS: launch the binary directly so flags are passed correctly
+            for browser in ("google-chrome", "google-chrome-stable",
+                            "chromium-browser", "chromium"):
+                try:
+                    subprocess.Popen([browser] + flags)
+                    say("RUN", f"Opened kiosk window in {browser} (autoplay enabled).")
+                    return
+                except FileNotFoundError:
+                    continue
+        say("RUN", f"Could not auto-open a browser — open {url} manually.")
     threading.Thread(target=open_kiosk_browser, daemon=True).start()
 
     say("RUN", "All services launching. Kiosk UI: http://localhost:3000  |  Ctrl+C stops everything.")

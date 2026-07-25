@@ -85,7 +85,15 @@ _lm_opts = mp_vision.FaceLandmarkerOptions(
     min_face_presence_confidence=0.6,
     min_tracking_confidence=0.5,
 )
-FACE_LANDMARKER = mp_vision.FaceLandmarker.create_from_options(_lm_opts)
+try:
+    FACE_LANDMARKER = mp_vision.FaceLandmarker.create_from_options(_lm_opts)
+except Exception as _lm_err:
+    logger.warning(
+        "[DETECT] FaceLandmarker unavailable (missing system library?): %s"
+        "  — face detection will be disabled until the library is installed.",
+        _lm_err,
+    )
+    FACE_LANDMARKER = None
 
 DEEPFACE_MODEL = os.getenv("DEEPFACE_MODEL", "Facenet512")
 DEEPFACE_DETECTOR = os.getenv("DEEPFACE_DETECTOR", "opencv")
@@ -170,6 +178,7 @@ class KioskState:
         with self.lock:
             self.state = "COOLDOWN"
             self.cooldown_until = time.time() + COOLDOWN
+            self.busy = False   # clear so the NEXT visitor's _spawn doesn't silently no-op
             self.face_id = ""
             self.identity = ""
             self.anchor = None
@@ -226,6 +235,8 @@ def _cos(a, b) -> float:
 def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResult:
     """PRIMARY-VISITOR LOCK: largest face above MIN_FACE_FRAC wins; the rest
     are bystanders — counted, never served, never blocking."""
+    if FACE_LANDMARKER is None:
+        return DetectionResult(present=False, error="landmarker_unavailable")
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     det = FACE_LANDMARKER.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
     if not det.face_landmarks:
@@ -346,10 +357,24 @@ def _start_session(face: dict, anchor: list, sim: float):
         "is_returning": True,
         "visit_count": int(face.get("visit_count") or 1),
     })
+
+    # ── BUG FIX: only advance to ACTIVE when the backend confirmed the session ──
+    # Previously ACTIVE was always set even when the HTTP call failed, causing
+    # the detection overlay to show "Welcome!" while /session/current returned
+    # {active: false} and App.js stayed stuck on the idle/home screen.
+    if r is None or r.status_code != 200:
+        logger.error(
+            "[DETECT] /visitor/greet failed (status=%s) — resetting to IDLE so "
+            "the visitor can be re-recognised on the next frame.",
+            getattr(r, "status_code", "no-response"),
+        )
+        ST.set(state="IDLE")
+        return
+
     _post("/faces/visit", params={"face_id": face_id})
     sid = ""
     try:
-        sid = (r.json() or {}).get("session_id", "") if r is not None else ""
+        sid = (r.json() or {}).get("session_id", "")
     except Exception:
         pass
     ST.set(state="ACTIVE", face_id=face_id, identity=face.get("name", ""),

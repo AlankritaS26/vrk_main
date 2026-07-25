@@ -15,13 +15,14 @@ import asyncio
 import sys
 import base64
 import secrets
+import json
 from pathlib import Path
 from datetime import datetime
 from typing import List
 from contextlib import asynccontextmanager
 
 import redis
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -32,6 +33,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# ── BUG FIX: set BEFORE detection import so detection.py captures the right URL ──
+# detection.py reads BACKEND_URL at module-level; setting it here (before the
+# import below) guarantees it always calls 127.0.0.1 even when the .env file
+# contains an external hostname.
+os.environ["BACKEND_URL"] = "http://127.0.0.1:8001"
 
 # Imports matching your async MongoDB database layout
 from backend.database import (
@@ -45,7 +52,37 @@ from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_respon
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
 
+try:
+    from backend.detection import run_pipeline as _run_pipeline
+    _detection_available = True
+except Exception as _det_import_err:
+    import logging as _lg
+    _lg.getLogger("RNSIT_Kiosk").warning(
+        "[SYSTEM] Face detection module unavailable: %s  "
+        "— install libgles2 (sudo apt-get install libgles2) and restart.",
+        _det_import_err,
+    )
+    _run_pipeline = None
+    _detection_available = False
+
+
+def run_pipeline(frame_data):
+    """Thin wrapper so the WebSocket handler always has a callable."""
+    if _run_pipeline is None:
+        class _NoOp:
+            present = False; state = "IDLE"; identity = ""
+            verified = False; bbox = None; bystanders = 0
+            error = "detection_unavailable"
+        return _NoOp()
+    return _run_pipeline(frame_data)
+
 load_dotenv()
+
+# When detection.py is imported inside the backend process its HTTP client
+# must call back to localhost, not the external hostname in BACKEND_URL.
+# NOTE: the real override is now ABOVE the detection import (line ~32); this
+# line is kept as a safety net in case load_dotenv() ran after that point.
+os.environ.setdefault("BACKEND_URL", "http://127.0.0.1:8001")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -973,6 +1010,53 @@ async def stt_websocket_endpoint(ws: WebSocket):
         logger.info("[WS/STT] Kiosk disconnected")
 
 
+@app.websocket("/ws/detect")
+async def detect_websocket(ws: WebSocket):
+    """
+    Browser-camera detection pipeline (cross-platform, no native window needed).
+
+    Browser → backend : JSON  {"frame": "<base64 JPEG>"}
+    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders}
+
+    bbox format when present: {x, y, w, h}  — pixel coords in the captured frame
+    """
+    await ws.accept()
+    logger.info("[WS/DETECT] Browser camera connected")
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+                b64 = msg.get("frame", "")
+                if not b64:
+                    continue
+                # Strip Data-URL prefix if the browser sends image/jpeg;base64,...
+                if "," in b64:
+                    b64 = b64.split(",", 1)[1]
+                frame_bytes = base64.b64decode(b64)
+                result = await asyncio.to_thread(run_pipeline, frame_bytes)
+                bbox = None
+                if result.bbox:
+                    bbox = {
+                        "x": result.bbox.x,
+                        "y": result.bbox.y,
+                        "w": result.bbox.w,
+                        "h": result.bbox.h,
+                    }
+                await ws.send_json({
+                    "present":    result.present,
+                    "state":      result.state,
+                    "identity":   result.identity or "",
+                    "verified":   result.verified,
+                    "bbox":       bbox,
+                    "bystanders": result.bystanders,
+                })
+            except Exception as frame_err:
+                logger.warning(f"[WS/DETECT] Frame processing error: {frame_err}")
+    except WebSocketDisconnect:
+        logger.info("[WS/DETECT] Browser camera disconnected")
+
+
 @app.post("/tts")
 async def tts_endpoint(request: Request):
     """Text → base64 WAV (Kokoro). Empty audio → frontend falls back to browser voice."""
@@ -1122,3 +1206,61 @@ async def delete_my_data(name: str):
     except Exception as e:
         logger.error(f"[DELETE] Error: {e}")
         return {"success": False, "message": "Deletion failed. Please contact staff."}
+
+
+# ==========================================
+# RAG KNOWLEDGE BASE MANAGEMENT
+# ==========================================
+_RAG_URL  = os.getenv("RAG_SERVICE_URL", "http://localhost:8600").rstrip("/")
+_RAG_COLL = os.getenv("RAG_COLLECTION",  "kiosk-rnsit")
+
+
+@app.post("/api/rag/upload")
+async def rag_upload_file(
+    file: UploadFile = File(...),
+    source: str = Form(""),
+    username: str = Depends(authenticate_admin),
+):
+    """Upload a document (PDF/DOCX/PPTX/TXT/MD/CSV) to the RAG knowledge base."""
+    content = await file.read()
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{_RAG_URL}/v1/collections/{_RAG_COLL}/index/file",
+            files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
+            data={"source": source or file.filename},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"RAGService error: {resp.text}")
+    return resp.json()
+
+
+@app.get("/api/rag/files")
+async def rag_list_files(username: str = Depends(authenticate_admin)):
+    """List all files indexed in the RAG knowledge base."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{_RAG_URL}/v1/collections/{_RAG_COLL}/files")
+    if resp.status_code != 200:
+        return {"files": []}
+    return resp.json()
+
+
+@app.get("/api/rag/stats")
+async def rag_stats(username: str = Depends(authenticate_admin)):
+    """Return collection stats (chunk count, indexed files) from RAGService."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{_RAG_URL}/v1/collections/{_RAG_COLL}")
+    if resp.status_code != 200:
+        return {"error": "RAGService unreachable"}
+    return resp.json()
+
+
+@app.delete("/api/rag/files/{filename}")
+async def rag_delete_file(filename: str, username: str = Depends(authenticate_admin)):
+    """Remove a specific file's chunks from the RAG knowledge base."""
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.delete(
+            f"{_RAG_URL}/v1/collections/{_RAG_COLL}/files/{filename}"
+        )
+    if resp.status_code not in (200, 404):
+        raise HTTPException(status_code=502, detail=f"RAGService error: {resp.text}")
+    return {"message": f"Removed '{filename}' from knowledge base."}
