@@ -116,7 +116,7 @@ MATCH_MARGIN    = float(os.getenv("FACE_MATCH_MARGIN", "0.06"))     # best must 
 _DEFAULT_CONT = "0.60" if _ENGINE == "arcface" else "0.28"
 CONTINUITY_DIST = float(os.getenv("SESSION_CONTINUITY_DISTANCE", _DEFAULT_CONT))
 DWELL_REQUIRED  = float(os.getenv("DWELL_REQUIRED", "0.7"))
-DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "5.5"))      # bag/phone/companion tolerance
+DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "3.0"))      # bag/phone/companion tolerance
 COOLDOWN        = float(os.getenv("DETECT_COOLDOWN", "6.0"))
 RECHECK_EVERY   = float(os.getenv("SESSION_RECHECK_INTERVAL", "2.0"))
 SWAP_STREAK     = int(os.getenv("SWAP_STREAK", "3"))           # frames before believing a swap

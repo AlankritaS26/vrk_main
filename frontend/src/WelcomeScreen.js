@@ -3,11 +3,10 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
-export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
+export default function WelcomeScreen({ session, messages, setMessages, askingName, camStream }) {
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const camVideoRef = useRef(null);
-  const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
   const isListening = useRef(false);
@@ -45,9 +44,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [name, setName] = useState('');
   const [saveData, setSaveData] = useState(true);
   const [submitted, setSubmitted] = useState(false);
-  const [deleteMode, setDeleteMode] = useState(false);
-  const [deleteName, setDeleteName] = useState('');
-  const [deleted, setDeleted] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
     'Try asking: "What courses does RNSIT offer?"',
@@ -115,21 +111,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, []);
 
   // ── Camera sidebar ────────────────────────────────────────────────────────
+  // The camera + detection WebSocket now live in App.js so presence
+  // detection (departure timeout, face-swap) keeps running while this
+  // screen is shown. This just displays the shared stream.
   useEffect(() => {
-    let active = true;
-    navigator.mediaDevices?.getUserMedia({ video: { facingMode: 'user' }, audio: false })
-      .then(stream => {
-        if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
-        camStreamRef.current = stream;
-        if (camVideoRef.current) camVideoRef.current.srcObject = stream;
-      })
-      .catch(() => { }); // camera unavailable — sidebar just stays blank
-    return () => {
-      active = false;
-      camStreamRef.current?.getTracks().forEach(t => t.stop());
-      camStreamRef.current = null;
-    };
-  }, []);
+    if (camVideoRef.current && camStream) {
+      camVideoRef.current.srcObject = camStream;
+    }
+  }, [camStream]);
 
   useEffect(() => {
     if (askingName) {
@@ -544,16 +533,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch (e) { console.error(e); }
   };
 
-  const handleDeleteData = async () => {
-    const trimmed = deleteName.trim();
-    if (!trimmed) return;
-    try {
-      await fetch(BACKEND + '/visitor/delete_my_data?name=' + encodeURIComponent(trimmed), { method: 'POST' });
-      setDeleted(true);
-      setTimeout(() => { setDeleteMode(false); setDeleted(false); setDeleteName(''); }, 3500);
-    } catch (e) { console.error(e); }
-  };
-
   const statusLabel = {
     ready: 'Ready',
     listening: 'Listening',
@@ -601,9 +580,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <span style={{ fontSize: '13px', color: statusColor, fontWeight: '700', transition: 'color 0.3s', letterSpacing: '0.2px' }}>{statusLabel}</span>
             </div>
           </div>
-          <button onClick={() => setDeleteMode(d => !d)} style={{ background: '#fff5f5', border: '1.5px solid #ef9a9a', color: '#c62828', borderRadius: '8px', padding: '9px 18px', fontSize: '13px', cursor: 'pointer', fontWeight: '600' }}>
-            Delete My Data
-          </button>
         </div>
       </header>
 
@@ -611,44 +587,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           chat bubble via speak(greeting, () => addMessage(...)), so showing
           it again in a banner was duplicate clutter. */}
 
-      {deleteMode && (
-        <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '16px', padding: '40px', width: '420px', boxShadow: '0 12px 48px rgba(0,0,0,0.18)' }}>
-            {deleted ? (
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-                </div>
-                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted Successfully</div>
-                <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed from the system.</p>
-              </div>
-            ) : (
-              <>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-                  <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>
-                  </div>
-                  <div>
-                    <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
-                    <div style={{ fontSize: '12px', color: '#999' }}>This action cannot be undone</div>
-                  </div>
-                </div>
-                <p style={{ color: '#666', marginBottom: '16px', fontSize: '14px', lineHeight: '1.6' }}>Enter your registered name to permanently remove your face data from the system.</p>
-                <input style={inputStyle} placeholder="Enter your registered name"
-                  value={deleteName} onChange={e => setDeleteName(e.target.value)}
-                  onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
-                <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
-                  <button onClick={() => setDeleteMode(false)} style={btnSecondary}>Cancel</button>
-                  <button onClick={handleDeleteData} style={{ ...btnPrimary, background: '#c62828' }}>Delete Permanently</button>
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
-      {askingName && !deleteMode && (
+      {askingName && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ background: '#fff', borderRadius: '16px', padding: '40px', width: '440px', boxShadow: '0 12px 48px rgba(0,0,0,0.18)' }}>
             {submitted ? (
