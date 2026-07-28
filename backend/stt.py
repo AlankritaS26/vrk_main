@@ -17,6 +17,7 @@ Env vars (matches the provider-abstraction story in EP-03):
 
 import os
 import time
+import logging
 import numpy as np
 from faster_whisper import WhisperModel
 
@@ -78,6 +79,9 @@ def pcm16_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
 
 # ---------------------------------------------------------------- main API
 
+logger = logging.getLogger('RNSIT_Kiosk.STT')
+
+
 def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
     """
     Transcribe one complete utterance of 16 kHz mono int16 PCM.
@@ -91,7 +95,13 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
     try:
         audio = pcm16_bytes_to_float32(pcm_bytes)
 
+        import numpy as _np
+        _rms = float(_np.sqrt(_np.mean(audio ** 2))) if len(audio) else 0.0
+        logger.info(f"[STT] recv {len(audio)} samples "
+                    f"({len(audio)/SAMPLE_RATE:.2f}s) rms={_rms:.5f}")
+
         if len(audio) < SAMPLE_RATE * 0.3:                      # <300 ms
+            logger.info("[STT] rejected: too_short")
             return {"text": "", "confidence": 0.0,
                     "language": language or "en", "error": "too_short"}
 
@@ -101,6 +111,7 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
         # DSP chain — EP-06
         audio = preprocess(audio)
         if audio is None:
+            logger.info(f"[STT] rejected: too_quiet (rms={_rms:.5f} < gate)")
             return {"text": "", "confidence": 0.0,
                     "language": language or "en", "error": "too_quiet"}
 
@@ -125,6 +136,7 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
             text += seg.text
             logprobs.append(seg.avg_logprob)
         text = text.strip()
+        logger.info(f"[STT] transcript={text!r}")
 
         confidence = (max(0.0, min(1.0, float(np.exp(np.mean(logprobs)))))
                       if logprobs else 0.0)

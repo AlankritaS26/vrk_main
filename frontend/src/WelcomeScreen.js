@@ -21,6 +21,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const playCtxRef = useRef(null);              // Web Audio playback context
   const playCursorRef = useRef(0);               // schedule cursor for gapless clips
   const pendingSpeechRef = useRef(null);         // speech blocked by autoplay policy
+  const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
+  const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
+  const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -214,7 +217,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleUtterance = useCallback(async (float32Audio) => {
     if (!isMounted.current || askingName) return;
-    if (isSpeaking.current || statusRef.current === 'processing') {
+    if (isSpeaking.current) {
+      // The VAD just CONFIRMED real speech (this is onSpeechEnd) while TTS
+      // was still playing — commit the barge-in now and process it right away.
+      interruptSpeaking();
+    } else if (statusRef.current === 'processing') {
       // Visitor spoke while we were busy — save it as the next prompt
       pendingUtteranceRef.current = float32Audio;
       return;
@@ -247,6 +254,55 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [askingName]);
 
+  // Barge-in has two stages, matching the two things the VAD can tell us:
+  //
+  //  1. onSpeechStart fires OPTIMISTICALLY — the instant sound crosses the
+  //     probability threshold, before the VAD knows if it's real speech or
+  //     a cough/click/echo blip. We respond by DUCKING the TTS volume —
+  //     fast, but non-destructive and reversible.
+  //  2. The VAD itself later tells us which it was:
+  //       - onSpeechEnd   -> real speech, confirmed. NOW we hard-stop TTS.
+  //       - onVADMisfire  -> false alarm. We restore TTS volume and carry on.
+  //
+  // This avoids killing the kiosk's sentence over noise/echo while still
+  // reacting within ~80ms when someone genuinely starts talking.
+
+  const duckSpeaking = useCallback(() => {
+    if (!isSpeaking.current || !ttsGainRef.current || !playCtxRef.current) return;
+    const g = ttsGainRef.current.gain;
+    const now = playCtxRef.current.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(0.12, now + 0.08);   // quick, gentle duck — not a hard cut
+  }, []);
+
+  const restoreSpeaking = useCallback(() => {
+    if (!ttsGainRef.current || !playCtxRef.current) return;
+    const g = ttsGainRef.current.gain;
+    const now = playCtxRef.current.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(1, now + 0.15);      // false alarm — fade back to full volume
+  }, []);
+
+  // Hard commit: only called once the VAD has CONFIRMED real speech
+  // (onSpeechEnd), or on session-ending events (e.g. goodbye). Stops all
+  // scheduled/playing TTS audio immediately and hands control back to the mic.
+  const interruptSpeaking = useCallback(() => {
+    if (!isSpeaking.current) return;
+    activeSpeakIdRef.current = null;        // any in-flight speak() loop sees this and stops
+    activeNodesRef.current.forEach((n) => { try { n.stop(); } catch (e) { /* already stopped */ } });
+    activeNodesRef.current = [];
+    window.speechSynthesis.cancel();        // in case the browser-voice fallback was speaking
+    if (playCtxRef.current) playCursorRef.current = playCtxRef.current.currentTime;
+    if (ttsGainRef.current && playCtxRef.current) {
+      const now = playCtxRef.current.currentTime;
+      ttsGainRef.current.gain.cancelScheduledValues(now);
+      ttsGainRef.current.gain.setValueAtTime(1, now);   // reset for the next speak() call
+    }
+    isSpeaking.current = false;
+  }, []);
+
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const startListening = useCallback(async () => {
     if (!isMounted.current || askingName) return;
@@ -267,7 +323,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       const mic = await createKioskMic({
         onStream: (stream) => { streamRef.current = stream; },
         onSpeechStart: () => {
-          if (isSpeaking.current || !isMounted.current) return;
+          if (!isMounted.current) return;
+          if (isSpeaking.current) duckSpeaking();   // tentative only — confirmed/cancelled below
           isListening.current = true;
           setListening(true);
           setLiveText('');
@@ -277,19 +334,21 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         onSpeechEnd: (audio) => handleUtterance(audio),
         onMisfire: () => {
           isListening.current = false;
-          if (isMounted.current) { setListening(false); setStatus('ready'); }
+          if (isSpeaking.current) {
+            restoreSpeaking();               // false alarm — resume full TTS volume
+            if (isMounted.current) { setListening(false); setStatus('speaking'); }
+          } else if (isMounted.current) {
+            setListening(false); setStatus('ready');
+          }
         },
       });
       micRef.current = mic;
-      // If TTS is already playing (greeting started before mic was ready),
-      // immediately park the VAD so it doesn't pick up TTS audio.  finish()
-      // will call startListening() again once speaking is done, at which point
-      // isSpeaking will be false and we take the resume path above.
-      if (isSpeaking.current) {
-        mic.pause();
-      } else {
-        setStatus('ready');
-      }
+      // Leave the VAD running even if TTS is already playing (e.g. the
+      // greeting started before the mic finished initializing) — this lets
+      // the visitor barge in on the very first greeting too. Status stays
+      // whatever speak() already set ('speaking'); only set 'ready' when
+      // nothing is currently talking.
+      if (!isSpeaking.current) setStatus('ready');
     } catch (err) {
       console.error('[MIC] Error:', err);
       if (!isSpeaking.current) setStatus('ready');
@@ -370,11 +429,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const speak = useCallback(async (text, onStart) => {
     window.speechSynthesis.cancel();
-    micRef.current?.pause();          // don't let the kiosk hear itself
+    const myId = Symbol('speak');           // identifies this call so interruptSpeaking() can invalidate it
+    activeSpeakIdRef.current = myId;
+    // Mic is intentionally NOT paused here (unlike before) — it stays live
+    // through TTS so the visitor can barge in. echoCancellation on the mic
+    // stream (kioskMic.js) is what keeps it from hearing its own voice.
     isSpeaking.current = true;
     setStatus('speaking');
 
     const finish = () => {
+      if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
       isSpeaking.current = false;
       setStatus('ready');
       if (isMounted.current) startListening();
@@ -419,17 +483,29 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       return;
     }
     playCursorRef.current = pctx.currentTime;
+    if (!ttsGainRef.current) {
+      ttsGainRef.current = pctx.createGain();
+      ttsGainRef.current.connect(pctx.destination);
+    }
+    ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
+    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
 
     const playClip = (b64) => new Promise(async (resolve) => {
+      if (activeSpeakIdRef.current !== myId) return resolve();   // interrupted before this clip started
       try {
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         const buf = await pctx.decodeAudioData(bytes.buffer);
+        if (activeSpeakIdRef.current !== myId) return resolve();  // interrupted while decoding
         const node = pctx.createBufferSource();
         node.buffer = buf;
-        node.connect(pctx.destination);
-        node.onended = resolve;
+        node.connect(ttsGainRef.current);
+        activeNodesRef.current.push(node);
+        node.onended = () => {
+          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+          resolve();
+        };
         fireStart();                     // text appears the moment audio starts
         const at = Math.max(pctx.currentTime, playCursorRef.current);
         node.start(at);
@@ -480,15 +556,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       let p1 = sentences.length > 1 ? fetchClip(sentences[1]) : null;
 
       for (let i = 0; i < sentences.length; i++) {
+        if (activeSpeakIdRef.current !== myId) break;   // interrupted — stop scheduling more chunks
         const b64 = await p0;
         p0 = p1;
         p1 = i + 2 < sentences.length ? fetchClip(sentences[i + 2]) : null;
         if (b64) { anyPlayed = true; await playClip(b64); }
       }
 
+      if (activeSpeakIdRef.current !== myId) return;    // interrupted — don't fall back to browser voice
       if (!anyPlayed) { browserSpeak(); return; }
       finish();
     } catch (e) {
+      if (activeSpeakIdRef.current !== myId) return;
       console.error('[TTS] backend unavailable, using browser voice', e);
       browserSpeak();
     }
