@@ -90,13 +90,8 @@ export default function App() {
       }
     }
 
-    // Tick every 333ms (3fps ceiling), but only actually SEND that often
-    // while nobody's been recognised yet (IDLE/DWELLING/RECOGNIZING) — that's
-    // when fast detection matters. Once a session is ACTIVE/DEPARTING we only
-    // need to notice "face gone" or "face swapped", so drop to ~1fps — this
-    // keeps the backend free to run STT/LLM/TTS without CPU contention from
-    // continuous face detection during conversation.
-    let lastSendAt = 0;
+    // 3 fps — runs continuously regardless of screen or conversation state,
+    // so departure/face-swap detection always works.
     function startSending() {
       sendIntervalRef.current = setInterval(() => {
         const ws = wsRef.current;
@@ -104,12 +99,6 @@ export default function App() {
         const cvs = captureCanvasRef.current;
         if (!ws || ws.readyState !== WebSocket.OPEN) return;
         if (!video || video.videoWidth === 0) return;
-
-        const st = detStateRef.current;
-        const minGap = (st === 'ACTIVE' || st === 'DEPARTING') ? 1000 : 333;
-        const now = Date.now();
-        if (now - lastSendAt < minGap) return;
-        lastSendAt = now;
 
         const ctx = cvs.getContext('2d');
         cvs.width = video.videoWidth;

@@ -1,4 +1,4 @@
-"""
+﻿"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
@@ -10,6 +10,7 @@ import uuid
 import shutil
 import logging
 import hashlib
+import httpx
 import string
 import asyncio
 import sys
@@ -153,7 +154,7 @@ async def _session_timeout_loop():
             if active_session and _last_activity_ts > 0:
                 idle = datetime.now().timestamp() - _last_activity_ts
                 if idle >= SESSION_TIMEOUT_SECONDS:
-                    logger.info(f"[SESSION] Timeout after {idle:.0f}s idle — ending session")
+                    logger.info(f"[SESSION] Timeout after {idle:.0f}s idle - ending session")
                     sid = active_session.get("session_id")
                     active_session    = None
                     _last_activity_ts = 0.0
@@ -799,9 +800,36 @@ async def start_session(
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
+    """
+    BUG FIX: previously this cleared `active_session` unconditionally, even
+    when the caller's `session_id` didn't match the currently active one (or
+    was omitted). That's a real race: detection.py's own recheck loop and
+    the voice/conversation flow can both call this endpoint, and a stale
+    call arriving just after a NEW session has already started would wipe
+    out that new session instead of the one it actually meant to end —
+    which would then make detection.py (which cross-checks /session/current)
+    think ITS brand-new session was "ended elsewhere" and immediately drop
+    it. Now: if a session_id is supplied, it must match the active session,
+    otherwise the request is ignored (not an error — just a no-op, since the
+    thing it wanted to end is already gone).
+    """
     global active_session, _last_activity_ts
-    sid = session_id or (active_session["session_id"] if active_session else None)
-    
+
+    if active_session is None:
+        return {"status": "success", "note": "no active session"}
+
+    if session_id and active_session.get("session_id") != session_id:
+        logger.info(
+            f"[SESSION] Ignoring /session/end for session_id={session_id} — "
+            f"active session is {active_session.get('session_id')}"
+        )
+        return {
+            "status": "ignored",
+            "reason": "session_id mismatch (a newer session is active)",
+            "active_session_id": active_session.get("session_id"),
+        }
+
+    sid = active_session.get("session_id")
     active_session    = None
     _last_activity_ts = 0.0
     await manager.broadcast({"type": "session_end", "session_id": sid})
