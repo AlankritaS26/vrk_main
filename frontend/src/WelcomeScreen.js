@@ -10,6 +10,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
+  const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
+  const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const isListening = useRef(false);
   const analyserRef = useRef(null);
   const animFrameRef = useRef(null);
@@ -82,6 +84,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     + 'How may I assist you today?');
 
   useEffect(() => { statusRef.current = status; }, [status]);
+  const sessionRef = useRef(null);
+  useEffect(() => { sessionRef.current = session; }, [session]);
 
   useEffect(() => {
     if (scrollRef.current)
@@ -107,6 +111,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'session_end') {
+            // Kill any audio + pending work from the ended session so nothing
+            // bleeds into the next visitor — EXCEPT the farewell, which is the
+            // one line meant to play as the session ends.
+            if (!farewellPlayingRef.current) {
+              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
+              pendingUtteranceRef.current = null;
+            }
             window.dispatchEvent(new Event('vrk-session-ended'));
           }
         } catch (_) { }
@@ -302,6 +313,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     isSpeaking.current = false;
   }, []);
+  useEffect(() => { interruptSpeakingRef.current = interruptSpeaking; }, [interruptSpeaking]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const startListening = useCallback(async () => {
@@ -324,7 +336,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         onStream: (stream) => { streamRef.current = stream; },
         onSpeechStart: () => {
           if (!isMounted.current) return;
-          if (isSpeaking.current) duckSpeaking();   // tentative only — confirmed/cancelled below
+          // HARD barge-in: the instant the visitor starts speaking, STOP the
+          // kiosk's voice immediately — don't just duck and wait for the VAD
+          // to confirm at speech-end. A receptionist stops talking the moment
+          // you speak; so does this.
+          if (isSpeaking.current) interruptSpeaking();
           isListening.current = true;
           setListening(true);
           setLiveText('');
@@ -333,13 +349,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         },
         onSpeechEnd: (audio) => handleUtterance(audio),
         onMisfire: () => {
+          // We hard-stopped TTS on speech-start, so there's nothing to
+          // restore. A misfire just means no real question followed — return
+          // to ready and let the visitor speak again.
           isListening.current = false;
-          if (isSpeaking.current) {
-            restoreSpeaking();               // false alarm — resume full TTS volume
-            if (isMounted.current) { setListening(false); setStatus('speaking'); }
-          } else if (isMounted.current) {
-            setListening(false); setStatus('ready');
-          }
+          if (isMounted.current) { setListening(false); setStatus('ready'); }
         },
       });
       micRef.current = mic;
@@ -387,9 +401,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
       const farewell = 'You are most welcome! Have a wonderful day. Goodbye!';
       micRef.current?.pause();
-      speak(farewell);                       // WebAudio keeps playing across unmount
-      try { await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }); } catch (e) { }
-      window.dispatchEvent(new Event('vrk-session-ended'));   // App switches NOW
+      farewellPlayingRef.current = true;     // protect this audio from the session_end stop
+
+      // Switch to the goodbye screen NOW so the farewell voice plays OVER it
+      // (they should appear together). The audio uses Web Audio, which keeps
+      // playing across this component unmounting — and farewellPlayingRef
+      // keeps the session_end handler from stopping it. We clear the flag
+      // when the voice actually finishes.
+      speak(farewell, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
+      window.dispatchEvent(new Event('vrk-session-ended'));   // goodbye screen appears now
       return;
     }
 
@@ -409,6 +430,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ]);
       clearTimeout(askTimeout);
       const data = await askRes.json();
+
+      // STALE-ANSWER GUARD: if the session changed while this request was in
+      // flight (visitor said goodbye and left, next visitor arrived), this
+      // answer belongs to nobody on screen — drop it so it never bleeds into
+      // the next person's session.
+      const liveSid = sessionRef.current?.session_id || 'guest';
+      if (data.dropped || liveSid !== sid) {
+        console.info('[sendToBackend] dropped stale answer for', sid);
+        isSpeaking.current = false;
+        setStatus('ready');
+        return;
+      }
+
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
       fetch(BACKEND + '/message', {
         method: 'POST',
@@ -427,7 +461,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, [session, addMessage]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speak = useCallback(async (text, onStart) => {
+  const speak = useCallback(async (text, onStart, onDone) => {
     window.speechSynthesis.cancel();
     const myId = Symbol('speak');           // identifies this call so interruptSpeaking() can invalidate it
     activeSpeakIdRef.current = myId;
@@ -441,6 +475,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
       isSpeaking.current = false;
       setStatus('ready');
+      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
       if (isMounted.current) startListening();
     };
 
