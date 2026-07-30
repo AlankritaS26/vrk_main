@@ -12,6 +12,7 @@ import logging
 import hashlib
 import httpx
 import string
+import re
 import asyncio
 import sys
 import base64
@@ -30,15 +31,15 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+import httpx
+
+load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── BUG FIX: set BEFORE detection import so detection.py captures the right URL ──
-# detection.py reads BACKEND_URL at module-level; setting it here (before the
-# import below) guarantees it always calls 127.0.0.1 even when the .env file
-# contains an external hostname.
 os.environ["BACKEND_URL"] = "http://127.0.0.1:8001"
 
 # Imports matching your async MongoDB database layout
@@ -49,7 +50,7 @@ from backend.database import (
     delete_face_by_name,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
-from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
+from backend.llm import initialize_rag_knowledge_base, close_llm_client
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
 
@@ -77,12 +78,6 @@ def run_pipeline(frame_data):
         return _NoOp()
     return _run_pipeline(frame_data)
 
-load_dotenv()
-
-# When detection.py is imported inside the backend process its HTTP client
-# must call back to localhost, not the external hostname in BACKEND_URL.
-# NOTE: the real override is now ABOVE the detection import (line ~32); this
-# line is kept as a safety net in case load_dotenv() ran after that point.
 os.environ.setdefault("BACKEND_URL", "http://127.0.0.1:8001")
 
 logging.basicConfig(
@@ -91,9 +86,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RNSIT_Kiosk")
 
-ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-MAX_QUERY_LENGTH: int = 300  # Lowered slightly to guard against buffer/token manipulation attacks
+MAX_QUERY_LENGTH: int = 300 
 SESSION_TIMEOUT_SECONDS: int = 120
+
+# ── RAG MICROSERVICE CONFIG ────────────────────────────────────────────────
+# Read once, here, near the top of the file — everything else in this module
+# (the /ask endpoint, the /api/chat endpoint, and the admin RAG management
+# endpoints) reuses these two constants instead of re-reading os.environ.
+RAG_SERVICE_URL: str   = os.getenv("RAG_SERVICE_URL", "http://127.0.0.1:8600").rstrip("/")
+RAG_COLLECTION:  str   = os.getenv("RAG_COLLECTION", "kiosk-rnsit")
+RAG_TOP_K:       int   = int(os.getenv("RAG_TOP_K", "5"))
+RAG_SIMILARITY_THRESHOLD: float = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
 
 DOMAINS_CORRECTIONS = {
     "pricipal":  "principal",
@@ -102,7 +105,6 @@ DOMAINS_CORRECTIONS = {
     "placment":  "placement",
     "fees":      "fee",
 }
-
 # --- REDIS / MEMURAI CACHING ---
 try:
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
@@ -186,6 +188,173 @@ def verify_input_safety(query: str) -> bool:
         return False
         
     return True
+
+
+# ==========================================
+# RAG MICROSERVICE CLIENT
+# ==========================================
+_RAG_STOPWORDS = {
+    "who", "is", "the", "of", "a", "an", "what", "where", "when", "how", "why",
+    "please", "tell", "me", "can", "you", "are", "in", "for", "to", "and", "or",
+    "do", "does", "it", "was", "were", "be", "this", "that", "rnsit", "rns",
+    "institute", "technology", "about",
+}
+
+
+_RAG_ABBREVS = {"dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "no", "vs", "etc"}
+
+
+# ── Q/A label stripper ────────────────────────────────────────────────────
+# FAQ-derived chunks are seeded (see backend/llm.py::_json_to_text_chunks)
+# as literal "Q: <question>? A: <answer>" strings, on purpose — that extra
+# question text helps the embedding model match visitor phrasing. But those
+# raw "Q:"/"A:" labels — and the question text itself — must never reach the
+# visitor. _QA_LABEL_RE strips a leading "Q: ...? A: " block; _STRAY_LABEL_RE
+# mops up any leftover "Q:"/"A:" markers (covers chunks with multiple
+# Q/A pairs bundled together, or any other future FAQ-shaped content).
+_QA_LABEL_RE = re.compile(r"Q:\s*.+?\?\s*A:\s*", re.IGNORECASE)
+_STRAY_LABEL_RE = re.compile(r"\b[QA]:\s*", re.IGNORECASE)
+
+
+def _strip_qa_labels(text: str) -> str:
+    """Remove 'Q: ... A: ...' scaffolding from a chunk, leaving just the answer text."""
+    text = _QA_LABEL_RE.sub("", text)
+    text = _STRAY_LABEL_RE.sub("", text)
+    return text.strip()
+
+
+def _split_into_facts(text: str) -> list[str]:
+    """
+    Splits a chunk into sentence-like fragments without cutting titles and
+    initials in half (e.g. "Dr. M K Venkatesha" would otherwise get chopped
+    into "Dr." + "M K Venkatesha" by a naive '. ' split).
+    """
+    raw = re.split(r"(?<=[.!?])\s+", text.strip())
+    merged, buffer = [], ""
+    for frag in raw:
+        buffer = (buffer + " " + frag).strip() if buffer else frag
+        tokens = buffer.split()
+        last = tokens[-1] if tokens else ""
+        is_initial = bool(re.fullmatch(r"[A-Z]\.", last))
+        is_abbrev = last.rstrip(".").lower() in _RAG_ABBREVS
+        if is_initial or is_abbrev:
+            continue  # keep buffering — this period wasn't a real sentence end
+        merged.append(buffer)
+        buffer = ""
+    if buffer:
+        merged.append(buffer)
+    return merged
+
+
+def _extract_relevant_sentences(text: str, query: str, max_sentences: int = 2) -> tuple[str, bool]:
+    """
+    RAGService's chunks sometimes bundle many unrelated facts into one
+    paragraph (e.g. a whole "college facts" block containing the address,
+    director, principal, admissions phone, etc. all together). Instead of
+    handing the entire chunk back to the visitor for every question that
+    happens to match it, pull out just the fact(s) that actually contain
+    the question's keywords.
+
+    Returns (text, matched) — matched=True means we found keyword overlap
+    and text is the focused extract; matched=False means nothing in this
+    chunk matched and text is the original, unmodified chunk (the caller
+    decides whether an unmatched chunk is even worth including at all).
+    """
+    keywords = {w for w in re.findall(r"[a-z0-9]+", query.lower())
+                if w not in _RAG_STOPWORDS and len(w) > 2}
+    if not keywords:
+        return text, False
+
+    fragments = _split_into_facts(text)
+    scored = []
+    for frag in fragments:
+        frag_lower = frag.lower()
+        hits = sum(1 for kw in keywords if kw in frag_lower)
+        if hits > 0:
+            scored.append((hits, frag.strip()))
+
+    if not scored:
+        return text, False
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = [frag for _, frag in scored[:max_sentences]]
+    return " ".join(best), True
+
+
+async def query_rag_service(query: str, k: int | None = None) -> str:
+    """
+    Calls the standalone RAGService microservice (RAG_SERVICE_URL, default
+    http://127.0.0.1:8600) to semantically search the knowledge base and
+    returns a natural-language answer built from the best-matching chunk(s).
+
+    RAG_TOP_K controls how many candidates we ask for; RAG_SIMILARITY_THRESHOLD
+    filters out weak matches (RAGService's score = 1 - vector distance, so
+    higher is better — 0.35 is a reasonable "actually related" cutoff).
+
+    This is the single place that talks to RAGService — both /ask and
+    /api/chat call through here so caching, logging, and the admin
+    dashboard all see consistent answers.
+    """
+    k = k or RAG_TOP_K
+    try:
+        # Timeout is generous (60s) because RAGService downloads/loads its
+        # embedding model lazily on its very first search request ever —
+        # after that first warm-up it responds in well under a second.
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/search",
+                json={"query": query, "k": k},
+            )
+        resp.raise_for_status()
+        results = resp.json()
+    except httpx.RequestError as exc:
+        logger.error("[RAG] RAGService unreachable at %s: %s", RAG_SERVICE_URL, exc)
+        return "I'm having trouble reaching the knowledge base right now. Please visit the Admin Block for assistance."
+    except httpx.HTTPStatusError as exc:
+        logger.error("[RAG] RAGService returned an error: %s", exc.response.text)
+        return "I couldn't find an answer to that just now. Could you rephrase your question?"
+    except Exception as exc:
+        logger.error("[RAG] Unexpected error querying RAGService: %s", exc)
+        return "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
+
+    # Drop weak matches so an unrelated question doesn't get a confident-sounding
+    # but wrong answer stitched together from irrelevant chunks.
+    strong_results = [r for r in results if r.get("score", 0) >= RAG_SIMILARITY_THRESHOLD]
+    if not strong_results:
+        logger.info("[RAG] No result above threshold %.2f for: '%s' (best score=%s)",
+                    RAG_SIMILARITY_THRESHOLD, query,
+                    results[0]["score"] if results else "n/a")
+        return "I don't have information on that yet. Please check with the Admin Block or try rephrasing your question."
+
+    # Take the single best-matching chunk instead of stitching facts from
+    # several chunks together. strong_results is ordered by score, so the
+    # first chunk whose text actually contains the question's keywords is
+    # the best answer — stop there rather than appending more chunks that
+    # happen to also mention the same topic (which was producing repetitive,
+    # multi-part answers for simple one-fact questions).
+    answer = ""
+    fallback_text = ""
+    for r in strong_results[:3]:
+        raw_text = (r.get("text") or "").strip()
+        if not raw_text:
+            continue
+        raw_text = _strip_qa_labels(raw_text)
+        if not raw_text:
+            continue
+        extracted, matched = _extract_relevant_sentences(raw_text, query, max_sentences=1)
+        if matched:
+            answer = extracted
+            break
+        if not fallback_text:
+            fallback_text = raw_text
+
+    if not answer:
+        # Nothing matched a keyword anywhere — fall back to just the single
+        # best-ranked chunk's full text rather than stitching several
+        # unrelated chunks together.
+        answer = fallback_text
+
+    return answer or "I don't have information on that yet. Please check with the Admin Block or try rephrasing your question."
 
 
 # ==========================================
@@ -303,6 +472,42 @@ def health():
 @app.get("/")
 def root():
     return {"status": "RNSIT Kiosk Backend is Live"}
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(..., description="Visitor's question, answered via the RAGService knowledge base")
+
+
+@app.post("/api/chat")
+async def proxy_to_rag(payload: QueryRequest):
+    """
+    Convenience POST endpoint: answers a question straight from the
+    RAGService knowledge base (port 8600 by default), then logs the
+    interaction to MongoDB and broadcasts it over the websocket so the
+    frontend and the /logs-dashboard admin view both see it — same as /ask.
+    """
+    global _last_activity_ts
+    _last_activity_ts = datetime.now().timestamp()
+
+    if not verify_input_safety(payload.query):
+        raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
+
+    sid = active_session["session_id"] if active_session else "unknown"
+
+    visitor_entry = _log_message(payload.query, "visitor")
+    await manager.broadcast({"type": "message", **visitor_entry})
+
+    answer = await query_rag_service(payload.query)
+
+    try:
+        await save_interaction(sid, payload.query, answer)
+    except Exception as exc:
+        logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
+
+    kiosk_entry = _log_message(answer, "kiosk")
+    await manager.broadcast({"type": "message", **kiosk_entry})
+
+    return {"query": payload.query, "answer": answer, "source": "rag_service"}
 
 
 # ==========================================================
@@ -939,29 +1144,24 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── External Team LLM RAG Pipeline Handoff ─────────────────────────────────
-    logger.info("[CACHE MISS] Invoking external team's custom RAG pipeline for: '%s'", q_normalized)
-    
-    # Process memory bounds safely matching the structure they parse
-    safe_history = message_log[-6:] if len(message_log) > 0 else []
-    
+    # ─── RAGService knowledge-base lookup (port 8600 by default) ────────────────
+    logger.info("[CACHE MISS] Querying RAGService knowledge base for: '%s'", q_normalized)
+
     try:
-        # Call the other team's function directly. It reads its own env vars, 
-        # manages context from college_info.json, and contacts their LLM platform.
-        answer = await generate_rag_kiosk_response(q_normalized, history=safe_history)
-        
+        answer = await query_rag_service(q_normalized)
+
         # Cache the successful response back in Redis
         if redis_client and answer:
             try:
                 redis_client.set(cache_key, answer, ex=3600)
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
-                
+
     except Exception as exc:
-        logger.error("External team's LLM engine failed or threw an exception: %s", exc)
+        logger.error("RAGService query failed or threw an exception: %s", exc)
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="external_team_llm")
+    return await _respond(answer, source="rag_service")
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
@@ -1239,8 +1439,9 @@ async def delete_my_data(name: str):
 # ==========================================
 # RAG KNOWLEDGE BASE MANAGEMENT
 # ==========================================
-_RAG_URL  = os.getenv("RAG_SERVICE_URL", "http://localhost:8600").rstrip("/")
-_RAG_COLL = os.getenv("RAG_COLLECTION",  "kiosk-rnsit")
+# NOTE: these reuse RAG_SERVICE_URL / RAG_COLLECTION defined near the top of
+# this file — do not re-declare them here, or you'll re-introduce the same
+# kind of NameError bug that used to crash this app on startup.
 
 
 @app.post("/api/rag/upload")
@@ -1253,7 +1454,7 @@ async def rag_upload_file(
     content = await file.read()
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
-            f"{_RAG_URL}/v1/collections/{_RAG_COLL}/index/file",
+            f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/index/file",
             files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
             data={"source": source or file.filename},
         )
@@ -1266,7 +1467,7 @@ async def rag_upload_file(
 async def rag_list_files(username: str = Depends(authenticate_admin)):
     """List all files indexed in the RAG knowledge base."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{_RAG_URL}/v1/collections/{_RAG_COLL}/files")
+        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/files")
     if resp.status_code != 200:
         return {"files": []}
     return resp.json()
@@ -1276,7 +1477,7 @@ async def rag_list_files(username: str = Depends(authenticate_admin)):
 async def rag_stats(username: str = Depends(authenticate_admin)):
     """Return collection stats (chunk count, indexed files) from RAGService."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{_RAG_URL}/v1/collections/{_RAG_COLL}")
+        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}")
     if resp.status_code != 200:
         return {"error": "RAGService unreachable"}
     return resp.json()
@@ -1287,7 +1488,7 @@ async def rag_delete_file(filename: str, username: str = Depends(authenticate_ad
     """Remove a specific file's chunks from the RAG knowledge base."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.delete(
-            f"{_RAG_URL}/v1/collections/{_RAG_COLL}/files/{filename}"
+            f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/files/{filename}"
         )
     if resp.status_code not in (200, 404):
         raise HTTPException(status_code=502, detail=f"RAGService error: {resp.text}")
