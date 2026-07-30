@@ -264,15 +264,26 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
         f"CET code: {c.get('admission_codes', {}).get('cet')}."
     )
 
+    # ── Administration: one focused chunk per fact instead of one bundled
+    # paragraph, so a query like "who is the principal" has a dedicated,
+    # undiluted chunk to match against instead of competing with working
+    # hours / director / admissions info all mashed into the same vector. ──
     adm = data.get("administration", {})
-    chunks.append(
-        f"RNSIT working hours: {adm.get('working_hours')}. "
-        f"Director: {adm.get('director', {}).get('name')} ({adm.get('director', {}).get('phone')}). "
-        f"Principal: {adm.get('principal', {}).get('name')} ({adm.get('principal', {}).get('phone')}). "
-        f"Admissions phone: {adm.get('contacts', {}).get('admissions_phone')}. "
-        f"Admissions email: {adm.get('contacts', {}).get('admissions_email')}."
-    )
-    enquiry = adm.get("contacts", {}).get("enquiry_phone", [])
+    if adm.get("working_hours"):
+        chunks.append(f"RNSIT working hours: {adm.get('working_hours')}.")
+    director = adm.get("director", {})
+    if director.get("name"):
+        chunks.append(f"RNSIT Director: {director.get('name')}. Contact: {director.get('phone')}.")
+    principal = adm.get("principal", {})
+    if principal.get("name"):
+        chunks.append(f"RNSIT Principal: {principal.get('name')}. Contact: {principal.get('phone')}.")
+    contacts = adm.get("contacts", {})
+    if contacts.get("admissions_phone") or contacts.get("admissions_email"):
+        chunks.append(
+            f"RNSIT admissions phone: {contacts.get('admissions_phone')}. "
+            f"Admissions email: {contacts.get('admissions_email')}."
+        )
+    enquiry = contacts.get("enquiry_phone", [])
     if enquiry:
         chunks.append(f"RNSIT general enquiry numbers: {', '.join(enquiry)}.")
 
@@ -319,7 +330,7 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
             chunks.append(" ".join(s_parts))
 
     for section, content in data.items():
-        if section in ("meta", "college", "administration", "departments", "facilities", "placements"):
+        if section in ("meta", "college", "administration", "departments", "facilities", "placements", "faqs"):
             continue
         if isinstance(content, dict):
             for key, val in content.items():
@@ -329,6 +340,17 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
                     chunks.append(f"{section.replace('_', ' ').title()} — {key}: {', '.join(str(v) for v in val)}")
         elif isinstance(content, str):
             chunks.append(f"{section.replace('_', ' ').title()}: {content}")
+
+    # ── FAQs: these are hand-written, single-topic Q&A pairs — the best
+    # possible chunks for direct-match retrieval. Previously silently
+    # dropped by the generic loop above (a list-of-dicts matches neither
+    # the isinstance(content, dict) nor isinstance(content, str) branch),
+    # so none of the 40+ FAQ entries ever reached the vector store. ──
+    for faq in data.get("faqs", []):
+        q = (faq.get("question") or "").strip()
+        a = (faq.get("answer") or "").strip()
+        if q and a:
+            chunks.append(f"Q: {q} A: {a}")
 
     return [c.strip() for c in chunks if c.strip()]
 

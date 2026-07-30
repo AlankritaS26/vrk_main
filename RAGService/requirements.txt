@@ -1,0 +1,17 @@
+streamlit>=1.36.0
+requests>=2.32.0
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9     # file uploads
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+torch>=2.3.0
+openai>=1.40.0              # Azure OpenAI embeddings (optional)
+python-pptx>=0.6.23
+python-docx>=1.1.0
+pypdf>=4.0.0
+pandas>=2.2.0
+openpyxl>=3.1.0
+langchain-text-splitters>=0.2.0
+python-dotenv>=1.0.0
+numpy>=1.26.0
