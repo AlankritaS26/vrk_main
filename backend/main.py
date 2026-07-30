@@ -1099,25 +1099,40 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
     visitor_entry = _log_message(question, "visitor")
-    await manager.broadcast({"type": "message", **visitor_entry})
+    await manager.broadcast({"type": "message", "session_id": sid, **visitor_entry})
 
-    async def _respond(answer: str, source: str = "") -> dict:
+    async def _respond(answer: str, source: str = "",
+                       is_farewell: bool = False) -> dict:
+        # STALE-ANSWER GUARD: a slow LLM reply can outlive the session that
+        # asked it (visitor said "thank you" and walked off). If the session
+        # changed while we were working, this answer belongs to nobody on
+        # screen — drop it instead of broadcasting into the NEXT visitor.
+        # (The farewell is exempt: it intentionally runs as the session ends.)
+        current_sid = active_session["session_id"] if active_session else None
+        if not is_farewell and sid != "unknown" and current_sid != sid:
+            logger.info(f"[ASK] Dropping stale answer for ended session "
+                        f"{sid[:8]} (current={str(current_sid)[:8]})")
+            return {"question": question, "answer": answer, "dropped": True}
+
         try:
             await save_interaction(sid, question, answer)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
-        await manager.broadcast({"type": "message", **kiosk_entry})
-        result = {"question": question, "answer": answer}
+        await manager.broadcast({"type": "message", "session_id": sid, **kiosk_entry})
+        result = {"question": question, "answer": answer, "session_id": sid}
         if source:
             result["source"] = source
         return result
 
     # ─── Thank you → end session immediately ─────────────────────────────────
     THANK_YOU_PHRASES = {
-        "thank you", "thanks", "thank u", "thankyou",
+        "thank you", "thanks", "thank u", "thankyou", "thank you so much",
         "ok thanks", "okay thanks", "ok thank you", "okay thank you",
-        "thats all", "thats all thanks", "bye", "goodbye", "that is all",
+        "thats all", "thats all thanks", "that is all", "thats it", "that is it",
+        "bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye",
+        "see you", "see ya", "no thanks", "no thank you", "im done",
+        "i am done", "nothing else", "that would be all",
     }
     if any(phrase in q_normalized for phrase in THANK_YOU_PHRASES):
         farewell = (
@@ -1131,7 +1146,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             "session_id": sid,
             "reason":     "thank_you",
         })
-        return await _respond(farewell)
+        return await _respond(farewell, is_farewell=True)
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
