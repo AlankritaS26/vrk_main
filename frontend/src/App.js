@@ -5,6 +5,7 @@ import GoodbyeScreen from './GoodbyeScreen';
 import './index.css';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
+const WS_BACKEND = BACKEND.replace(/^http/, 'ws');
 
 // Polling intervals — fast only when idle (waiting for face recognition),
 // slow heartbeat during an active session (WebSocket handles real-time ends).
@@ -20,6 +21,107 @@ export default function App() {
   const goodbyeTimer = useRef(null);
   const prevActiveRef = useRef(false);
 
+  // ── Shared camera + detection WebSocket — lives for the whole app ────────
+  // Runs continuously across idle/welcome/goodbye so presence detection
+  // (departure timeout, face-swap) never stops just because the screen
+  // switched to WelcomeScreen.
+  const [detState, setDetState] = useState('IDLE');
+  const [identity, setIdentity] = useState('');
+  const [bbox, setBbox] = useState(null);
+  const [videoDims, setVideoDims] = useState({ w: 640, h: 480 });
+  const [camError, setCamError] = useState(null);
+  const [camStream, setCamStream] = useState(null);
+
+  const hiddenVideoRef = useRef(null);      // used only for frame capture
+  const captureCanvasRef = useRef(null);
+  const wsRef = useRef(null);
+  const streamRef = useRef(null);
+  const sendIntervalRef = useRef(null);
+
+  const detStateRef = useRef('IDLE');
+  useEffect(() => { detStateRef.current = detState; }, [detState]);
+
+  useEffect(() => {
+    let stopped = false;
+
+    function connectWs() {
+      if (stopped) return;
+      const ws = new WebSocket(WS_BACKEND + '/ws/detect');
+      wsRef.current = ws;
+
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          setDetState(data.state || 'IDLE');
+          setIdentity(data.identity || '');
+          setBbox(data.present && data.bbox ? data.bbox : null);
+        } catch (_) { }
+      };
+
+      ws.onclose = () => {
+        if (!stopped) setTimeout(connectWs, 2000);
+      };
+    }
+
+    async function startCamera() {
+      if (!navigator.mediaDevices?.getUserMedia) {
+        if (!stopped) setCamError(
+          'Camera unavailable: open the kiosk at http://localhost:3000 (not the machine hostname)');
+        return;
+      }
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+          audio: false,
+        });
+        if (stopped) { stream.getTracks().forEach(t => t.stop()); return; }
+        streamRef.current = stream;
+        setCamStream(stream);
+        if (hiddenVideoRef.current) {
+          hiddenVideoRef.current.srcObject = stream;
+          hiddenVideoRef.current.onloadedmetadata = () => {
+            const w = hiddenVideoRef.current.videoWidth;
+            const h = hiddenVideoRef.current.videoHeight;
+            if (w && h) setVideoDims({ w, h });
+          };
+        }
+      } catch (err) {
+        if (!stopped) setCamError('Camera unavailable: ' + err.message);
+      }
+    }
+
+    // 3 fps — runs continuously regardless of screen or conversation state,
+    // so departure/face-swap detection always works.
+    function startSending() {
+      sendIntervalRef.current = setInterval(() => {
+        const ws = wsRef.current;
+        const video = hiddenVideoRef.current;
+        const cvs = captureCanvasRef.current;
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        if (!video || video.videoWidth === 0) return;
+
+        const ctx = cvs.getContext('2d');
+        cvs.width = video.videoWidth;
+        cvs.height = video.videoHeight;
+        ctx.drawImage(video, 0, 0);
+        const b64 = cvs.toDataURL('image/jpeg', 0.7).split(',')[1];
+        try { ws.send(JSON.stringify({ frame: b64 })); } catch (_) { }
+      }, 333);
+    }
+
+    startCamera();
+    connectWs();
+    startSending();
+
+    return () => {
+      stopped = true;
+      clearInterval(sendIntervalRef.current);
+      wsRef.current?.close();
+      streamRef.current?.getTracks().forEach(t => t.stop());
+    };
+  }, []);
+
+  // ── Session polling ────────────────────────────────────────────────────
   useEffect(() => {
     async function poll() {
       try {
@@ -30,7 +132,6 @@ export default function App() {
           if (!prevActiveRef.current) {
             setMessages([]);
             clearTimeout(goodbyeTimer.current);
-            // idle → active: drop to slow heartbeat; WS handles real-time ends
             clearInterval(pollRef.current);
             pollRef.current = setInterval(poll, ACTIVE_POLL_MS);
           }
@@ -44,8 +145,7 @@ export default function App() {
             goodbyeTimer.current = setTimeout(() => {
               setScreen('idle');
               setLastSession(null);
-            }, 7000);   // goodbye stays long enough for the farewell voice
-            // active → idle: resume fast poll
+            }, 7000);
             clearInterval(pollRef.current);
             pollRef.current = setInterval(poll, IDLE_POLL_MS);
           }
@@ -59,9 +159,6 @@ export default function App() {
     poll();
     pollRef.current = setInterval(poll, IDLE_POLL_MS);
 
-    // WelcomeScreen fires this right after ending the session OR when the
-    // backend /ws WebSocket sends a session_end event.  Either way we want
-    // an immediate poll then fast idle detection.
     const onEnded = () => {
       clearInterval(pollRef.current);
       pollRef.current = setInterval(poll, IDLE_POLL_MS);
@@ -78,9 +175,21 @@ export default function App() {
 
   const askingName = session?.asking_name === true;
 
-  if (screen === 'welcome')
-    return <WelcomeScreen session={session} messages={messages} setMessages={setMessages} askingName={askingName} />;
-  if (screen === 'goodbye')
-    return <GoodbyeScreen session={lastSession} />;
-  return <IdleScreen />;
+  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream };
+
+  return (
+    <>
+      {/* Hidden video element used only to feed the capture canvas — always
+          mounted so the camera + WS never drop when the screen switches. */}
+      <video ref={hiddenVideoRef} autoPlay playsInline muted style={{ display: 'none' }} />
+      <canvas ref={captureCanvasRef} style={{ display: 'none' }} />
+
+      {screen === 'welcome' && (
+        <WelcomeScreen session={session} messages={messages} setMessages={setMessages}
+          askingName={askingName} {...detectionProps} />
+      )}
+      {screen === 'goodbye' && <GoodbyeScreen session={lastSession} />}
+      {screen === 'idle' && <IdleScreen {...detectionProps} />}
+    </>
+  );
 }

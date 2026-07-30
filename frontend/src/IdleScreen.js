@@ -1,31 +1,15 @@
 import React, { useEffect, useState, useRef } from 'react';
 
-const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
-// Convert http(s):// to ws(s)://
-const WS_BACKEND = BACKEND.replace(/^http/, 'ws');
-
 /**
- * Idle / attract screen — camera feed runs directly in the browser.
- * Frames are sent to the backend /ws/detect WebSocket for face detection.
- * No separate native-window process is required (works on Linux & Windows).
+ * Idle / attract screen — camera + detection now live in App.js so they
+ * keep running across screen switches. This component only displays the
+ * shared stream and detection state passed down as props.
  */
-export default function IdleScreen() {
+export default function IdleScreen({ detState, identity, bbox, videoDims, camError, camStream }) {
   const [visible, setVisible] = useState(false);
   const [slide, setSlide] = useState(0);
   const [now, setNow] = useState(new Date());
-
-  // Detection state from backend
-  const [detState, setDetState] = useState('IDLE');
-  const [identity, setIdentity] = useState('');
-  const [bbox, setBbox] = useState(null);      // {x,y,w,h} in frame coords
-  const [videoDims, setVideoDims] = useState({ w: 640, h: 480 });
-  const [camError, setCamError] = useState(null);
-
   const videoRef = useRef(null);
-  const captureCanvas = useRef(null);   // hidden — used only for frame capture
-  const wsRef = useRef(null);
-  const streamRef = useRef(null);
-  const intervalRef = useRef(null);
 
   const capabilities = [
     { icon: '🎓', title: 'Admissions & Courses', text: '"What courses does RNSIT offer?"' },
@@ -35,7 +19,6 @@ export default function IdleScreen() {
     { icon: '🗺️', title: 'Campus Directions', text: '"Where is the admission office?"' },
   ];
 
-  // Slide + clock
   useEffect(() => {
     setTimeout(() => setVisible(true), 100);
     const s = setInterval(() => setSlide(i => (i + 1) % capabilities.length), 3800);
@@ -44,92 +27,13 @@ export default function IdleScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Camera + detection WebSocket
+  // Attach the shared stream to this screen's own <video> for display.
   useEffect(() => {
-    let stopped = false;
-
-    // ── WebSocket connection (with auto-reconnect) ────────────────────────
-    function connectWs() {
-      if (stopped) return;
-      const ws = new WebSocket(WS_BACKEND + '/ws/detect');
-      wsRef.current = ws;
-
-      ws.onmessage = (e) => {
-        try {
-          const data = JSON.parse(e.data);
-          setDetState(data.state || 'IDLE');
-          setIdentity(data.identity || '');
-          setBbox(data.present && data.bbox ? data.bbox : null);
-        } catch (_) { }
-      };
-
-      ws.onclose = () => {
-        if (!stopped) setTimeout(connectWs, 2000);
-      };
+    if (videoRef.current && camStream) {
+      videoRef.current.srcObject = camStream;
     }
+  }, [camStream]);
 
-    // ── Camera access ─────────────────────────────────────────────────────
-    async function startCamera() {
-      // navigator.mediaDevices is only available in secure contexts (https or
-      // localhost).  If the page is opened via a machine hostname over plain
-      // http the API is undefined — tell the user how to fix it.
-      if (!navigator.mediaDevices?.getUserMedia) {
-        if (!stopped) setCamError(
-          'Camera unavailable: open the kiosk at http://localhost:3000 (not the machine hostname)');
-        return;
-      }
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-          audio: false,
-        });
-        if (stopped) { stream.getTracks().forEach(t => t.stop()); return; }
-        streamRef.current = stream;
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.onloadedmetadata = () => {
-            const w = videoRef.current.videoWidth;
-            const h = videoRef.current.videoHeight;
-            if (w && h) setVideoDims({ w, h });
-          };
-        }
-      } catch (err) {
-        if (!stopped) setCamError('Camera unavailable: ' + err.message);
-      }
-    }
-
-    // ── Frame sender — 3 fps is plenty for presence detection ─────────────
-    function startSending() {
-      intervalRef.current = setInterval(() => {
-        const ws = wsRef.current;
-        const video = videoRef.current;
-        const cvs = captureCanvas.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        if (!video || video.videoWidth === 0) return;
-
-        const ctx = cvs.getContext('2d');
-        cvs.width = video.videoWidth;
-        cvs.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0);
-        // Send as compact JPEG (quality 0.7 is fine for face detection)
-        const b64 = cvs.toDataURL('image/jpeg', 0.7).split(',')[1];
-        try { ws.send(JSON.stringify({ frame: b64 })); } catch (_) { }
-      }, 333); // ~3 fps
-    }
-
-    startCamera();
-    connectWs();
-    startSending();
-
-    return () => {
-      stopped = true;
-      clearInterval(intervalRef.current);
-      wsRef.current?.close();
-      streamRef.current?.getTracks().forEach(t => t.stop());
-    };
-  }, []);
-
-  // ── Derived display values ────────────────────────────────────────────────
   const stateLabel = {
     IDLE: 'Walk up — I\'ll recognise you',
     DWELLING: 'I see you — hold still…',
@@ -150,13 +54,11 @@ export default function IdleScreen() {
   return (
     <div style={{ minHeight: '100vh', background: '#ffffff', fontFamily: "'Segoe UI', Arial, sans-serif", display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative' }}>
 
-      {/* slow ambient color drift */}
       <div style={{ position: 'absolute', width: '560px', height: '560px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(26,35,126,0.07), transparent 65%)', top: '-180px', left: '-160px', animation: 'drift 14s ease-in-out infinite' }} />
       <div style={{ position: 'absolute', width: '480px', height: '480px', borderRadius: '50%', background: 'radial-gradient(circle, rgba(66,165,245,0.08), transparent 65%)', bottom: '-140px', right: '-120px', animation: 'drift 17s ease-in-out infinite reverse' }} />
 
       <div style={{ background: '#1a237e', height: '6px', width: '100%', position: 'relative', zIndex: 1 }} />
 
-      {/* live clock */}
       <div style={{ position: 'absolute', top: '24px', right: '32px', textAlign: 'right', zIndex: 2 }}>
         <div style={{ fontSize: '26px', fontWeight: '700', color: '#1a237e', letterSpacing: '0.5px' }}>
           {now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })}
@@ -168,7 +70,6 @@ export default function IdleScreen() {
 
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '28px', padding: '40px', position: 'relative', zIndex: 1 }}>
 
-        {/* Logo + identity */}
         <div style={{ opacity: visible ? 1 : 0, transform: visible ? 'scale(1)' : 'scale(0.85)', transition: 'all 0.8s cubic-bezier(0.34, 1.56, 0.64, 1)', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }}>
           <img src="/rnslogo.png" alt="RNSIT Logo"
             onError={(e) => { e.currentTarget.style.display = 'none'; }}
@@ -191,7 +92,6 @@ export default function IdleScreen() {
           border: `3px solid ${borderColor}`,
           transition: 'border-color 0.4s ease',
         }}>
-          {/* Live video — mirror so it looks natural (selfie view) */}
           <video
             ref={videoRef}
             autoPlay playsInline muted
@@ -199,15 +99,11 @@ export default function IdleScreen() {
               display: 'block',
               width: '360px', height: '270px',
               objectFit: 'cover',
-              transform: 'scaleX(-1)',   // mirror for natural selfie orientation
+              transform: 'scaleX(-1)',
               background: '#1a237e11',
             }}
           />
 
-          {/* Hidden canvas for frame capture (not mirrored) */}
-          <canvas ref={captureCanvas} style={{ display: 'none' }} />
-
-          {/* Face bounding-box overlay (mirrored to match video) */}
           {bbox && (
             <svg
               viewBox={`0 0 ${videoDims.w} ${videoDims.h}`}
@@ -216,7 +112,7 @@ export default function IdleScreen() {
                 position: 'absolute', top: 0, left: 0,
                 width: '100%', height: '100%',
                 pointerEvents: 'none',
-                transform: 'scaleX(-1)',   // mirror to match the video
+                transform: 'scaleX(-1)',
               }}
             >
               <rect
@@ -226,7 +122,6 @@ export default function IdleScreen() {
                 strokeWidth={Math.max(2, videoDims.w / 160)}
                 rx="6"
               />
-              {/* Corner accents */}
               <line x1={bbox.x} y1={bbox.y + 20} x2={bbox.x} y2={bbox.y} stroke={borderColor} strokeWidth={Math.max(3, videoDims.w / 100)} />
               <line x1={bbox.x} y1={bbox.y} x2={bbox.x + 20} y2={bbox.y} stroke={borderColor} strokeWidth={Math.max(3, videoDims.w / 100)} />
               <line x1={bbox.x + bbox.w - 20} y1={bbox.y} x2={bbox.x + bbox.w} y2={bbox.y} stroke={borderColor} strokeWidth={Math.max(3, videoDims.w / 100)} />
@@ -238,7 +133,6 @@ export default function IdleScreen() {
             </svg>
           )}
 
-          {/* Status bar at bottom of camera feed */}
           <div style={{
             position: 'absolute', bottom: 0, left: 0, right: 0,
             background: 'rgba(26,35,126,0.75)', backdropFilter: 'blur(6px)',
@@ -250,7 +144,6 @@ export default function IdleScreen() {
               : stateLabel}
           </div>
 
-          {/* Scanning animation ring when detecting */}
           {(detState === 'DWELLING' || detState === 'RECOGNIZING' || detState === 'ENROLLING') && (
             <div style={{
               position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
@@ -262,7 +155,6 @@ export default function IdleScreen() {
           )}
         </div>
 
-        {/* Rotating capability carousel */}
         <div key={slide} style={{
           background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '16px',
           padding: '20px 36px', display: 'flex', alignItems: 'center', gap: '18px',
@@ -276,7 +168,6 @@ export default function IdleScreen() {
           </div>
         </div>
 
-        {/* carousel position dots */}
         <div style={{ display: 'flex', gap: '8px' }}>
           {capabilities.map((_, i) => (
             <div key={i} style={{ width: i === slide ? '22px' : '8px', height: '8px', borderRadius: '4px', background: i === slide ? '#1a237e' : '#c5cae9', transition: 'all 0.35s ease' }} />
