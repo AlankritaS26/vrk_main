@@ -1,22 +1,3 @@
-"""
-VRK Kiosk — one-command launcher (self-healing).
-
-    venv\\Scripts\\python.exe run.py
-
-Starts, in one terminal with prefixed logs:
-  [BACKEND]   uvicorn backend.main:app     (port 8001)
-  [DETECT]    backend.detection            (only after backend is healthy)
-  [FRONTEND]  npm start                    (./frontend, port 3000)
-
-Self-healing:
-  * If ports 8001/3000 are held by a STALE python/node process from a
-    previous run, it is killed automatically — no manual taskkill.
-  * If a port is held by some unrelated program, we refuse (safely) and
-    tell you which program it is.
-
-Ctrl+C stops all three services cleanly.
-"""
-
 import os
 import signal
 import subprocess
@@ -26,13 +7,15 @@ import time
 import urllib.request
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-PY = sys.executable                       # the venv python that launched us
+PY = sys.executable                        # the venv python that launched us
 BACKEND_URL = "http://127.0.0.1:8001"
+RAG_URL     = "http://127.0.0.1:8600"
+RAG_DIR     = os.path.join(ROOT, "RAGService")
 
 # process names we are allowed to auto-kill when they squat on our ports
 KILLABLE = {"python.exe", "pythonw.exe", "uvicorn.exe", "node.exe"}
 
-COLORS = {"BACKEND": "\033[96m", "DETECT": "\033[93m", "FRONTEND": "\033[92m", "RUN": "\033[95m"}
+COLORS = {"BACKEND": "\033[96m", "RAG": "\033[94m", "FRONTEND": "\033[92m", "RUN": "\033[95m"}
 RESET = "\033[0m"
 
 procs: list = []
@@ -104,7 +87,7 @@ def free_port(port: int, label: str) -> bool:
             kill_pid(pid)
         else:
             say("RUN", f"Port {port} is used by '{name}' (PID {pid}) — not a kiosk "
-                       f"process, refusing to kill it automatically.")
+                      f"process, refusing to kill it automatically.")
             say("RUN", f"Close that program, or change the {label} port, then rerun.")
             return False
     # give the OS a moment to release the socket
@@ -150,6 +133,18 @@ def wait_for_backend(timeout: float = 180) -> bool:
     return False
 
 
+def wait_for_rag(timeout: float = 120) -> bool:
+    """RAGService loads its embedding model on first boot, so give it time."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(RAG_URL + "/health", timeout=2):
+                return True
+        except Exception:
+            time.sleep(1.5)
+    return False
+
+
 def shutdown(*_):
     say("RUN", "Stopping all services...")
     for p in procs:
@@ -165,8 +160,8 @@ def shutdown(*_):
             p.kill()
         except Exception:
             pass
-    # sweep anything that survived (npm spawns child node processes)
-    for port in (8001, 3000):
+    # sweep anything that survived (npm / child node / background services)
+    for port in (8001, 8600, 3000):
         for pid in pids_on_port(port):
             if process_name(pid) in KILLABLE:
                 kill_pid(pid)
@@ -177,15 +172,43 @@ def shutdown(*_):
 
 def main():
     signal.signal(signal.SIGINT, shutdown)
-    os.system("")                          # enable ANSI colors on Windows
+    os.system("")                         # enable ANSI colors on Windows
 
     say("RUN", "Checking ports...")
     if not free_port(8001, "backend"):
         sys.exit(1)
+    if not free_port(8600, "rag service"):
+        sys.exit(1)
     if not free_port(3000, "frontend"):
         sys.exit(1)
 
-    say("RUN", "Starting backend...")
+    if not os.path.isdir(RAG_DIR):
+        say("RUN", f"RAGService folder not found at: {RAG_DIR}")
+        say("RUN", "Unzip RAGService.zip so the 'RAGService' folder sits directly "
+                  "next to 'backend' and 'frontend' in your project root, then rerun.")
+        sys.exit(1)
+
+    say("RUN", "Starting RAG microservice on port 8600...")
+    # RAGService's app.py uses bare imports ("import config", "from rag_store import ...")
+    # so it must be launched with RAGService/ itself as the working directory —
+    # NOT as "-m RAGService.app" (that treats RAGService as a package and fails,
+    # since there's no RAGService/__init__.py and no top-level "config" module
+    # from that vantage point).
+    start("RAG", [PY, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8600"],
+          cwd=RAG_DIR)
+
+    say("RUN", "Waiting for RAG microservice health (embedding model loads on first boot)...")
+    if not wait_for_rag():
+        say("RUN", "RAG microservice never became healthy — check [RAG] logs above.")
+        say("RUN", "Common cause: RAGService's own dependencies (chromadb, "
+                  "sentence-transformers, torch, etc. from RAGService/requirements.txt) "
+                  "aren't installed in this venv. Run:")
+        say("RUN", f"    {PY} -m pip install -r RAGService/requirements.txt")
+        shutdown()
+
+    say("RUN", "RAG microservice healthy.")
+
+    say("RUN", "Starting main backend...")
     start("BACKEND", [PY, "-m", "uvicorn", "backend.main:app",
                       "--host", "0.0.0.0", "--port", "8001"])
 
@@ -198,19 +221,17 @@ def main():
 
     say("RUN", "Starting frontend (npm start)...")
     env = os.environ.copy()
-    env["BROWSER"] = "none"          # we open the kiosk browser ourselves, with flags
+    env["BROWSER"] = "none"            # we open the kiosk browser ourselves, with flags
     start("FRONTEND", "npm start", cwd=os.path.join(ROOT, "frontend"),
           shell=True, env=env)
 
     # Open the kiosk browser with autoplay ENABLED so the greeting can speak
-    # before any user gesture — this is the standard kiosk deployment flag.
     def open_kiosk_browser():
-        time.sleep(10)                 # let the CRA dev server come up
+        time.sleep(10)                # let the CRA dev server come up
         url   = "http://localhost:3000"
         flags = ["--autoplay-policy=no-user-gesture-required", f"--app={url}"]
 
         if sys.platform == "win32":
-            # Windows: use 'start "" <browser> <flags>'
             flag_str = " ".join(flags)
             for browser in ("chrome", "msedge"):
                 try:
@@ -220,7 +241,6 @@ def main():
                 except Exception:
                     continue
         else:
-            # Linux / macOS: launch the binary directly so flags are passed correctly
             for browser in ("google-chrome", "google-chrome-stable",
                             "chromium-browser", "chromium"):
                 try:
@@ -239,7 +259,7 @@ def main():
             for p in list(procs):
                 if p.poll() is not None and p.returncode not in (0, None):
                     say("RUN", f"A service exited (code {p.returncode}). "
-                               "Others keep running; Ctrl+C to stop all.")
+                             "Others keep running; Ctrl+C to stop all.")
                     procs.remove(p)
     except KeyboardInterrupt:
         shutdown()
