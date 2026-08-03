@@ -3,6 +3,207 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
+/* ────────────────────────────────────────────────────────────────────────
+   ARIA — animated receptionist avatar. Purely additive: does not read or
+   modify any state/logic from WelcomeScreen. Takes `status` and animates
+   itself with plain refs + CSS (blink, breathe, head-tilt, talk-cycle
+   mouth movement while status === 'speaking'). Mouth animation uses a
+   simple interval, not real audio amplitude, specifically so the existing
+   speak()/TTS pipeline below never had to change.
+   ──────────────────────────────────────────────────────────────────────── */
+function AriaAvatar({ status }) {
+  const mouthPathRef = useRef(null);
+  const eyeLeftRef = useRef(null);
+  const eyeRightRef = useRef(null);
+  const irisLeftRef = useRef(null);
+  const irisRightRef = useRef(null);
+  const headGroupRef = useRef(null);
+  const talkTimerRef = useRef(null);
+
+  // idle blink loop — runs regardless of status
+  useEffect(() => {
+    let blinkTimer;
+    const scheduleBlink = () => {
+      const delay = 2600 + Math.random() * 3200;
+      blinkTimer = setTimeout(() => {
+        [eyeLeftRef.current, eyeRightRef.current].forEach(el => {
+          if (!el) return;
+          el.style.transform = 'scaleY(0.08)';
+          setTimeout(() => { if (el) el.style.transform = 'scaleY(1)'; }, 120);
+        });
+        scheduleBlink();
+      }, delay);
+    };
+    scheduleBlink();
+    return () => clearTimeout(blinkTimer);
+  }, []);
+
+  // head tilt per status
+  useEffect(() => {
+    if (!headGroupRef.current) return;
+    if (status === 'listening') {
+      headGroupRef.current.style.transform = 'rotate(-3deg) translateY(-2px)';
+    } else if (status === 'processing') {
+      headGroupRef.current.style.transform = 'rotate(5deg) translateY(-1px)';
+    } else if (status === 'speaking') {
+      headGroupRef.current.style.transform = 'rotate(0deg)';
+    } else {
+      headGroupRef.current.style.transform = 'rotate(-1deg)';
+    }
+  }, [status]);
+
+  // gaze shift — while 'processing', her eyes drift up and to the side like
+  // she's recalling something, instead of just staring straight ahead. This
+  // is what actually reads as "thinking" rather than the head tilt alone.
+  useEffect(() => {
+    [irisLeftRef.current, irisRightRef.current].forEach(el => {
+      if (!el) return;
+      el.style.transform = status === 'processing' ? 'translate(2px, -5px)' : 'translate(0px, 0px)';
+    });
+  }, [status]);
+
+  // simple talk-cycle mouth animation while speaking — not tied to real
+  // audio amplitude on purpose, so the existing TTS/speak() code below
+  // never needed to change.
+  useEffect(() => {
+    if (status !== 'speaking') {
+      if (talkTimerRef.current) clearInterval(talkTimerRef.current);
+      if (mouthPathRef.current) mouthPathRef.current.setAttribute('d', 'M112 168 Q130 172 148 168');
+      return;
+    }
+    talkTimerRef.current = setInterval(() => {
+      if (!mouthPathRef.current) return;
+      const openness = 6 + Math.random() * 18;
+      mouthPathRef.current.setAttribute('d', `M112 168 Q130 ${168 + openness} 148 168`);
+    }, 130);
+    return () => clearInterval(talkTimerRef.current);
+  }, [status]);
+
+  return (
+    <div className={`aria-figure aria-${status}`} style={{ width: '280px', height: '400px', position: 'relative' }}>
+      <svg viewBox="0 0 260 400" width="280" height="400" style={{ overflow: 'visible' }}>
+        <defs>
+          <radialGradient id="ariaSkin" cx="42%" cy="32%" r="75%">
+            <stop offset="0%" stopColor="#ffdcb8" />
+            <stop offset="100%" stopColor="#f0bd8e" />
+          </radialGradient>
+          <linearGradient id="ariaBlazer" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="#2b3fa8" />
+            <stop offset="100%" stopColor="#1a237e" />
+          </linearGradient>
+          <linearGradient id="ariaHair" x1="0.15" y1="0" x2="0.9" y2="1">
+            <stop offset="0%" stopColor="#4a3527" />
+            <stop offset="45%" stopColor="#2a1c14" />
+            <stop offset="100%" stopColor="#180f0a" />
+          </linearGradient>
+          <radialGradient id="ariaBlush" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stopColor="#ff8f8f" stopOpacity="0.55" />
+            <stop offset="100%" stopColor="#ff8f8f" stopOpacity="0" />
+          </radialGradient>
+        </defs>
+
+        {/* body / blazer, longer for a full-body figure */}
+        <path d="M50 400 C50 300 70 245 130 245 C190 245 210 300 210 400 Z" fill="url(#ariaBlazer)" />
+        {/* left arm, resting at side */}
+        <path d="M76 262 C52 278 40 320 42 375 L62 375 C62 330 72 292 92 270 Z" fill="url(#ariaBlazer)" />
+        <circle cx="52" cy="375" r="11" fill="url(#ariaSkin)" />
+        {/* right arm, resting at side */}
+        <path d="M184 262 C208 278 220 320 218 375 L198 375 C198 330 188 292 168 270 Z" fill="url(#ariaBlazer)" />
+        <circle cx="208" cy="375" r="11" fill="url(#ariaSkin)" />
+        {/* collar */}
+        <path d="M118 249 L130 271 L142 249 L130 261 Z" fill="#fdfaf3" />
+        <path d="M104 251 C112 261 122 267 130 269 L118 249 Z" fill="#28399c" />
+        <path d="M156 251 C148 261 138 267 130 269 L142 249 Z" fill="#28399c" />
+        {/* blazer buttons */}
+        <circle cx="130" cy="288" r="3" fill="#28399c" />
+        <circle cx="130" cy="308" r="3" fill="#28399c" />
+        <circle cx="130" cy="328" r="3" fill="#28399c" />
+
+        {/* head + neck */}
+        <g ref={headGroupRef} className="aria-head-group" style={{ transformOrigin: '130px 185px' }}>
+          <rect x="116" y="218" width="28" height="36" fill="url(#ariaSkin)" />
+
+          {/* low side ponytail, sits behind everything */}
+          <path d="M182 150 C202 168 208 202 196 234 C190 248 182 250 180 238
+                    C186 214 182 184 168 164 Z" fill="url(#ariaHair)" />
+          <path d="M184 156 C198 172 202 198 194 222" stroke="#5a4030" strokeWidth="2"
+                fill="none" strokeLinecap="round" opacity="0.5" />
+
+          {/* face base */}
+          <ellipse cx="130" cy="168" rx="64" ry="68" fill="url(#ariaSkin)" />
+
+          {/* hair back / crown, center-parted and swept to the side */}
+          <path d="M66 158 C60 100 92 54 130 54 C170 54 200 100 194 158
+                    C193 130 182 108 158 100 C170 118 172 140 168 158
+                    C150 128 140 108 130 100 C120 108 110 128 96 158
+                    C92 140 90 118 100 100 C78 108 68 130 66 158 Z"
+                fill="url(#ariaHair)" />
+
+          {/* loose face-framing strands */}
+          <path d="M68 150 C62 180 66 212 78 236" stroke="url(#ariaHair)" strokeWidth="9"
+                fill="none" strokeLinecap="round" />
+          <path d="M192 150 C196 176 190 202 180 220" stroke="url(#ariaHair)" strokeWidth="8"
+                fill="none" strokeLinecap="round" />
+          <path d="M72 156 C67 178 70 202 80 220" stroke="#5a4030" strokeWidth="1.6"
+                fill="none" strokeLinecap="round" opacity="0.45" />
+
+          {/* eyebrows — thicker, arched */}
+          <path d="M92 142 Q108 128 128 138" stroke="#2a1c14" strokeWidth="5" fill="none" strokeLinecap="round" />
+          <path d="M132 138 Q152 128 168 142" stroke="#2a1c14" strokeWidth="5" fill="none" strokeLinecap="round" />
+
+          {/* blush */}
+          <ellipse cx="88" cy="188" rx="16" ry="10" fill="url(#ariaBlush)" />
+          <ellipse cx="172" cy="188" rx="16" ry="10" fill="url(#ariaBlush)" />
+
+          {/* big expressive eyes — scaleY toggled for blinking */}
+          <g ref={eyeLeftRef} className="aria-eye" style={{ transformOrigin: '108px 163px' }}>
+            <ellipse cx="108" cy="163" rx="15" ry="16.5" fill="#fff" />
+            <g ref={irisLeftRef} style={{ transition: 'transform 0.4s ease' }}>
+              <circle cx="109" cy="165" r="10.5" fill="#4a2f1c" />
+              <circle cx="106" cy="161" r="3.4" fill="#fff" />
+              <circle cx="112" cy="169" r="1.6" fill="#fff" opacity="0.7" />
+            </g>
+            {/* upper lash */}
+            <path d="M94 154 Q108 144 124 152" stroke="#1c130d" strokeWidth="3.4" fill="none" strokeLinecap="round" />
+            <path d="M92 153 L86 148" stroke="#1c130d" strokeWidth="2" strokeLinecap="round" />
+          </g>
+          <g ref={eyeRightRef} className="aria-eye" style={{ transformOrigin: '152px 163px' }}>
+            <ellipse cx="152" cy="163" rx="15" ry="16.5" fill="#fff" />
+            <g ref={irisRightRef} style={{ transition: 'transform 0.4s ease' }}>
+              <circle cx="151" cy="165" r="10.5" fill="#4a2f1c" />
+              <circle cx="154" cy="161" r="3.4" fill="#fff" />
+              <circle cx="148" cy="169" r="1.6" fill="#fff" opacity="0.7" />
+            </g>
+            {/* upper lash */}
+            <path d="M136 152 Q152 144 166 154" stroke="#1c130d" strokeWidth="3.4" fill="none" strokeLinecap="round" />
+            <path d="M168 153 L174 148" stroke="#1c130d" strokeWidth="2" strokeLinecap="round" />
+          </g>
+
+          {/* nose */}
+          <path d="M128 170 Q125 184 131 187" stroke="#d69f74" strokeWidth="2.2" fill="none" strokeLinecap="round" />
+
+          {/* mouth — animated during 'speaking' via the talk-cycle interval */}
+          <path ref={mouthPathRef} d="M112 168 Q130 172 148 168" transform="translate(0, 40)" stroke="#b5555f"
+                strokeWidth="3.5" fill="#d98189" strokeLinecap="round" />
+
+          {/* pearl earrings */}
+          <circle cx="65" cy="182" r="4" fill="#fdf6ea" stroke="#e0d3b8" strokeWidth="1" />
+          <circle cx="195" cy="182" r="4" fill="#fdf6ea" stroke="#e0d3b8" strokeWidth="1" />
+        </g>
+
+        {/* thinking dots — only visible while status === 'processing', via
+            the .aria-processing rule below. Small trail rising toward her
+            temple, like a thought bubble forming. */}
+        <g className="aria-think-dots">
+          <circle className="aria-think-dot" cx="196" cy="96" r="4.5" fill="#7e57c2" />
+          <circle className="aria-think-dot" cx="210" cy="78" r="6" fill="#7e57c2" />
+          <circle className="aria-think-dot" cx="228" cy="58" r="7.5" fill="#7e57c2" />
+        </g>
+      </svg>
+    </div>
+  );
+}
+
 export default function WelcomeScreen({ session, messages, setMessages, askingName, camStream }) {
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
@@ -361,7 +562,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     window.speechSynthesis.cancel();
     micRef.current?.pause();          // don't let the kiosk hear itself
     isSpeaking.current = true;
-    setStatus('speaking');
+    // NOTE: status intentionally stays whatever it currently is (usually
+    // 'processing'/'ready') here — NOT 'speaking' yet. Setting it this early
+    // made Aria's mouth start moving and the status pill/dot turn red during
+    // the TTS fetch+decode delay, before any actual audio had played. It now
+    // flips inside fireStart(), which only fires once real playback begins.
 
     const finish = () => {
       isSpeaking.current = false;
@@ -369,7 +574,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (isMounted.current) startListening();
     };
 
-    const fireStart = () => { if (onStart) { onStart(); onStart = null; } };
+    const fireStart = () => {
+      setStatus('speaking');   // audio is actually starting NOW
+      if (onStart) { onStart(); onStart = null; }
+    };
 
     // Fallback: robotic browser voice, only if backend TTS is unavailable
     const browserSpeak = () => {
@@ -534,18 +742,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   };
 
   const statusLabel = {
-    ready: 'Ready',
+    ready: 'Voice Ready',
     listening: 'Listening',
     processing: 'Thinking',
     speaking: 'Speaking'
-  }[status] || 'Ready';
+  }[status] || 'Voice Ready';
 
   const statusColor = {
-    ready: '#ffb300',
+    ready: '#5c6bc0',
     listening: '#43a047',
     processing: '#7e57c2',
     speaking: '#ef5350'
-  }[status] || '#ffb300';
+  }[status] || '#5c6bc0';
 
   const inputStyle = {
     width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
@@ -565,27 +773,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   return (
     <div style={{ minHeight: '100vh', background: '#f5f6fa', fontFamily: "'Segoe UI', Arial, sans-serif", display: 'flex', flexDirection: 'column' }}>
 
-      <header style={{ background: '#ffffff', borderBottom: '2px solid #e8eaf6', padding: '14px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 2px 10px rgba(26,35,126,0.07)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
-          <img src="/rnslogo.png" onError={(e) => { e.currentTarget.style.display = 'none'; }} alt="RNSIT" style={{ height: '56px', objectFit: 'contain' }} />
+      <header style={{ background: '#1a237e', padding: '14px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 2px 10px rgba(26,35,126,0.15)' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
+          <div style={{ width: '36px', height: '36px', borderRadius: '10px', background: 'rgba(255,255,255,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px' }}>❄</div>
           <div>
-            <div style={{ fontSize: '18px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>RNS Institute of Technology</div>
-            <div style={{ fontSize: '12px', color: '#888', marginTop: '2px', letterSpacing: '0.5px' }}>Digital Receptionist · Interactive Kiosk</div>
+            <span style={{ fontSize: '17px', fontWeight: '800', color: '#fff', letterSpacing: '0.2px' }}>RNS Institute of Technology</span>
+            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.65)', marginLeft: '10px' }}>Digital Receptionist</span>
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '20px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '18px' }}>
           <div style={{ textAlign: 'right' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '7px', justifyContent: 'flex-end' }}>
-              <div style={{ width: '9px', height: '9px', borderRadius: '50%', background: statusColor, transition: 'background 0.3s' }} />
-              <span style={{ fontSize: '13px', color: statusColor, fontWeight: '700', transition: 'color 0.3s', letterSpacing: '0.2px' }}>{statusLabel}</span>
+            <div style={{ fontSize: '14px', fontWeight: '700', color: '#fff' }}>{visitorName}</div>
+            <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.6)' }}>
+              {isReturning ? `Visit #${visitCount}` : 'New Visitor'}
             </div>
           </div>
         </div>
       </header>
-
-      {/* The greeting is SPOKEN, not printed. It also appears as the first
-          chat bubble via speak(greeting, () => addMessage(...)), so showing
-          it again in a banner was duplicate clutter. */}
 
       {askingName && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
@@ -642,118 +846,154 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
 
-        {/* ── Camera sidebar ── */}
-        <div style={{ width: '220px', flexShrink: 0, background: '#fff', borderRight: '1.5px solid #e8eaf6', display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '20px 14px', gap: '14px', boxShadow: '2px 0 8px rgba(26,35,126,0.04)' }}>
-          <div style={{ position: 'relative', width: '100%', borderRadius: '14px', overflow: 'hidden', boxShadow: '0 4px 18px rgba(26,35,126,0.15)', border: '2.5px solid #1a237e', background: '#1a237e22' }}>
+        {/* ── Aria panel — matches reference layout ── */}
+        <div style={{
+          width: '46%', flexShrink: 0, position: 'relative', overflow: 'hidden',
+          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
+          gap: '14px', padding: '32px 24px',
+          background: 'linear-gradient(160deg, #dfe3f7 0%, #eef0fb 55%, #e6e9f9 100%)',
+        }}>
+          {/* small live-camera PiP, bottom-right corner */}
+          <div style={{
+            position: 'absolute', bottom: '20px', right: '20px', width: '60px', height: '60px',
+            borderRadius: '50%', overflow: 'hidden', border: '2.5px solid #fff',
+            boxShadow: '0 4px 14px rgba(26,35,126,0.25)', zIndex: 2,
+          }}>
             <video ref={camVideoRef} autoPlay playsInline muted
-              style={{ display: 'block', width: '100%', aspectRatio: '4/3', objectFit: 'cover', transform: 'scaleX(-1)' }} />
-            <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(26,35,126,0.72)', backdropFilter: 'blur(4px)', padding: '6px 10px', textAlign: 'center' }}>
-              <span style={{ fontSize: '12px', color: '#fff', fontWeight: '600' }}>Live Camera</span>
-            </div>
+              style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }} />
           </div>
-          <div style={{ textAlign: 'center', width: '100%' }}>
-            <div style={{ fontSize: '15px', fontWeight: '700', color: '#1a237e', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{visitorName}</div>
-            <div style={{ fontSize: '11px', color: isReturning ? '#43a047' : '#888', marginTop: '3px', fontWeight: '600', letterSpacing: '0.3px', textTransform: 'uppercase' }}>
-              {isReturning ? `Visit #${visitCount} · Returning` : 'New Visitor'}
-            </div>
+
+          <div className={`aria-wrap aria-wrap-${status}`}>
+            <AriaAvatar status={status} />
           </div>
-          <div style={{ width: '100%', background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '10px 12px' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '7px' }}>
-              <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: statusColor, flexShrink: 0, transition: 'background 0.3s' }} />
-              <span style={{ fontSize: '12px', color: statusColor, fontWeight: '700' }}>{statusLabel}</span>
-            </div>
+
+          <div style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: '24px', fontWeight: '800', color: '#1a237e' }}>Aria</div>
+            <div style={{ fontSize: '13px', color: '#888', marginTop: '2px' }}>RNSIT Digital Receptionist</div>
+          </div>
+
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: '8px',
+            padding: '7px 16px', borderRadius: '20px', background: '#fff',
+            border: `1.5px solid ${statusColor}44`, boxShadow: '0 2px 10px rgba(26,35,126,0.08)',
+          }}>
+            <div style={{
+              width: '8px', height: '8px', borderRadius: '50%', background: statusColor,
+              transition: 'background 0.3s',
+              animation: status === 'speaking' ? 'ariaPulse 0.9s infinite'
+                : status === 'listening' ? 'ariaPulse 1.4s infinite' : 'none',
+            }} />
+            <span style={{ fontSize: '13px', fontWeight: '700', color: statusColor }}>{statusLabel}</span>
+          </div>
+
+          <div style={{
+            fontSize: '13px', color: '#7280a3',
+            background: 'rgba(255,255,255,0.7)', padding: '8px 16px', borderRadius: '10px',
+            fontStyle: 'italic', textAlign: 'center', maxWidth: '300px',
+          }}>
+            {status === 'listening' ? 'Please speak your question clearly' : hints[hintIndex]}
           </div>
         </div>
 
-        <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-          {messages.length === 0 && !liveText ? (
-            <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '16px', paddingTop: '40px' }}>
-              <div style={{ width: '340px', height: '150px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <div style={{ position: 'relative', width: '130px', height: '130px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  {/* expanding rings — the kiosk visibly "breathes" while waiting */}
-                  <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.25)', animation: status === 'ready' ? 'ring 3.6s ease-out infinite' : 'none' }} />
-                  <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.18)', animation: status === 'ready' ? 'ring 3.6s ease-out infinite 1.2s' : 'none' }} />
-                  <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.10)', animation: status === 'ready' ? 'ring 3.6s ease-out infinite 2.4s' : 'none' }} />
-                  <div style={{ width: '84px', height: '84px', borderRadius: '50%', background: 'linear-gradient(135deg, #1a237e, #3949ab)', display: 'flex', alignItems: 'center', justifyContent: 'center', boxShadow: '0 8px 28px rgba(26,35,126,0.35)', animation: status === 'ready' ? 'breathe 3.6s ease-in-out infinite' : 'none' }}>
-                    <svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#ffffff" strokeWidth="1.7">
-                      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                      <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                      <line x1="12" y1="19" x2="12" y2="23" />
-                      <line x1="8" y1="23" x2="16" y2="23" />
-                    </svg>
-                  </div>
-                </div>
-              </div>
-              <div style={{ fontSize: '26px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.2px', display: 'flex', alignItems: 'center', gap: '10px' }}>
-                {status === 'listening' && 'Listening'}
-                {status === 'processing' && <>Thinking<span className="dots"><i /><i /><i /></span></>}
-                {status === 'speaking' && 'Speaking'}
-                {status === 'ready' && 'How may I help you?'}
-              </div>
-              <div style={{ fontSize: '16px', color: '#9aa0b4', textAlign: 'center', maxWidth: '380px', lineHeight: '1.6' }}>
-                {status === 'listening' ? 'Please speak your question clearly' : hints[hintIndex]}
-              </div>
-            </div>
-          ) : (
-            <>
-              {messages.map((msg, i) => (
-                <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
-                    {msg.speaker === 'kiosk' ? 'RNSIT Kiosk' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
-                  </div>
-                  <div style={{
-                    animation: 'fadeUp 0.3s ease',
-                    maxWidth: '70%', padding: '15px 19px',
-                    borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
-                    background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
-                    color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
-                    border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
-                    fontSize: '17px', lineHeight: '1.6',
-                    boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
-                  }}>
-                    {msg.text}
-                  </div>
-                </div>
-              ))}
-              {liveText && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                    {liveText}
-                  </div>
-                </div>
-              )}
-            </>
-          )}
-        </div>
+        {/* ── Conversation panel ── */}
+        <div style={{ flex: '1 1 0', display: 'flex', flexDirection: 'column', minWidth: 0, borderLeft: '1.5px solid #e8eaf6' }}>
 
+          <div style={{ padding: '16px 28px', borderBottom: '1.5px solid #e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#43a047' }} />
+              <span style={{ fontSize: '15px', fontWeight: '700', color: '#222' }}>Conversation</span>
+            </div>
+            <span style={{ fontSize: '12px', color: '#aaa' }}>
+              {messages.length === 0 ? 'Just started' : `${messages.length} messages`}
+            </span>
+          </div>
+
+          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            {messages.length === 0 && !liveText ? (
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '14px' }}>
+                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#c5cae9" strokeWidth="1.6">
+                  <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
+                </svg>
+                <div style={{ fontSize: '16px', fontWeight: '700', color: '#9aa0b4' }}>
+                  Your conversation with Aria will appear here
+                </div>
+                <div style={{ fontSize: '13px', color: '#c2c7db' }}>
+                  {status === 'listening' ? 'Listening...'
+                    : status === 'processing' ? 'Thinking...'
+                    : status === 'speaking' ? 'Speaking...'
+                    : "Just speak — she's ready"}
+                </div>
+              </div>
+            ) : (
+              <>
+                {messages.map((msg, i) => (
+                  <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
+                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
+                      {msg.speaker === 'kiosk' ? 'Aria' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
+                    </div>
+                    <div style={{
+                      animation: 'fadeUp 0.3s ease',
+                      maxWidth: '70%', padding: '15px 19px',
+                      borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
+                      background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
+                      color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
+                      border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
+                      fontSize: '17px', lineHeight: '1.6',
+                      boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
+                    }}>
+                      {msg.text}
+                    </div>
+                  </div>
+                ))}
+                {liveText && (
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                    <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                      {liveText}
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          <div style={{ padding: '12px 28px', borderTop: '1.5px solid #e8eaf6', display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <canvas ref={canvasRef} width={200} height={38}
+              style={{ borderRadius: '10px', background: 'rgba(26,35,126,0.05)', display: listening ? 'block' : 'none' }} />
+            {!listening && (
+              <div style={{ width: '30px', height: '30px', borderRadius: '50%', background: '#f0f1f8', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={statusColor} strokeWidth="2">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                </svg>
+              </div>
+            )}
+            <span style={{ fontSize: '13px', color: '#888', fontWeight: '600' }}>{statusLabel}</span>
+          </div>
+        </div>
       </div>{/* end flex row */}
-
-      <footer style={{ background: '#ffffff', borderTop: '1.5px solid #e8eaf6', padding: '10px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 -2px 8px rgba(26,35,126,0.05)', minHeight: '64px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-          {/* persistent voice dock: waveform while listening, breathing dot otherwise */}
-          <canvas ref={canvasRef} width={240} height={44}
-            style={{ borderRadius: '10px', background: 'rgba(26,35,126,0.05)', display: listening ? 'block' : 'none' }} />
-          {!listening && (
-            <div style={{ position: 'relative', width: '34px', height: '34px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-              {status === 'ready' && <div style={{ position: 'absolute', inset: 0, borderRadius: '50%', border: '2px solid rgba(26,35,126,0.25)', animation: 'ring 3.4s ease-out infinite' }} />}
-              <div style={{ width: '16px', height: '16px', borderRadius: '50%', background: statusColor, transition: 'background 0.3s', animation: status === 'speaking' ? 'pulse 1.1s infinite' : status === 'ready' ? 'breathe 3.4s ease-in-out infinite' : 'none' }} />
-            </div>
-          )}
-          <span style={{ fontSize: '14px', color: '#444', fontWeight: '600', transition: 'color 0.3s' }}>{statusLabel}</span>
-        </div>
-        <div style={{ fontSize: '12px', color: '#bbb' }}>RNSIT Digital Receptionist &nbsp;·&nbsp; Bengaluru 560098</div>
-      </footer>
 
       <style>{`
         @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(1.4)} }
+        @keyframes ariaPulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(1.6)} }
         @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
         @keyframes ring { 0%{transform:scale(0.65);opacity:1} 100%{transform:scale(1.5);opacity:0} }
-        .dots { display:inline-flex; gap:5px; align-items:center; }
-        .dots i { width:7px; height:7px; border-radius:50%; background:#7e57c2; animation: dotp 1.2s infinite ease-in-out; }
-        .dots i:nth-child(2){ animation-delay:0.18s } .dots i:nth-child(3){ animation-delay:0.36s }
-        @keyframes dotp { 0%,80%,100%{opacity:0.25; transform:scale(0.8)} 40%{opacity:1; transform:scale(1)} }
         @keyframes breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(1.06)} }
+        @keyframes ariaBreathe { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
+        @keyframes ariaSway { 0%,100%{transform:rotate(-1deg)} 50%{transform:rotate(1deg)} }
+        .aria-wrap { transition: filter 0.4s ease; }
+        .aria-wrap-ready { animation: ariaBreathe 4.2s ease-in-out infinite; }
+        .aria-wrap-listening { animation: ariaBreathe 2.2s ease-in-out infinite; filter: drop-shadow(0 8px 20px rgba(67,160,71,0.3)); }
+        .aria-wrap-processing { animation: ariaSway 2.4s ease-in-out infinite; filter: drop-shadow(0 8px 20px rgba(126,87,194,0.3)); }
+        .aria-wrap-speaking { animation: ariaBreathe 1.6s ease-in-out infinite; filter: drop-shadow(0 8px 20px rgba(239,83,80,0.3)); }
+        .aria-head-group, .aria-eye { transition: transform 0.35s ease; }
+        .aria-think-dots { opacity: 0; transition: opacity 0.3s ease; }
+        .aria-processing .aria-think-dots { opacity: 1; }
+        .aria-think-dot { animation: ariaThinkDot 1.4s ease-in-out infinite; transform-origin: center; }
+        .aria-think-dot:nth-child(1) { animation-delay: 0s; }
+        .aria-think-dot:nth-child(2) { animation-delay: 0.2s; }
+        .aria-think-dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes ariaThinkDot { 0%,100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.1); } }
         * { box-sizing: border-box; margin: 0; padding: 0; }
         input:focus { border-color: #1a237e !important; box-shadow: 0 0 0 3px rgba(26,35,126,0.1); }
         ::-webkit-scrollbar { width: 6px; }
