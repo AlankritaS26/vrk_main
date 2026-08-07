@@ -51,7 +51,7 @@ export async function createKioskMic({ onSpeechStart, onSpeechEnd, onMisfire, on
     onnxWASMBasePath: '/',
 
     // Kiosk tuning — accept the person in front, reject background voices
-    positiveSpeechThreshold: 0.8,
+    positiveSpeechThreshold: 0.85,   // stricter: reject distant corridor chatter
     negativeSpeechThreshold: 0.55,
     minSpeechFrames: 4,         // ignore coughs / screen taps (<~130 ms)
     redemptionFrames: 8,        // ~800 ms pause = end of utterance
