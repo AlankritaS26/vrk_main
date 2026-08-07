@@ -313,15 +313,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
 
-    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
-    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
-      const farewell = 'You are most welcome! Have a wonderful day. Goodbye!';
-      micRef.current?.pause();
-      speak(farewell);                       // WebAudio keeps playing across unmount
-      try { await fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }); } catch (e) { }
-      window.dispatchEvent(new Event('vrk-session-ended'));   // App switches NOW
-      return;
-    }
+    // NOTE: farewell/greeting detection used to be guessed HERE too, via a
+    // raw substring check on the unnormalized transcript (`text.includes('bye')`
+    // etc). That's gone — it was a duplicate of (and inconsistent with) the
+    // backend's own check, ran on unnormalized text, and had no word-boundary
+    // or length guard, so it could fire on any utterance that merely
+    // contained "bye"/"thanks" as a substring and silently swallow the rest
+    // of the sentence. The backend (/ask) is now the single source of truth:
+    // it returns `session_action: "END"` when it genuinely detects a
+    // farewell, and we act on that below after the real answer comes back.
 
     // 35 s hard cap — prevents status getting stuck at 'processing' if the
     // LLM is slow or the network drops after the request was sent.
@@ -345,6 +345,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
       });
+
+      if (data.session_action === 'END') {
+        // Backend already ended the session (active_session = None) and
+        // broadcast session_end over the websocket — just speak the
+        // farewell and switch screens once it's done playing.
+        micRef.current?.pause();
+        speak(answer, () => addMessage(answer, 'kiosk'));
+        window.dispatchEvent(new Event('vrk-session-ended'));
+        return;
+      }
+
       speak(answer, () => addMessage(answer, 'kiosk'));
     } catch (e) {
       clearTimeout(askTimeout);
