@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import List
 import config
@@ -23,12 +23,27 @@ class EmbeddingProvider(ABC):
         return f"{self.provider_name}_{self.dimensions}"
 
 
+# Real embedding dimensions per model — the ONLY safe source of truth.
+# Previously hardcoded to 1024 unconditionally, which is correct for
+# bge-large but WRONG for bge-base (768) and bge-small (384). Since
+# dimensions feeds directly into collection_suffix() (which encodes
+# provider+dimension into the ChromaDB collection name to prevent vector
+# dimension collisions), leaving this hardcoded would have crashed on the
+# first search after switching models, or silently reused the wrong
+# collection. Now it looks up the ACTUAL configured model.
+_BGE_DIMENSIONS = {
+    "BAAI/bge-large-en-v1.5": 1024,
+    "BAAI/bge-base-en-v1.5":  768,
+    "BAAI/bge-small-en-v1.5": 384,
+}
+
+
 class LocalBGEEmbedding(EmbeddingProvider):
     _model = None
 
     @property
     def dimensions(self) -> int:
-        return 1024
+        return _BGE_DIMENSIONS.get(config.BGE_MODEL_NAME, 1024)
 
     @property
     def provider_name(self) -> str:
@@ -44,14 +59,13 @@ class LocalBGEEmbedding(EmbeddingProvider):
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         return self._load().encode(
-            texts,
+            [f"Represent this sentence: {t}" for t in texts],
             normalize_embeddings=True, batch_size=32,
         ).tolist()
 
     def embed_query(self, text: str) -> List[float]:
         return self._load().encode(
-            f"Represent this sentence for searching relevant passages: {text}",
-            normalize_embeddings=True,
+            f"Represent this sentence: {text}", normalize_embeddings=True
         ).tolist()
 
 

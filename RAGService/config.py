@@ -14,8 +14,21 @@ for _d in (VECTORSTORE_DIR, UPLOADS_DIR):
 
 # ── Embedding provider: "local" | "azure_openai" ──────────────────────
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
-BGE_MODEL_NAME     = "BAAI/bge-large-en-v1.5"
-BGE_DEVICE         = os.getenv("BGE_DEVICE", "cpu")
+
+# Device-aware model selection — same pattern as the kiosk's STT (small.en
+# on CPU, a turbo model when GPU-connected). The large model is NOT removed:
+# it's still used automatically whenever a GPU is available, so quality is
+# preserved wherever the hardware supports it; CPU gets a lighter model
+# purely for latency, appropriate for this project's focused ~90-chunk
+# campus knowledge base (not a huge diverse corpus where the accuracy gap
+# would matter more).
+BGE_DEVICE     = os.getenv("BGE_DEVICE", "cpu")
+BGE_MODEL_CPU  = os.getenv("BGE_MODEL_CPU", "BAAI/bge-base-en-v1.5")
+BGE_MODEL_GPU  = os.getenv("BGE_MODEL_GPU", "BAAI/bge-large-en-v1.5")
+# Explicit override always wins if set; otherwise choose by device.
+BGE_MODEL_NAME = os.getenv("BGE_MODEL_NAME", "").strip() or (
+    BGE_MODEL_GPU if BGE_DEVICE.strip().lower() in ("cuda", "gpu") else BGE_MODEL_CPU
+)
 
 # Azure OpenAI (only needed when EMBEDDING_PROVIDER=azure_openai)
 AZURE_OPENAI_ENDPOINT         = os.getenv("AZURE_OPENAI_ENDPOINT", "")
