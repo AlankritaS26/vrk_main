@@ -8,3 +8,4 @@ faces/
 frontend/build/
 .vscode/
 requirements.lock.txt
+RAGService/data/vectorstore/
