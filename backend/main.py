@@ -53,6 +53,7 @@ from backend.database import (
 from backend.llm import initialize_rag_knowledge_base, close_llm_client
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
+from backend.tts import PREWARM_DONE
 
 try:
     from backend.detection import run_pipeline as _run_pipeline
@@ -465,8 +466,18 @@ def _log_message(text: str, speaker: str) -> dict:
 # ==========================================
 @app.get("/health")
 def health():
-    """Liveness probe for the launcher and future monitoring."""
-    return {"status": "healthy"}
+    """
+    Liveness probe for the launcher — and the fix for a real bug: this used
+    to report healthy the instant uvicorn was up, before TTS finished
+    pre-caching the fixed phrases (greeting, acknowledgments, farewell).
+    detection.py starts as soon as /health is green, so a visitor could be
+    recognized and greeted BEFORE the greeting audio was actually cached —
+    falling through to slow live synthesis. Now this waits (briefly, with a
+    hard cap so a genuinely broken TTS install can never block startup
+    forever) for that pre-warm to actually finish first.
+    """
+    PREWARM_DONE.wait(timeout=25)   # bounded — degrades gracefully, never hangs
+    return {"status": "healthy", "tts_prewarmed": PREWARM_DONE.is_set()}
 
 
 @app.get("/")
@@ -898,17 +909,38 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
 
 INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
+import random as _random
+
 def build_greeting(name: str, is_returning: bool, resumed: bool) -> str:
-    """The exact spoken lines for first-time vs returning visitors."""
+    """Spoken greeting — varied so it never sounds like a recording.
+
+    First visit explains what the kiosk is (so the visitor knows what to ask);
+    return visits are warmer and shorter. Each picks randomly from a few
+    phrasings, the way a real receptionist naturally varies their words."""
     who = name if name and name not in ("Guest", "Unknown", "") else "there"
+
     if not is_returning:
-        return (f"Welcome {who}! I am the digital receptionist of {INSTITUTE_NAME}. "
-                f"I can help you with admissions, departments, placements, fees, "
-                f"and finding your way around campus. How may I assist you today?")
+        # Fixed script (not randomized) so the ENTIRE line can be
+        # pre-synthesized once at server startup and served from cache —
+        # this is what makes the very first greeting instant instead of
+        # waiting on live TTS synthesis. If you change this text, also
+        # update the matching entry in tts.py's _PREWARM list.
+        return (f"Welcome to {INSTITUTE_NAME}. I am Voix Nova, your digital receptionist. "
+                f"I can help you with admissions, departments, placements, fees, and "
+                f"directions around campus. How may I assist you today?")
+
     if resumed:
-        return (f"Welcome back, {who}! Good to see you again. "
-                f"We can continue where we left off. How may I assist you today?")
-    return f"Welcome back, {who}! How may I assist you today?"
+        return _random.choice([
+            f"Welcome back, {who}! Good to see you again — shall we pick up where we left off?",
+            f"Hey {who}, welcome back! We can carry on from before. What would you like to know?",
+            f"Good to see you again, {who}! How can I help this time?",
+        ])
+
+    return _random.choice([
+        f"Welcome back, {who}! How can I help you today?",
+        f"Hi again, {who}! What can I do for you?",
+        f"Hello {who}, good to see you! How may I help?",
+    ])
 
 
 async def resume_or_create_session(face_id: str, user_name: str,
@@ -1125,7 +1157,65 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             result["source"] = source
         return result
 
+    # ─── Greeting → instant, deterministic reply (no RAG/LLM round-trip) ─────
+    # "Hi"/"Hello" used to be answered via RAG, which is what caused the
+    # "Hi Hi there! Welcome..." echo bug: a greeting isn't a fact lookup, it
+    # doesn't belong in the knowledge base, and it should never wait on an
+    # LLM call. Handled the same deterministic way as the goodbye phrases.
+    GREETING_PHRASES = {
+        "hi", "hello", "hey", "hiya", "yo",
+        "good morning", "good afternoon", "good evening",
+    }
+    if q_normalized in GREETING_PHRASES:
+        import random as _random2
+        reply = _random2.choice([
+            f"Hi{', ' + visitor_name if visitor_name != 'there' else ''}! What can I help you with?",
+            f"Hello{', ' + visitor_name if visitor_name != 'there' else ''}! How can I assist you today?",
+            f"Hey there! What would you like to know?",
+        ])
+        return await _respond(reply)
+
     # ─── Thank you → end session immediately ─────────────────────────────────
+    # ── Easter eggs — deterministic, instant, no RAG/LLM round-trip ─────────
+    # This is the single thing visitors actually remember and tell their
+    # friends about. A few warm, self-aware replies to the questions people
+    # ask ANY assistant sooner or later.
+    import random as _random3
+    EASTER_EGGS = {
+        "are you a robot": [
+            "I'm a digital receptionist, so yes and no — no body, but I do the job!",
+            "Guilty as charged! But I promise I'm a friendly one.",
+        ],
+        "are you real": [
+            "Real enough to help you find the CSE block! I'm Voix Nova, RNSIT's digital receptionist.",
+        ],
+        "are you human": [
+            "Not quite — I'm Voix Nova, a digital receptionist. But I'll do my best to sound like one!",
+        ],
+        "tell me a joke": [
+            "Why did the student bring a ladder to class? To reach the higher studies!",
+            "What did the router say to the CSE student? Nothing, they just had a falling out over connection issues.",
+        ],
+        "who made you": [
+            "I was built by the students of RNSIT to help visitors like you find your way around!",
+        ],
+        "what is your name": [
+            "I'm Voix Nova, the digital receptionist here at RNSIT. Nice to meet you!",
+        ],
+        "who are you": [
+            "I'm Voix Nova — think of me as RNSIT's always-awake front desk.",
+        ],
+        "i love you": [
+            "That's sweet! I love helping visitors find their way around RNSIT too.",
+        ],
+        "do you sleep": [
+            "Never! I'm here whenever a visitor needs help, day or night.",
+        ],
+    }
+    for _trigger, _replies in EASTER_EGGS.items():
+        if _trigger in q_normalized:
+            return await _respond(_random3.choice(_replies))
+
     THANK_YOU_PHRASES = {
         "thank you", "thanks", "thank u", "thankyou", "thank you so much",
         "ok thanks", "okay thanks", "ok thank you", "okay thank you",
