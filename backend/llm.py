@@ -58,9 +58,14 @@ def get_shared_client() -> httpx.AsyncClient:
     global _SHARED_ASYNC_CLIENT
     if _SHARED_ASYNC_CLIENT is None or _SHARED_ASYNC_CLIENT.is_closed:
         limits = httpx.Limits(max_keepalive_connections=20, max_connections=100)
+        # connect=4.0: fail fast when the LLM server isn't reachable at all
+        # (unreachable host/port should be near-instant, not a long hang —
+        # a real visitor stood at the kiosk for ~21s in silence before this
+        # was tightened). read=30.0 stays generous since a slow LLM that IS
+        # connected and actually generating tokens shouldn't be cut off.
         _SHARED_ASYNC_CLIENT = httpx.AsyncClient(
             limits=limits,
-            timeout=httpx.Timeout(30.0, connect=10.0),
+            timeout=httpx.Timeout(30.0, connect=4.0),
         )
     return _SHARED_ASYNC_CLIENT
 
@@ -75,8 +80,11 @@ async def close_llm_client():
 def _require_llm_config():
     if not LLM_BASE_URL:
         raise ValueError("LLM_BASE_URL is not configured.")
-    if not LLM_API_KEY:
-        raise ValueError("LLM_API_KEY is not configured.")
+    # NOTE: LLM_API_KEY is intentionally NOT required here anymore. The
+    # team's actual server (confirmed working via their standalone test
+    # script) runs with no API key at all — LLM_API_KEY="" in .env — so
+    # hard-requiring a truthy key here made every call fail before it even
+    # left this machine, regardless of network/URL correctness.
 
 
 def _provider() -> str:
@@ -120,8 +128,25 @@ def _max_tokens_param() -> str:
     return "max_completion_tokens" if _is_new_model_family() else "max_tokens"
 
 
+def _api_style() -> str:
+    """
+    'openai' (default) — standard {"messages": [...]} to POST {base}/chat/completions,
+        Authorization: Bearer header. Works for real OpenAI, vLLM, LiteLLM, Ollama, etc.
+    'query' — the other team's actual confirmed-working server: POST {base}/chat
+        with {"query": "<flattened prompt>", "model": ..., "max_tokens": ...,
+        "temperature": ...}, X-API-Key header, response shaped {"answer": "..."}.
+        Set LLM_API_STYLE=query in .env to use this.
+    """
+    return os.getenv("LLM_API_STYLE", "openai").strip().lower()
+
+
 def _auth_headers() -> dict[str, str]:
     _require_llm_config()
+    if _api_style() == "query":
+        headers = {"Content-Type": "application/json"}
+        if LLM_API_KEY:
+            headers["X-API-Key"] = LLM_API_KEY
+        return headers
     if _provider() == "azure":
         # Azure OpenAI uses 'api-key', not 'Authorization: Bearer'
         return {"api-key": LLM_API_KEY, "Content-Type": "application/json"}
@@ -194,6 +219,46 @@ async def chat_completion(
 ) -> str:
     _require_llm_config()
     prov = _provider()
+    style = _api_style()
+
+    if style == "query":
+        # The team's actual server: POST {base}/chat, {"query": "<flat prompt>"}.
+        # It has no concept of a role-based messages array, so flatten the
+        # system+user messages into one plain-text prompt — same as sending
+        # a single combined instruction to a text-completion-style endpoint.
+        url = f"{LLM_BASE_URL.rstrip('/')}/chat"
+        prompt_text = "\n\n".join(
+            f"[{m.get('role', 'user').upper()}]\n{m.get('content', '')}" for m in messages
+        )
+        payload = {
+            "query": prompt_text,
+            "model": LLM_CHAT_MODEL,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        active_client = client if client is not None else get_shared_client()
+        try:
+            response = await active_client.post(
+                url, json=payload, headers=_auth_headers(),
+                timeout=httpx.Timeout(30.0, connect=5.0),
+            )
+            response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            logger.error("[LLM] HTTP %s from query-style API — %s", exc.response.status_code, exc.response.text[:400])
+            raise
+        data = response.json()
+        if isinstance(data, dict):
+            if data.get("answer") is not None:
+                return str(data["answer"]).strip()
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices:
+                choice = choices[0]
+                if isinstance(choice, dict):
+                    if isinstance(choice.get("message"), dict):
+                        return str(choice["message"].get("content", "")).strip()
+                    if choice.get("text"):
+                        return str(choice["text"]).strip()
+        raise ValueError(f"Unable to extract LLM output from query-style response: {data}")
 
     _AZURE_API_VER = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
     if prov == "azure":
@@ -223,7 +288,15 @@ async def chat_completion(
             url,
             json=payload,
             headers=_auth_headers(),
-            timeout=30.0,
+            # NOTE: previously `timeout=30.0` (a flat float) here silently
+            # overrode the shared client's fast connect-timeout
+            # (httpx.Timeout(30.0, connect=4.0), set where the client is
+            # created) with one flat 30s timeout applied to every phase —
+            # so an unreachable LLM_BASE_URL took up to 30s to fail instead
+            # of ~4-5s. Passing an explicit httpx.Timeout here keeps the
+            # generous 30s allowance for slow LLM *inference* while still
+            # failing fast if the server isn't even reachable.
+            timeout=httpx.Timeout(30.0, connect=5.0),
         )
         response.raise_for_status()
     except httpx.HTTPStatusError as exc:
@@ -329,8 +402,67 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
                 s_parts.append(f"Students placed: {stats['students_placed']}.")
             chunks.append(" ".join(s_parts))
 
+    # ── Admissions: dedicated builder (not the generic key:val loop below) ──
+    # because admissions now holds nested dicts/lists (eligibility per
+    # course, process steps, documents, fee/scholarship disclaimers) that
+    # the generic loop can't turn into natural sentences. One topic per
+    # chunk, same pattern as departments/placements above.
+    adms = data.get("admissions", {})
+    if adms:
+        headline = [f"RNSIT admissions status: {adms.get('status', 'contact the admissions office for current status')}."]
+        if adms.get("academic_year"):
+            headline.append(f"Academic year: {adms['academic_year']}.")
+        if adms.get("contact_phone") or adms.get("contact_email"):
+            headline.append(f"Admissions contact: phone {adms.get('contact_phone', 'N/A')}, "
+                             f"email {adms.get('contact_email', 'N/A')}.")
+        if adms.get("cet_code"):
+            headline.append(f"KCET institute code: {adms['cet_code']}.")
+        if adms.get("comedk_code"):
+            headline.append(f"COMEDK institute code: {adms['comedk_code']}.")
+        chunks.append(" ".join(headline))
+
+        modes = adms.get("modes", {})
+        if isinstance(modes, dict):
+            for course, exams in modes.items():
+                if exams:
+                    label = course.replace("_", " ").upper()
+                    chunks.append(f"RNSIT admission route for {label}: {', '.join(exams)}.")
+        elif isinstance(modes, list) and modes:
+            chunks.append(f"RNSIT admission modes: {', '.join(modes)}.")
+
+        elig = adms.get("eligibility", {})
+        if isinstance(elig, dict):
+            for course, text in elig.items():
+                if isinstance(text, str) and text.strip():
+                    label = course.replace("_", " ").upper()
+                    chunks.append(f"RNSIT eligibility for {label}: {text}")
+
+        steps = adms.get("process_steps", [])
+        if steps:
+            numbered = " ".join(f"({i+1}) {s}" for i, s in enumerate(steps))
+            chunks.append(f"RNSIT admission process: {numbered}")
+
+        docs = adms.get("documents_required", [])
+        if docs:
+            chunks.append("Documents required for RNSIT admission: " + "; ".join(docs) + ".")
+
+        fees = adms.get("fees", {})
+        if isinstance(fees, dict):
+            if fees.get("quota_types"):
+                chunks.append(f"RNSIT admission quota types: {', '.join(fees['quota_types'])}.")
+            if fees.get("note"):
+                chunks.append(f"RNSIT fee information: {fees['note']}")
+
+        schol = adms.get("scholarships", {})
+        if isinstance(schol, dict):
+            if schol.get("general"):
+                chunks.append("RNSIT scholarship options: " + "; ".join(schol["general"]) + ".")
+            if schol.get("note"):
+                chunks.append(f"RNSIT scholarship note: {schol['note']}")
+
     for section, content in data.items():
-        if section in ("meta", "college", "administration", "departments", "facilities", "placements", "faqs"):
+        if section in ("meta", "college", "administration", "departments",
+                        "facilities", "placements", "admissions", "faqs"):
             continue
         if isinstance(content, dict):
             for key, val in content.items():
@@ -346,11 +478,31 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
     # dropped by the generic loop above (a list-of-dicts matches neither
     # the isinstance(content, dict) nor isinstance(content, str) branch),
     # so none of the 40+ FAQ entries ever reached the vector store. ──
+    #
+    # EXCLUDE conversational entries (greetings/farewells/thanks). These are
+    # conversation mechanics, not campus facts — they don't belong in a
+    # fact-retrieval index. Leaving them in causes two real bugs: (1) they
+    # can win the similarity search for vague/short queries and get echoed
+    # back as if they were the answer, and (2) they're now handled by
+    # deterministic GREETING_PHRASES/THANK_YOU_PHRASES checks in main.py
+    # instead, so indexing them here would just create a second,
+    # competing (and inconsistent) path to the same behaviour.
+    _CONVERSATIONAL_FAQ_QUESTIONS = {
+        "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+        "thank you", "thanks", "bye", "goodbye",
+    }
+    skipped = 0
     for faq in data.get("faqs", []):
         q = (faq.get("question") or "").strip()
         a = (faq.get("answer") or "").strip()
-        if q and a:
-            chunks.append(f"Q: {q} A: {a}")
+        if not (q and a):
+            continue
+        if q.lower().strip(" ?!.") in _CONVERSATIONAL_FAQ_QUESTIONS:
+            skipped += 1
+            continue
+        chunks.append(f"Q: {q} A: {a}")
+    if skipped:
+        logger.info("[RAG SEED] Skipped %d conversational FAQ entries (handled deterministically, not indexed).", skipped)
 
     return [c.strip() for c in chunks if c.strip()]
 
@@ -401,10 +553,15 @@ async def initialize_rag_knowledge_base():
         logger.warning("[RAG] RAGService unreachable during init (%s). Will retry on next query.", e)
 
 
-async def retrieve_relevant_context(user_query: str, top_k: int = None) -> tuple[str, float]:
+async def retrieve_relevant_context(user_query: str, top_k: int = None) -> tuple[str, float, list[dict]]:
     """
     Semantic search via RAGService.
-    Returns (context_text, best_score).  Falls back to empty string on error.
+    Returns (context_text, best_score, raw_results). raw_results is the
+    ranked list of {text, score, metadata} from RAGService, kept around so
+    callers can log exactly what was retrieved (see Step-15 debug logging
+    in generate_rag_kiosk_response) — this is what lets us actually PROVE
+    what the LLM was given, instead of just trusting it happened.
+    Falls back to empty context on error.
     """
     k = top_k or RAG_TOP_K
     client = get_shared_client()
@@ -417,15 +574,15 @@ async def retrieve_relevant_context(user_query: str, top_k: int = None) -> tuple
         resp.raise_for_status()
         results = resp.json()   # list of {text, score, metadata}
         if not results:
-            return "No relevant context found.", 0.0
+            return "No relevant context found.", 0.0, []
 
         best_score = max(safe_float(r.get("score", 0)) for r in results)
         context = "\n\n".join(r["text"] for r in results if r.get("text"))
-        return context, best_score
+        return context, best_score, results
 
     except Exception as e:
         logger.warning("[RAG] Search failed: %s", e)
-        return "No context available.", 0.0
+        return "No context available.", 0.0, []
 
 
 # ==========================================
@@ -496,20 +653,60 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
     # Ensure RAGService collection is seeded (no-op after first call)
     await initialize_rag_knowledge_base()
 
-    search_query            = await condense_query(question, history or [])
-    context_text, max_score = await retrieve_relevant_context(search_query)
+    # ── Live-info intent check BEFORE the RAG threshold gate ─────────────
+    # Weather/traffic questions can score misleadingly HIGH against generic
+    # chunks in a small corpus (confirmed: "how is the weather today?" hit
+    # 0.61 similarity against canteen/gym/banking facts — well above the
+    # 0.35 threshold), which routes them into RNSIT_RAG and skips
+    # _handle_offtopic() entirely — the ONLY place _try_fetch_weather() is
+    # called from. So live-info questions never reached the weather fetch,
+    # regardless of RAG score. Checking here, before RAG runs at all, means
+    # this can never be preempted by a coincidental high similarity score —
+    # same reasoning as why greetings/farewells are checked before RAG.
+    weather_answer = await _try_fetch_weather(question)
+    if weather_answer:
+        logger.info("=" * 60)
+        logger.info("TRANSCRIPT: %r", question)
+        logger.info("ROUTE: LIVE_INFO (weather, pre-RAG)")
+        logger.info("LLM CALLED: NO")
+        logger.info("FINAL RESPONSE: %r", weather_answer)
+        logger.info("=" * 60)
+        return weather_answer
+
+    traffic_answer = await _try_fetch_traffic(question)
+    if traffic_answer:
+        logger.info("=" * 60)
+        logger.info("TRANSCRIPT: %r", question)
+        logger.info("ROUTE: LIVE_INFO (traffic, pre-RAG)")
+        logger.info("LLM CALLED: NO")
+        logger.info("FINAL RESPONSE: %r", traffic_answer)
+        logger.info("=" * 60)
+        return traffic_answer
+
+    search_query = await condense_query(question, history or [])
+    context_text, max_score, raw_results = await retrieve_relevant_context(search_query)
 
     max_score = safe_float(max_score)
-    logger.info("[RAG] query='%s' | top_score=%.4f | threshold=%.2f",
-                search_query, max_score, RAG_SIMILARITY_THRESHOLD)
+
+    # ── Step-15 structured debug logging ────────────────────────────────
+    logger.info("=" * 60)
+    logger.info("TRANSCRIPT: %r", question)
+    logger.info("NORMALIZED QUERY: %r", search_query)
+    for i, r in enumerate(raw_results[:5], start=1):
+        preview = (r.get("text") or "")[:80].replace("\n", " ")
+        logger.info("  RETRIEVED #%d — score=%.3f — %s...", i, safe_float(r.get("score", 0)), preview)
+    logger.info("THRESHOLD: %.2f | TOP SCORE: %.4f", RAG_SIMILARITY_THRESHOLD, max_score)
 
     if max_score < RAG_SIMILARITY_THRESHOLD:
-        logger.info("[RAG] Score below threshold — off-topic guard triggered.")
-        return (
-            "I am the RNSIT Campus Kiosk virtual assistant. I can help you with "
-            "campus directions, departments, fees, placements, and administrative queries. "
-            "Please ask a campus-related question!"
-        )
+        route, answer = await _handle_offtopic(question, history or [])
+        logger.info("ROUTE: %s", route)
+        logger.info("LLM CALLED: %s", "YES" if route != "RNSIT_UNKNOWN" else "NO")
+        logger.info("FINAL RESPONSE: %r", answer)
+        logger.info("=" * 60)
+        return answer
+
+    logger.info("ROUTE: RNSIT_RAG")
+    logger.info("LLM CALLED: YES | MODEL: %s", LLM_CHAT_MODEL)
 
     system_prompt = (
         "You are the official AI Digital Receptionist for RNS Institute of Technology (RNSIT), Bengaluru.\n"
@@ -523,6 +720,14 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
         "2. Keep responses snappy and punchy (2-3 sentences maximum). Avoid long paragraphs.\n"
         "3. Do not answer out-of-domain questions (politics, celebrities, general trivia). "
         "Guide them back to college topics.\n"
+        "4. COMPARISON / RANKING QUESTIONS (e.g. 'which department is best for placements'): "
+        "the placement figures you have are INSTITUTE-WIDE totals, not broken down per department. "
+        "Do NOT invent a per-department ranking or imply one department outperforms another unless "
+        "the context above explicitly states department-specific figures. If asked to compare "
+        "departments and you only have overall numbers, say so plainly — e.g. 'I only have "
+        "placement numbers for RNSIT overall, not broken down by department, so I can't say which "
+        "is best — but I can tell you the departments and overall placement stats we do have.' "
+        "Never present a guess as if it were verified data.\n"
     )
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -542,7 +747,10 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
             temperature=0.2,
             max_tokens=180,
         )
-        return text_out.strip() if text_out else "I am having trouble formatting the response. Please try again."
+        answer = text_out.strip() if text_out else "I am having trouble formatting the response. Please try again."
+        logger.info("FINAL RESPONSE: %r", answer)
+        logger.info("=" * 60)
+        return answer
 
     except httpx.HTTPStatusError as e:
         logger.error("[LLM API] Status %s: %s", e.response.status_code, e.response.text)
@@ -550,3 +758,165 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
     except Exception as e:
         logger.exception("[LLM API] Connection failure: %s", e)
         return "The kiosk AI engine is currently experiencing connectivity issues. Please visit the Admin Block."
+
+
+# ==========================================
+# OFF-TOPIC ROUTER — GENERAL_LLM / LIVE_INFO / UNSUPPORTED_EXTERNAL / RNSIT_UNKNOWN
+# ==========================================
+# Only runs when RAG scored below threshold, so it costs nothing on the
+# common case (a real RNSIT question that retrieval already answered).
+# One cheap LLM call classifies + drafts a response in a single round trip
+# instead of a large keyword/if-else tree.
+_OFFTOPIC_ROUTER_PROMPT = (
+    "You are the routing brain behind an RNSIT campus kiosk voice assistant. "
+    "The visitor's question did not match anything in the RNSIT knowledge base. "
+    "Classify it into exactly one category and reply with ONLY that category word "
+    "on the first line, then (if GENERAL_LLM) a short 1-2 sentence helpful answer "
+    "on the second line. Categories:\n"
+    "GENERAL_LLM — harmless general-knowledge or small-talk question you can answer "
+    "yourself (e.g. 'what is machine learning', 'how are you').\n"
+    "LIVE_INFO — needs real-time/current data you cannot know (weather, today's date, "
+    "live traffic, current news).\n"
+    "UNSUPPORTED_EXTERNAL — asks a specific factual question about a DIFFERENT "
+    "institution/company/person you have no verified data on.\n"
+    "RNSIT_UNKNOWN — seems to be about RNSIT but you have no matching verified fact.\n\n"
+    f"Visitor question: {{question}}"
+)
+
+
+async def _try_fetch_weather(question: str) -> str | None:
+    """
+    Real weather integration for LIVE_INFO — Open-Meteo (no API key needed).
+    Only fires for questions that actually look weather-related; returns None
+    for other LIVE_INFO questions (news/traffic/etc.) so the caller falls back
+    to an honest "I don't have that" message instead of guessing.
+    Coordinates are RNSIT's campus location (R R Nagar, Bengaluru).
+    """
+    q = question.lower()
+    if not any(w in q for w in ("weather", "rain", "raining", "temperature", "hot", "cold", "climate", "sunny", "humid")):
+        return None
+
+    _WMO_CODES = {
+        0: "clear sky", 1: "mostly clear", 2: "partly cloudy", 3: "overcast",
+        45: "foggy", 48: "foggy", 51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+        61: "light rain", 63: "rain", 65: "heavy rain", 66: "freezing rain", 67: "freezing rain",
+        71: "light snow", 73: "snow", 75: "heavy snow", 80: "light showers",
+        81: "showers", 82: "heavy showers", 95: "thunderstorm", 96: "thunderstorm with hail",
+        99: "severe thunderstorm with hail",
+    }
+    try:
+        client = get_shared_client()
+        resp = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": 12.9081, "longitude": 77.5218,
+                    "current_weather": "true", "timezone": "Asia/Kolkata"},
+            timeout=httpx.Timeout(8.0, connect=4.0),
+        )
+        resp.raise_for_status()
+        cw = resp.json().get("current_weather", {})
+        temp = cw.get("temperature")
+        code = cw.get("weathercode")
+        if temp is None:
+            return None
+        desc = _WMO_CODES.get(code, "")
+        desc_part = f" and {desc}" if desc else ""
+        return f"It's currently around {temp}°C{desc_part} here at RNSIT in Bengaluru."
+    except Exception as e:
+        logger.warning("[LIVE_INFO] Weather fetch failed: %s", e)
+        return None
+
+
+async def _try_fetch_traffic(question: str) -> str | None:
+    """
+    Real traffic integration for LIVE_INFO — TomTom Traffic Flow API.
+    Unlike weather, traffic isn't free-and-keyless anywhere reputable, so this
+    requires TOMTOM_API_KEY in .env (free tier, no cost, just a signup at
+    developer.tomtom.com). Only fires for traffic-looking questions; if no key
+    is configured, returns None so the caller falls back to an honest message
+    instead of silently doing nothing or guessing.
+    Reports live road-flow conditions at a fixed point on RNSIT's approach
+    road (Dr. Vishnuvardhan Road) rather than route-based ETA, since the
+    visitor is already at the kiosk — there's no "origin" to route from.
+    """
+    q = question.lower()
+    if not any(w in q for w in ("traffic", "congestion", "jam", "road condition", "how's the road")):
+        return None
+
+    api_key = os.getenv("TOMTOM_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    try:
+        client = get_shared_client()
+        resp = await client.get(
+            "https://api.tomtom.com/traffic/services/4/flowSegmentData/absolute/10/json",
+            params={"point": "12.9081,77.5218", "key": api_key},
+            timeout=httpx.Timeout(8.0, connect=4.0),
+        )
+        resp.raise_for_status()
+        seg = resp.json().get("flowSegmentData", {})
+        current = seg.get("currentSpeed")
+        free_flow = seg.get("freeFlowSpeed")
+        if not current or not free_flow:
+            return None
+        ratio = current / free_flow
+        if ratio >= 0.8:
+            desc = "flowing smoothly"
+        elif ratio >= 0.5:
+            desc = "moderately busy"
+        else:
+            desc = "quite congested"
+        return f"Traffic on the road near RNSIT is currently {desc}."
+    except Exception as e:
+        logger.warning("[LIVE_INFO] Traffic fetch failed: %s", e)
+        return None
+
+
+async def _handle_offtopic(question: str, history: list) -> tuple[str, str]:
+    try:
+        raw = await chat_completion(
+            messages=[
+                {"role": "system", "content": "You are a strict single-word classifier plus optional short answer generator."},
+                {"role": "user", "content": _OFFTOPIC_ROUTER_PROMPT.format(question=question)},
+            ],
+            temperature=0.2,
+            max_tokens=120,
+        )
+    except Exception as e:
+        logger.warning("[ROUTER] Classification call failed (%s) — defaulting to RNSIT_UNKNOWN.", e)
+        raw = "RNSIT_UNKNOWN"
+
+    lines = (raw or "").strip().splitlines()
+    route = (lines[0].strip().upper() if lines else "RNSIT_UNKNOWN")
+    if route not in ("GENERAL_LLM", "LIVE_INFO", "UNSUPPORTED_EXTERNAL", "RNSIT_UNKNOWN"):
+        route = "RNSIT_UNKNOWN"
+
+    if route == "GENERAL_LLM" and len(lines) > 1 and lines[1].strip():
+        return route, lines[1].strip()
+
+    if route == "LIVE_INFO":
+        weather_answer = await _try_fetch_weather(question)
+        if weather_answer:
+            return route, weather_answer
+        traffic_answer = await _try_fetch_traffic(question)
+        if traffic_answer:
+            return route, traffic_answer
+        return route, (
+            "I don't have access to that kind of live information right now. "
+            "For campus-related timings or schedules, I'm happy to help!"
+        )
+
+    if route == "UNSUPPORTED_EXTERNAL":
+        variants = [
+            "I currently have detailed information about RNSIT, so I don't have reliable information about that institution.",
+            "I'm specialized in RNSIT information and don't have verified details on that institution — sorry!",
+            "That's outside what I have verified data on — I can only speak confidently about RNSIT.",
+        ]
+        return route, variants[hash(question) % len(variants)]
+
+    # RNSIT_UNKNOWN — plausibly about RNSIT but nothing in the knowledge base
+    return "RNSIT_UNKNOWN", (
+        "I don't have that detail on hand — please check with the Admin Block "
+        "or call our admissions desk, and I'll be able to help with most other "
+        "RNSIT questions!"
+    )

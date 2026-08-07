@@ -49,7 +49,7 @@ from backend.database import (
     delete_face_by_name,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
-from backend.llm import initialize_rag_knowledge_base, close_llm_client
+from backend.llm import initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
 
@@ -203,6 +203,40 @@ _RAG_STOPWORDS = {
 _RAG_ABBREVS = {"dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "no", "vs", "etc"}
 
 
+def _matches_short_phrase(q_normalized: str, phrases: set[str]) -> bool:
+    """
+    Word-boundary phrase match, deliberately restricted to SHORT utterances
+    (<=4 words). This is the fix for the "random Goodbye" bug: the old code
+    did `phrase in q_normalized`, a raw substring check across the entire
+    sentence with no length cap — so a real question that happened to
+    contain "bye"/"thanks" anywhere (or just drifted semantically close via
+    RAG) could trigger a farewell. A genuine "bye"/"thank you" utterance is
+    always short; a real campus question with those letters buried in it
+    (or a coincidental partial match) is not, so capping length here is a
+    cheap, robust way to tell the two apart without a big keyword tree.
+    """
+    q = q_normalized.strip()
+    if not q or len(q.split()) > 4:
+        return False
+    if q in phrases:
+        return True
+    for phrase in phrases:
+        if re.search(rf"(?:^|\s){re.escape(phrase)}(?:$|\s)", q):
+            return True
+    return False
+
+
+GREETING_PHRASES = {
+    "hi", "hello", "hey", "hiya", "yo",
+    "good morning", "good afternoon", "good evening",
+}
+_GREETING_RESPONSES = [
+    "Hello! Welcome to RNSIT. How can I help you today?",
+    "Hi there! I'm the RNSIT digital receptionist — what would you like to know?",
+    "Hey! Welcome to RNS Institute of Technology. What can I help you with?",
+]
+
+
 # ── Q/A label stripper ────────────────────────────────────────────────────
 # FAQ-derived chunks are seeded (see backend/llm.py::_json_to_text_chunks)
 # as literal "Q: <question>? A: <answer>" strings, on purpose — that extra
@@ -290,9 +324,12 @@ async def query_rag_service(query: str, k: int | None = None) -> str:
     filters out weak matches (RAGService's score = 1 - vector distance, so
     higher is better — 0.35 is a reasonable "actually related" cutoff).
 
-    This is the single place that talks to RAGService — both /ask and
-    /api/chat call through here so caching, logging, and the admin
-    dashboard all see consistent answers.
+    NOTE: as of the Phase 3 fix, the primary voice pipeline (/ask) no longer
+    calls this — it calls backend.llm.generate_rag_kiosk_response, which
+    retrieves the same way but then passes the context to the LOCAL LLM
+    for a real generated answer instead of returning raw retrieved text.
+    This function is kept for /api/chat, a lower-level diagnostic endpoint
+    useful for inspecting exactly what RAGService itself returns.
     """
     k = k or RAG_TOP_K
     try:
@@ -1073,29 +1110,36 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     visitor_entry = _log_message(question, "visitor")
     await manager.broadcast({"type": "message", **visitor_entry})
 
-    async def _respond(answer: str, source: str = "") -> dict:
+    async def _respond(answer: str, source: str = "", session_action: str = "CONTINUE") -> dict:
         try:
             await save_interaction(sid, question, answer)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
         await manager.broadcast({"type": "message", **kiosk_entry})
-        result = {"question": question, "answer": answer}
+        result = {"question": question, "answer": answer, "session_action": session_action}
         if source:
             result["source"] = source
         return result
 
-    # ─── Thank you → end session immediately ─────────────────────────────────
+    # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
+    if _matches_short_phrase(q_normalized, GREETING_PHRASES):
+        answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
+        logger.info("[ROUTE] GREETING (deterministic) — '%s'", q_normalized)
+        return await _respond(answer, source="greeting")
+
+    # ─── Thank you / bye → end session immediately ──────────────────────────
     THANK_YOU_PHRASES = {
         "thank you", "thanks", "thank u", "thankyou",
         "ok thanks", "okay thanks", "ok thank you", "okay thank you",
         "thats all", "thats all thanks", "bye", "goodbye", "that is all",
     }
-    if any(phrase in q_normalized for phrase in THANK_YOU_PHRASES):
+    if _matches_short_phrase(q_normalized, THANK_YOU_PHRASES):
         farewell = (
             f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
             "Have a great day. Goodbye!"
         )
+        logger.info("[ROUTE] FAREWELL (deterministic) — '%s'", q_normalized)
         active_session    = None
         _last_activity_ts = 0.0
         await manager.broadcast({
@@ -1103,7 +1147,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             "session_id": sid,
             "reason":     "thank_you",
         })
-        return await _respond(farewell)
+        return await _respond(farewell, source="farewell", session_action="END")
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
@@ -1116,13 +1160,23 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── RAGService knowledge-base lookup (port 8600 by default) ────────────────
-    logger.info("[CACHE MISS] Querying RAGService knowledge base for: '%s'", q_normalized)
+    # ─── RNSIT_RAG / GENERAL_LLM / LIVE_INFO / UNSUPPORTED_EXTERNAL ─────────
+    # generate_rag_kiosk_response is the real pipeline: condense follow-up
+    # questions using recent history -> semantic search against RAGService
+    # -> threshold check -> ground the LOCAL LLM in the retrieved context (or
+    # route off-topic questions through _handle_offtopic) -> natural answer.
+    # This is the function that was previously built but never wired up to
+    # any live endpoint — /ask used to call the LLM-free query_rag_service
+    # instead, which is why answers kept working with the LLM disconnected.
+    recent_history = [
+        {"speaker": m["speaker"], "text": m["text"]}
+        for m in message_log[-6:]
+        if m.get("index") != visitor_entry.get("index")
+    ]
 
     try:
-        answer = await query_rag_service(q_normalized)
+        answer = await generate_rag_kiosk_response(question, history=recent_history)
 
-        # Cache the successful response back in Redis
         if redis_client and answer:
             try:
                 redis_client.set(cache_key, answer, ex=3600)
@@ -1130,10 +1184,10 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
                 logger.warning("Redis write error: %s", e)
 
     except Exception as exc:
-        logger.error("RAGService query failed or threw an exception: %s", exc)
+        logger.error("[LLM PIPELINE] generate_rag_kiosk_response failed: %s", exc)
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="rag_service")
+    return await _respond(answer, source="rag_llm")
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
@@ -1288,9 +1342,14 @@ async def greet_visitor(payload: GreetVisitorPayload):
     Orchestration gateway intercepting hits from detection.py hardware loop.
     Routes tracked users directly into session pipelines or triggers identity checks.
     """
-    global active_session, visitor_name_response, _last_activity_ts
+    global active_session, visitor_name_response, _last_activity_ts, message_log
     _last_activity_ts = datetime.now().timestamp()
-    
+    message_log = []  # BUG FIX: this used to be a same-name local shadowing the
+    # module-level `message_log`, so it never actually cleared — a returning or
+    # new visitor's conversation would silently inherit the PREVIOUS visitor's
+    # message history, which corrupts follow-up context resolution ("its",
+    # "what about ISE", etc. could resolve against a stranger's conversation).
+
     # Context handling for unrecognized/new visitors
     if not payload.face_id or payload.name.lower() == "unknown":
         logger.info("[GREET BLOCK] Unrecognized presence captured. Redirecting to initialization context.")
