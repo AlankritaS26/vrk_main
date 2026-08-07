@@ -3,211 +3,11 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
-/* ────────────────────────────────────────────────────────────────────────
-   ARIA — animated receptionist avatar. Purely additive: does not read or
-   modify any state/logic from WelcomeScreen. Takes `status` and animates
-   itself with plain refs + CSS (blink, breathe, head-tilt, talk-cycle
-   mouth movement while status === 'speaking'). Mouth animation uses a
-   simple interval, not real audio amplitude, specifically so the existing
-   speak()/TTS pipeline below never had to change.
-   ──────────────────────────────────────────────────────────────────────── */
-function AriaAvatar({ status }) {
-  const mouthPathRef = useRef(null);
-  const eyeLeftRef = useRef(null);
-  const eyeRightRef = useRef(null);
-  const irisLeftRef = useRef(null);
-  const irisRightRef = useRef(null);
-  const headGroupRef = useRef(null);
-  const talkTimerRef = useRef(null);
-
-  // idle blink loop — runs regardless of status
-  useEffect(() => {
-    let blinkTimer;
-    const scheduleBlink = () => {
-      const delay = 2600 + Math.random() * 3200;
-      blinkTimer = setTimeout(() => {
-        [eyeLeftRef.current, eyeRightRef.current].forEach(el => {
-          if (!el) return;
-          el.style.transform = 'scaleY(0.08)';
-          setTimeout(() => { if (el) el.style.transform = 'scaleY(1)'; }, 120);
-        });
-        scheduleBlink();
-      }, delay);
-    };
-    scheduleBlink();
-    return () => clearTimeout(blinkTimer);
-  }, []);
-
-  // head tilt per status
-  useEffect(() => {
-    if (!headGroupRef.current) return;
-    if (status === 'listening') {
-      headGroupRef.current.style.transform = 'rotate(-3deg) translateY(-2px)';
-    } else if (status === 'processing') {
-      headGroupRef.current.style.transform = 'rotate(5deg) translateY(-1px)';
-    } else if (status === 'speaking') {
-      headGroupRef.current.style.transform = 'rotate(0deg)';
-    } else {
-      headGroupRef.current.style.transform = 'rotate(-1deg)';
-    }
-  }, [status]);
-
-  // gaze shift — while 'processing', her eyes drift up and to the side like
-  // she's recalling something, instead of just staring straight ahead. This
-  // is what actually reads as "thinking" rather than the head tilt alone.
-  useEffect(() => {
-    [irisLeftRef.current, irisRightRef.current].forEach(el => {
-      if (!el) return;
-      el.style.transform = status === 'processing' ? 'translate(2px, -5px)' : 'translate(0px, 0px)';
-    });
-  }, [status]);
-
-  // simple talk-cycle mouth animation while speaking — not tied to real
-  // audio amplitude on purpose, so the existing TTS/speak() code below
-  // never needed to change.
-  useEffect(() => {
-    if (status !== 'speaking') {
-      if (talkTimerRef.current) clearInterval(talkTimerRef.current);
-      if (mouthPathRef.current) mouthPathRef.current.setAttribute('d', 'M112 168 Q130 172 148 168');
-      return;
-    }
-    talkTimerRef.current = setInterval(() => {
-      if (!mouthPathRef.current) return;
-      const openness = 6 + Math.random() * 18;
-      mouthPathRef.current.setAttribute('d', `M112 168 Q130 ${168 + openness} 148 168`);
-    }, 130);
-    return () => clearInterval(talkTimerRef.current);
-  }, [status]);
-
-  return (
-    <div className={`aria-figure aria-${status}`} style={{ width: '280px', height: '400px', position: 'relative' }}>
-      <svg viewBox="0 0 260 400" width="280" height="400" style={{ overflow: 'visible' }}>
-        <defs>
-          <radialGradient id="ariaSkin" cx="42%" cy="32%" r="75%">
-            <stop offset="0%" stopColor="#ffdcb8" />
-            <stop offset="100%" stopColor="#f0bd8e" />
-          </radialGradient>
-          <linearGradient id="ariaBlazer" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#2b3fa8" />
-            <stop offset="100%" stopColor="#1a237e" />
-          </linearGradient>
-          <linearGradient id="ariaHair" x1="0.15" y1="0" x2="0.9" y2="1">
-            <stop offset="0%" stopColor="#4a3527" />
-            <stop offset="45%" stopColor="#2a1c14" />
-            <stop offset="100%" stopColor="#180f0a" />
-          </linearGradient>
-          <radialGradient id="ariaBlush" cx="50%" cy="50%" r="50%">
-            <stop offset="0%" stopColor="#ff8f8f" stopOpacity="0.55" />
-            <stop offset="100%" stopColor="#ff8f8f" stopOpacity="0" />
-          </radialGradient>
-        </defs>
-
-        {/* body / blazer, longer for a full-body figure */}
-        <path d="M50 400 C50 300 70 245 130 245 C190 245 210 300 210 400 Z" fill="url(#ariaBlazer)" />
-        {/* left arm, resting at side */}
-        <path d="M76 262 C52 278 40 320 42 375 L62 375 C62 330 72 292 92 270 Z" fill="url(#ariaBlazer)" />
-        <circle cx="52" cy="375" r="11" fill="url(#ariaSkin)" />
-        {/* right arm, resting at side */}
-        <path d="M184 262 C208 278 220 320 218 375 L198 375 C198 330 188 292 168 270 Z" fill="url(#ariaBlazer)" />
-        <circle cx="208" cy="375" r="11" fill="url(#ariaSkin)" />
-        {/* collar */}
-        <path d="M118 249 L130 271 L142 249 L130 261 Z" fill="#fdfaf3" />
-        <path d="M104 251 C112 261 122 267 130 269 L118 249 Z" fill="#28399c" />
-        <path d="M156 251 C148 261 138 267 130 269 L142 249 Z" fill="#28399c" />
-        {/* blazer buttons */}
-        <circle cx="130" cy="288" r="3" fill="#28399c" />
-        <circle cx="130" cy="308" r="3" fill="#28399c" />
-        <circle cx="130" cy="328" r="3" fill="#28399c" />
-
-        {/* head + neck */}
-        <g ref={headGroupRef} className="aria-head-group" style={{ transformOrigin: '130px 185px' }}>
-          <rect x="116" y="218" width="28" height="36" fill="url(#ariaSkin)" />
-
-          {/* low side ponytail, sits behind everything */}
-          <path d="M182 150 C202 168 208 202 196 234 C190 248 182 250 180 238
-                    C186 214 182 184 168 164 Z" fill="url(#ariaHair)" />
-          <path d="M184 156 C198 172 202 198 194 222" stroke="#5a4030" strokeWidth="2"
-                fill="none" strokeLinecap="round" opacity="0.5" />
-
-          {/* face base */}
-          <ellipse cx="130" cy="168" rx="64" ry="68" fill="url(#ariaSkin)" />
-
-          {/* hair back / crown, center-parted and swept to the side */}
-          <path d="M66 158 C60 100 92 54 130 54 C170 54 200 100 194 158
-                    C193 130 182 108 158 100 C170 118 172 140 168 158
-                    C150 128 140 108 130 100 C120 108 110 128 96 158
-                    C92 140 90 118 100 100 C78 108 68 130 66 158 Z"
-                fill="url(#ariaHair)" />
-
-          {/* loose face-framing strands */}
-          <path d="M68 150 C62 180 66 212 78 236" stroke="url(#ariaHair)" strokeWidth="9"
-                fill="none" strokeLinecap="round" />
-          <path d="M192 150 C196 176 190 202 180 220" stroke="url(#ariaHair)" strokeWidth="8"
-                fill="none" strokeLinecap="round" />
-          <path d="M72 156 C67 178 70 202 80 220" stroke="#5a4030" strokeWidth="1.6"
-                fill="none" strokeLinecap="round" opacity="0.45" />
-
-          {/* eyebrows — thicker, arched */}
-          <path d="M92 142 Q108 128 128 138" stroke="#2a1c14" strokeWidth="5" fill="none" strokeLinecap="round" />
-          <path d="M132 138 Q152 128 168 142" stroke="#2a1c14" strokeWidth="5" fill="none" strokeLinecap="round" />
-
-          {/* blush */}
-          <ellipse cx="88" cy="188" rx="16" ry="10" fill="url(#ariaBlush)" />
-          <ellipse cx="172" cy="188" rx="16" ry="10" fill="url(#ariaBlush)" />
-
-          {/* big expressive eyes — scaleY toggled for blinking */}
-          <g ref={eyeLeftRef} className="aria-eye" style={{ transformOrigin: '108px 163px' }}>
-            <ellipse cx="108" cy="163" rx="15" ry="16.5" fill="#fff" />
-            <g ref={irisLeftRef} style={{ transition: 'transform 0.4s ease' }}>
-              <circle cx="109" cy="165" r="10.5" fill="#4a2f1c" />
-              <circle cx="106" cy="161" r="3.4" fill="#fff" />
-              <circle cx="112" cy="169" r="1.6" fill="#fff" opacity="0.7" />
-            </g>
-            {/* upper lash */}
-            <path d="M94 154 Q108 144 124 152" stroke="#1c130d" strokeWidth="3.4" fill="none" strokeLinecap="round" />
-            <path d="M92 153 L86 148" stroke="#1c130d" strokeWidth="2" strokeLinecap="round" />
-          </g>
-          <g ref={eyeRightRef} className="aria-eye" style={{ transformOrigin: '152px 163px' }}>
-            <ellipse cx="152" cy="163" rx="15" ry="16.5" fill="#fff" />
-            <g ref={irisRightRef} style={{ transition: 'transform 0.4s ease' }}>
-              <circle cx="151" cy="165" r="10.5" fill="#4a2f1c" />
-              <circle cx="154" cy="161" r="3.4" fill="#fff" />
-              <circle cx="148" cy="169" r="1.6" fill="#fff" opacity="0.7" />
-            </g>
-            {/* upper lash */}
-            <path d="M136 152 Q152 144 166 154" stroke="#1c130d" strokeWidth="3.4" fill="none" strokeLinecap="round" />
-            <path d="M168 153 L174 148" stroke="#1c130d" strokeWidth="2" strokeLinecap="round" />
-          </g>
-
-          {/* nose */}
-          <path d="M128 170 Q125 184 131 187" stroke="#d69f74" strokeWidth="2.2" fill="none" strokeLinecap="round" />
-
-          {/* mouth — animated during 'speaking' via the talk-cycle interval */}
-          <path ref={mouthPathRef} d="M112 168 Q130 172 148 168" transform="translate(0, 40)" stroke="#b5555f"
-                strokeWidth="3.5" fill="#d98189" strokeLinecap="round" />
-
-          {/* pearl earrings */}
-          <circle cx="65" cy="182" r="4" fill="#fdf6ea" stroke="#e0d3b8" strokeWidth="1" />
-          <circle cx="195" cy="182" r="4" fill="#fdf6ea" stroke="#e0d3b8" strokeWidth="1" />
-        </g>
-
-        {/* thinking dots — only visible while status === 'processing', via
-            the .aria-processing rule below. Small trail rising toward her
-            temple, like a thought bubble forming. */}
-        <g className="aria-think-dots">
-          <circle className="aria-think-dot" cx="196" cy="96" r="4.5" fill="#7e57c2" />
-          <circle className="aria-think-dot" cx="210" cy="78" r="6" fill="#7e57c2" />
-          <circle className="aria-think-dot" cx="228" cy="58" r="7.5" fill="#7e57c2" />
-        </g>
-      </svg>
-    </div>
-  );
-}
-
-export default function WelcomeScreen({ session, messages, setMessages, askingName, camStream }) {
+export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
   const camVideoRef = useRef(null);
+  const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
   const isListening = useRef(false);
@@ -245,6 +45,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [name, setName] = useState('');
   const [saveData, setSaveData] = useState(true);
   const [submitted, setSubmitted] = useState(false);
+  const [deleteMode, setDeleteMode] = useState(false);
+  const [deleteName, setDeleteName] = useState('');
+  const [deleted, setDeleted] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
     'Try asking: "What courses does RNSIT offer?"',
@@ -312,14 +115,21 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, []);
 
   // ── Camera sidebar ────────────────────────────────────────────────────────
-  // The camera + detection WebSocket now live in App.js so presence
-  // detection (departure timeout, face-swap) keeps running while this
-  // screen is shown. This just displays the shared stream.
   useEffect(() => {
-    if (camVideoRef.current && camStream) {
-      camVideoRef.current.srcObject = camStream;
-    }
-  }, [camStream]);
+    let active = true;
+    navigator.mediaDevices?.getUserMedia({ video: { facingMode: 'user' }, audio: false })
+      .then(stream => {
+        if (!active) { stream.getTracks().forEach(t => t.stop()); return; }
+        camStreamRef.current = stream;
+        if (camVideoRef.current) camVideoRef.current.srcObject = stream;
+      })
+      .catch(() => { }); // camera unavailable — sidebar just stays blank
+    return () => {
+      active = false;
+      camStreamRef.current?.getTracks().forEach(t => t.stop());
+      camStreamRef.current = null;
+    };
+  }, []);
 
   useEffect(() => {
     if (askingName) {
@@ -562,11 +372,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     window.speechSynthesis.cancel();
     micRef.current?.pause();          // don't let the kiosk hear itself
     isSpeaking.current = true;
-    // NOTE: status intentionally stays whatever it currently is (usually
-    // 'processing'/'ready') here — NOT 'speaking' yet. Setting it this early
-    // made Aria's mouth start moving and the status pill/dot turn red during
-    // the TTS fetch+decode delay, before any actual audio had played. It now
-    // flips inside fireStart(), which only fires once real playback begins.
+    setStatus('speaking');
 
     const finish = () => {
       isSpeaking.current = false;
@@ -574,10 +380,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (isMounted.current) startListening();
     };
 
-    const fireStart = () => {
-      setStatus('speaking');   // audio is actually starting NOW
-      if (onStart) { onStart(); onStart = null; }
-    };
+    const fireStart = () => { if (onStart) { onStart(); onStart = null; } };
 
     // Fallback: robotic browser voice, only if backend TTS is unavailable
     const browserSpeak = () => {
@@ -741,59 +544,233 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch (e) { console.error(e); }
   };
 
-  const statusLabel = {
-    ready: 'Voice Ready',
-    listening: 'Listening',
-    processing: 'Thinking',
-    speaking: 'Speaking'
-  }[status] || 'Voice Ready';
-
-  const statusColor = {
-    ready: '#5c6bc0',
-    listening: '#43a047',
-    processing: '#7e57c2',
-    speaking: '#ef5350'
-  }[status] || '#5c6bc0';
+  const handleDeleteData = async () => {
+    const trimmed = deleteName.trim();
+    if (!trimmed) return;
+    try {
+      await fetch(BACKEND + '/visitor/delete_my_data?name=' + encodeURIComponent(trimmed), { method: 'POST' });
+      setDeleted(true);
+      setTimeout(() => { setDeleteMode(false); setDeleted(false); setDeleteName(''); }, 3500);
+    } catch (e) { console.error(e); }
+  };
 
   const inputStyle = {
     width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
     borderRadius: '8px', fontSize: '15px', boxSizing: 'border-box',
     outline: 'none', color: '#1a237e', background: '#f8f9ff', transition: 'border 0.2s'
   };
-  const btnPrimary = {
-    padding: '11px 24px', border: 'none', borderRadius: '8px',
-    background: '#1a237e', color: '#fff', cursor: 'pointer',
-    fontSize: '14px', fontWeight: '600', letterSpacing: '0.3px'
-  };
-  const btnSecondary = {
-    padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px',
-    background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px'
-  };
+  const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
+  const btnSecondary = { padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px', background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px' };
+
+  /* ── ANIMATED ARIA CHARACTER ─────────────────────────────────────────── */
+  const AriaCharacter = ({ st }) => (
+    <svg className={`aria-svg aria-${st}`} viewBox="0 0 320 500"
+      style={{ width: '100%', maxWidth: '340px', overflow: 'visible', display: 'block' }}>
+      <defs>
+        <linearGradient id="skinG" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#FFCFA0" /><stop offset="100%" stopColor="#F0A06A" />
+        </linearGradient>
+        <linearGradient id="suitG" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" />
+        </linearGradient>
+        <radialGradient id="shadowG" cx="50%" cy="50%">
+          <stop offset="0%" stopColor="#0000001a" /><stop offset="100%" stopColor="#00000000" />
+        </radialGradient>
+      </defs>
+
+      {/* ── floor shadow ── */}
+      <ellipse cx="160" cy="498" rx="88" ry="11" fill="url(#shadowG)" />
+
+      {/* ════════ BODY (breathing group) ════════ */}
+      <g className="body-grp" style={{ transformOrigin: '160px 360px' }}>
+
+        {/* suit */}
+        <path d="M55 228 Q55 202 160 207 Q265 202 265 228 L270 460 Q160 474 50 460 Z" fill="url(#suitG)" />
+        {/* shirt */}
+        <path d="M130 207 L160 245 L190 207" fill="white" />
+        {/* lapels */}
+        <path d="M88 207 L130 207 L160 245 Q110 265 80 298 Z" fill="#152070" />
+        <path d="M232 207 L190 207 L160 245 Q210 265 240 298 Z" fill="#152070" />
+        {/* buttons */}
+        <circle cx="160" cy="280" r="4.5" fill="#3a4ec8" />
+        <circle cx="160" cy="308" r="4.5" fill="#3a4ec8" />
+        <circle cx="160" cy="336" r="4.5" fill="#3a4ec8" />
+        <line x1="160" y1="245" x2="160" y2="465" stroke="#0d1860" strokeWidth="1.5" />
+
+        {/* ── LEFT ARM (stays normal in all states) ── */}
+        <path d="M55 228 Q22 270 18 325 Q15 355 28 366"
+          stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
+        <ellipse cx="28" cy="372" rx="22" ry="15" fill="url(#skinG)" />
+
+        {/* ── RIGHT ARM — normal (hidden during processing) ── */}
+        {st !== 'processing' && <>
+          <path d="M265 228 Q298 270 302 325 Q305 355 292 366"
+            stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
+          <ellipse cx="292" cy="372" rx="22" ry="15" fill="url(#skinG)" />
+        </>}
+
+        {/* ── RIGHT ARM — thinking pose ── */}
+        {st === 'processing' && <>
+          <path className="arm-think" d="M265 228 Q288 212 272 176 Q264 158 244 152"
+            stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
+          <ellipse className="hand-think" cx="242" cy="158" rx="24" ry="15" fill="url(#skinG)" />
+        </>}
+      </g>{/* end body-grp */}
+
+      {/* ════════ HEAD (expression group) ════════ */}
+      <g className="head-grp" style={{ transformOrigin: '160px 120px' }}>
+
+        {/* neck */}
+        <rect x="145" y="175" width="30" height="38" rx="10" fill="url(#skinG)" />
+
+        {/* hair back */}
+        <path d="M74 158 Q68 86 108 44 Q133 16 160 13 Q187 16 212 44 Q252 86 246 158" fill="#2B1A0C" />
+        {/* head skin */}
+        <circle cx="160" cy="105" r="80" fill="url(#skinG)" />
+        {/* hair front */}
+        <path d="M80 86 Q92 34 160 28 Q228 34 240 86 Q218 48 160 46 Q102 48 80 86" fill="#2B1A0C" />
+        {/* hair sides */}
+        <path d="M80 86 Q66 124 70 170" stroke="#2B1A0C" strokeWidth="15" fill="none" strokeLinecap="round" />
+        <path d="M240 86 Q254 124 250 170" stroke="#2B1A0C" strokeWidth="15" fill="none" strokeLinecap="round" />
+
+        {/* ── EYE AREA ── */}
+        {/* whites */}
+        <ellipse cx="131" cy="106" rx="16" ry="17" fill="white" opacity="0.97" />
+        <ellipse cx="189" cy="106" rx="16" ry="17" fill="white" opacity="0.97" />
+        {/* iris */}
+        <circle className="iris-l" cx="133" cy="107" r="10" fill="#3A2010" />
+        <circle className="iris-r" cx="191" cy="107" r="10" fill="#3A2010" />
+        {/* pupil */}
+        <circle className="pupil-l" cx="134" cy="108" r="5.5" fill="#0C0706" />
+        <circle className="pupil-r" cx="192" cy="108" r="5.5" fill="#0C0706" />
+        {/* shine */}
+        <circle cx="136" cy="104" r="2.8" fill="white" />
+        <circle cx="194" cy="104" r="2.8" fill="white" />
+        {/* bottom lash line */}
+        <path d="M115 118 Q131 124 147 118" stroke="#2B1A0C" strokeWidth="1.5" fill="none" />
+        <path d="M173 118 Q189 124 205 118" stroke="#2B1A0C" strokeWidth="1.5" fill="none" />
+        {/* BLINK eyelids — animated via SMIL */}
+        <ellipse cx="131" cy="106" rx="16.5" ry="1" fill="url(#skinG)">
+          <animate attributeName="ry" values="1;1;1;1;1;1;1;1;1;18;1;1;1" dur="4.2s" repeatCount="indefinite" />
+        </ellipse>
+        <ellipse cx="189" cy="106" rx="16.5" ry="1" fill="url(#skinG)">
+          <animate attributeName="ry" values="1;1;1;1;1;1;1;1;1;18;1;1;1" dur="4.2s" begin="0.07s" repeatCount="indefinite" />
+        </ellipse>
+
+        {/* ── eyebrows ── */}
+        <path className={`brow-l ${st === 'processing' ? 'brow-think' : ''}`}
+          d="M 117 89 Q 131 82 145 89" stroke="#2B1A0C" strokeWidth="3.5" fill="none" strokeLinecap="round" />
+        <path className={`brow-r ${st === 'processing' ? 'brow-think' : ''}`}
+          d="M 175 89 Q 189 82 203 89" stroke="#2B1A0C" strokeWidth="3.5" fill="none" strokeLinecap="round" />
+
+        {/* nose */}
+        <path d="M157 120 Q152 132 154 136 Q159 140 165 136 Q168 132 163 120" fill="none" stroke="#D4906A" strokeWidth="1.5" />
+
+        {/* ── MOUTH states ── */}
+        {/* neutral smile */}
+        {st !== 'speaking' &&
+          <path d="M142 149 Q160 161 178 149" stroke="#B84055" strokeWidth="2.8" fill="none" strokeLinecap="round" />}
+        {/* talking — alternates via CSS */}
+        {st === 'speaking' && <>
+          <g className="mouth-a">
+            <path d="M143 149 Q160 163 177 149" fill="#B84055" stroke="#B84055" strokeWidth="2" strokeLinecap="round" />
+            <ellipse cx="160" cy="156" rx="14" ry="8" fill="#7B2030" />
+            <path d="M147 150 Q160 148 173 150" stroke="#FFBBC0" strokeWidth="1.5" fill="none" />
+          </g>
+          <g className="mouth-b">
+            <path d="M142 148 Q160 166 178 148" fill="#B84055" stroke="#B84055" strokeWidth="2" strokeLinecap="round" />
+            <ellipse cx="160" cy="158" rx="17" ry="11" fill="#7B2030" />
+            <path d="M147 149 Q160 147 173 149" stroke="#FFBBC0" strokeWidth="1.5" fill="none" />
+          </g>
+        </>}
+
+        {/* blush */}
+        <ellipse cx="108" cy="124" rx="17" ry="12" fill="#F4A0B0" opacity="0.28" />
+        <ellipse cx="212" cy="124" rx="17" ry="12" fill="#F4A0B0" opacity="0.28" />
+        {/* earrings */}
+        <circle cx="80" cy="113" r="5.5" fill="#FFD700" />
+        <circle cx="240" cy="113" r="5.5" fill="#FFD700" />
+
+        {/* ── SPEAKING sound waves (right of head) ── */}
+        {st === 'speaking' && <>
+          <path className="wave1" d="M250 92 Q264 105 250 118" stroke="#7c4dff" strokeWidth="3" fill="none" strokeLinecap="round" />
+          <path className="wave2" d="M260 80 Q278 105 260 130" stroke="#7c4dff" strokeWidth="2.5" fill="none" strokeLinecap="round" />
+          <path className="wave3" d="M270 68 Q292 105 270 142" stroke="#7c4dff" strokeWidth="2" fill="none" strokeLinecap="round" />
+        </>}
+
+        {/* ── LISTENING pulse ring ── */}
+        {st === 'listening' && <>
+          <circle cx="160" cy="105" r="92" fill="none" stroke="#43a047" strokeWidth="2.5" className="listen-r1" />
+          <circle cx="160" cy="105" r="92" fill="none" stroke="#43a047" strokeWidth="1.5" className="listen-r2" />
+        </>}
+
+        {/* ── THINKING bubble ── */}
+        {st === 'processing' && <>
+          <circle className="tbub" cx="226" cy="70" r="6" fill="rgba(255,255,255,0.88)" />
+          <circle className="tbub" cx="240" cy="54" r="10" fill="rgba(255,255,255,0.92)" />
+          <circle className="tbub" cx="258" cy="36" r="15" fill="rgba(255,255,255,0.96)" />
+          <text x="258" y="41" textAnchor="middle" fontSize="15" fill="#7e57c2" fontWeight="700">?</text>
+        </>}
+
+      </g>{/* end head-grp */}
+    </svg>
+  );
+
+  /* background tint per state */
+  const charBg = {
+    ready: 'linear-gradient(175deg, #dde4ff 0%, #c8d4fc 100%)',
+    listening: 'linear-gradient(175deg, #d8f5dc 0%, #b8eec0 100%)',
+    processing: 'linear-gradient(175deg, #ede4ff 0%, #d8caff 100%)',
+    speaking: 'linear-gradient(175deg, #fff0dd 0%, #ffd8a8 100%)',
+  }[status] || 'linear-gradient(175deg, #dde4ff 0%, #c8d4fc 100%)';
+
+  const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
+  const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
+  const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
   return (
-    <div style={{ minHeight: '100vh', background: '#f5f6fa', fontFamily: "'Segoe UI', Arial, sans-serif", display: 'flex', flexDirection: 'column' }}>
+    <div style={{
+      height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
+      fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#f0f4ff'
+    }}>
 
-      <header style={{ background: '#1a237e', padding: '14px 32px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', boxShadow: '0 2px 10px rgba(26,35,126,0.15)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '14px' }}>
-          <div style={{ width: '36px', height: '36px', borderRadius: '10px', background: 'rgba(255,255,255,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '20px' }}>❄</div>
-          <div>
-            <span style={{ fontSize: '17px', fontWeight: '800', color: '#fff', letterSpacing: '0.2px' }}>RNS Institute of Technology</span>
-            <span style={{ fontSize: '13px', color: 'rgba(255,255,255,0.65)', marginLeft: '10px' }}>Digital Receptionist</span>
+      {/* ── MODALS ── */}
+      {deleteMode && (
+        <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '420px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
+            {deleted ? (
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+                </div>
+                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted</div>
+                <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed.</p>
+              </div>
+            ) : (<>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+                <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>
+                </div>
+                <div>
+                  <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
+                  <div style={{ fontSize: '12px', color: '#999' }}>This cannot be undone</div>
+                </div>
+              </div>
+              <p style={{ color: '#666', marginBottom: '16px', fontSize: '14px', lineHeight: '1.6' }}>Enter your registered name to permanently remove your face data.</p>
+              <input style={inputStyle} placeholder="Your registered name" value={deleteName} onChange={e => setDeleteName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
+              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
+                <button onClick={() => setDeleteMode(false)} style={btnSecondary}>Cancel</button>
+                <button onClick={handleDeleteData} style={{ ...btnPrimary, background: '#c62828' }}>Delete Permanently</button>
+              </div>
+            </>)}
           </div>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '18px' }}>
-          <div style={{ textAlign: 'right' }}>
-            <div style={{ fontSize: '14px', fontWeight: '700', color: '#fff' }}>{visitorName}</div>
-            <div style={{ fontSize: '11px', color: 'rgba(255,255,255,0.6)' }}>
-              {isReturning ? `Visit #${visitCount}` : 'New Visitor'}
-            </div>
-          </div>
-        </div>
-      </header>
+      )}
 
-      {askingName && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.35)', zIndex: 200, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '16px', padding: '40px', width: '440px', boxShadow: '0 12px 48px rgba(0,0,0,0.18)' }}>
+      {askingName && !deleteMode && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '440px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
             {submitted ? (
               <div style={{ textAlign: 'center' }}>
                 <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
@@ -803,203 +780,387 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   {saveData ? 'Welcome, ' + (name || 'Guest') + '!' : 'Welcome, Guest!'}
                 </div>
                 <p style={{ color: '#666', marginTop: '10px', fontSize: '14px', lineHeight: '1.6' }}>
-                  {saveData ? 'Your face has been registered. We will recognize you on your next visit.' : 'You are visiting as a guest. No data has been saved.'}
+                  {saveData ? "Your face is registered. We'll recognise you next time." : 'Visiting as a guest — no data saved.'}
                 </p>
               </div>
-            ) : (
-              <>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '20px' }}>
-                  <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" /><circle cx="12" cy="7" r="4" /></svg>
-                  </div>
+            ) : (<>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: '20px' }}>
+                <svg viewBox="0 0 80 80" width="56" height="56" style={{ flexShrink: 0 }}>
+                  <circle cx="40" cy="40" r="40" fill="url(#suitG2)" />
+                  <defs><linearGradient id="suitG2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" /></linearGradient></defs>
+                  <circle cx="40" cy="30" r="14" fill="#FFCFA0" />
+                  <path d="M12 72 Q12 54 40 54 Q68 54 68 72" fill="#FFCFA0" />
+                </svg>
+                <div>
+                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Aria 👋</div>
+                  <div style={{ fontSize: '13px', color: '#888' }}>I don&apos;t recognise you yet — what&apos;s your name?</div>
+                </div>
+              </div>
+              <div style={{ marginBottom: '16px' }}>
+                <label style={{ fontSize: '13px', fontWeight: '600', color: '#444', display: 'block', marginBottom: '6px' }}>Your Full Name</label>
+                <input ref={inputRef} style={inputStyle} placeholder="e.g. Akshatha A" value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
+              </div>
+              <div style={{ background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '14px 16px', marginBottom: '20px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                   <div>
-                    <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hello! Welcome to RNSIT</div>
-                    <div style={{ fontSize: '13px', color: '#888' }}>We do not recognize you yet</div>
+                    <div style={{ fontSize: '13px', fontWeight: '600', color: '#333' }}>Remember me for next visit</div>
+                    <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>{saveData ? 'Face saved securely' : 'No data stored'}</div>
+                  </div>
+                  <div onClick={() => setSaveData(s => !s)} style={{ width: '48px', height: '26px', borderRadius: '13px', background: saveData ? '#1a237e' : '#ddd', cursor: 'pointer', position: 'relative', transition: 'background 0.25s', flexShrink: 0 }}>
+                    <div style={{ position: 'absolute', top: '3px', left: saveData ? '25px' : '3px', width: '20px', height: '20px', borderRadius: '50%', background: '#fff', transition: 'left 0.25s', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
                   </div>
                 </div>
-                <div style={{ marginBottom: '16px' }}>
-                  <label style={{ fontSize: '13px', fontWeight: '600', color: '#444', display: 'block', marginBottom: '6px' }}>Your Full Name</label>
-                  <input ref={inputRef} style={inputStyle} placeholder="e.g. Akshatha A"
-                    value={name} onChange={e => setName(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
-                </div>
-                <div style={{ background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '14px 16px', marginBottom: '20px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <div>
-                      <div style={{ fontSize: '13px', fontWeight: '600', color: '#333' }}>Remember me for next visit</div>
-                      <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>{saveData ? 'Your face will be saved securely' : 'No data will be stored'}</div>
-                    </div>
-                    <div onClick={() => setSaveData(s => !s)} style={{ width: '48px', height: '26px', borderRadius: '13px', background: saveData ? '#1a237e' : '#ddd', cursor: 'pointer', position: 'relative', transition: 'background 0.25s', flexShrink: 0 }}>
-                      <div style={{ position: 'absolute', top: '3px', left: saveData ? '25px' : '3px', width: '20px', height: '20px', borderRadius: '50%', background: '#fff', transition: 'left 0.25s', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
-                    </div>
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: '10px' }}>
-                  <button onClick={() => handleSubmitName('Guest', false)} style={{ ...btnSecondary, flex: 1 }}>Continue as Guest</button>
-                  <button onClick={() => handleSubmitName()} style={{ ...btnPrimary, flex: 1 }}>{saveData ? 'Register & Continue' : 'Continue'}</button>
-                </div>
-              </>
-            )}
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button onClick={() => handleSubmitName('Guest', false)} style={{ ...btnSecondary, flex: 1 }}>Continue as Guest</button>
+                <button onClick={() => handleSubmitName()} style={{ ...btnPrimary, flex: 1 }}>{saveData ? 'Register & Continue' : 'Continue'}</button>
+              </div>
+            </>)}
           </div>
         </div>
       )}
 
-      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
-
-        {/* ── Aria panel — matches reference layout ── */}
-        <div style={{
-          width: '46%', flexShrink: 0, position: 'relative', overflow: 'hidden',
-          display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center',
-          gap: '14px', padding: '32px 24px',
-          background: 'linear-gradient(160deg, #dfe3f7 0%, #eef0fb 55%, #e6e9f9 100%)',
-        }}>
-          {/* small live-camera PiP, bottom-right corner */}
-          <div style={{
-            position: 'absolute', bottom: '20px', right: '20px', width: '60px', height: '60px',
-            borderRadius: '50%', overflow: 'hidden', border: '2.5px solid #fff',
-            boxShadow: '0 4px 14px rgba(26,35,126,0.25)', zIndex: 2,
-          }}>
-            <video ref={camVideoRef} autoPlay playsInline muted
-              style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }} />
-          </div>
-
-          <div className={`aria-wrap aria-wrap-${status}`}>
-            <AriaAvatar status={status} />
-          </div>
-
-          <div style={{ textAlign: 'center' }}>
-            <div style={{ fontSize: '24px', fontWeight: '800', color: '#1a237e' }}>Aria</div>
-            <div style={{ fontSize: '13px', color: '#888', marginTop: '2px' }}>RNSIT Digital Receptionist</div>
-          </div>
-
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: '8px',
-            padding: '7px 16px', borderRadius: '20px', background: '#fff',
-            border: `1.5px solid ${statusColor}44`, boxShadow: '0 2px 10px rgba(26,35,126,0.08)',
-          }}>
-            <div style={{
-              width: '8px', height: '8px', borderRadius: '50%', background: statusColor,
-              transition: 'background 0.3s',
-              animation: status === 'speaking' ? 'ariaPulse 0.9s infinite'
-                : status === 'listening' ? 'ariaPulse 1.4s infinite' : 'none',
-            }} />
-            <span style={{ fontSize: '13px', fontWeight: '700', color: statusColor }}>{statusLabel}</span>
-          </div>
-
-          <div style={{
-            fontSize: '13px', color: '#7280a3',
-            background: 'rgba(255,255,255,0.7)', padding: '8px 16px', borderRadius: '10px',
-            fontStyle: 'italic', textAlign: 'center', maxWidth: '300px',
-          }}>
-            {status === 'listening' ? 'Please speak your question clearly' : hints[hintIndex]}
+      {/* ── SLIM HEADER ── */}
+      <header style={{
+        background: 'linear-gradient(90deg,#1a237e,#283593)', padding: '9px 20px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT"
+            style={{ height: '36px', objectFit: 'contain', filter: 'brightness(0) invert(1)', opacity: 0.9 }} />
+          <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
+            RNS Institute of Technology
+            <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
           </div>
         </div>
-
-        {/* ── Conversation panel ── */}
-        <div style={{ flex: '1 1 0', display: 'flex', flexDirection: 'column', minWidth: 0, borderLeft: '1.5px solid #e8eaf6' }}>
-
-          <div style={{ padding: '16px 28px', borderBottom: '1.5px solid #e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <div style={{ width: '8px', height: '8px', borderRadius: '50%', background: '#43a047' }} />
-              <span style={{ fontSize: '15px', fontWeight: '700', color: '#222' }}>Conversation</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: '13px', color: '#fff', fontWeight: '700' }}>{visitorName}</div>
+            <div style={{ fontSize: '11px', color: isReturning ? '#a5d6a7' : 'rgba(255,255,255,0.5)', fontWeight: '600' }}>
+              {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
             </div>
-            <span style={{ fontSize: '12px', color: '#aaa' }}>
-              {messages.length === 0 ? 'Just started' : `${messages.length} messages`}
+          </div>
+          <button onClick={() => setDeleteMode(d => !d)}
+            style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
+            ⚙ Privacy
+          </button>
+        </div>
+      </header>
+
+      {/* ── MAIN BODY ── */}
+      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
+
+        {/* ══════════ LEFT: ANIMATED ARIA CHARACTER ══════════ */}
+        <div style={{
+          width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
+          background: charBg, transition: 'background 0.8s ease', position: 'relative',
+          overflow: 'hidden'
+        }}>
+
+          {/* subtle radial glow behind character */}
+          <div style={{
+            position: 'absolute', bottom: '60px', left: '50%', transform: 'translateX(-50%)',
+            width: '320px', height: '320px', borderRadius: '50%',
+            background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
+          }} />
+
+          {/* ── Aria SVG character ── */}
+          <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
+            <AriaCharacter st={status} />
+          </div>
+
+          {/* ── Name + status badge ── */}
+          <div style={{
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
+            zIndex: 1, marginTop: '8px'
+          }}>
+            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Aria</div>
+            <div style={{ fontSize: '12px', color: '#5c6bc0', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+            <div style={{
+              padding: '5px 18px', borderRadius: '20px', background: statusBg,
+              color: statusColor, fontSize: '13px', fontWeight: '700',
+              transition: 'all 0.4s ease', boxShadow: '0 2px 10px rgba(0,0,0,0.10)'
+            }}>
+              {{ ready: '● Voice Ready', listening: '🎤 Listening to you…', processing: '💭 Thinking…', speaking: '🔊 Speaking…' }[status]}
+            </div>
+          </div>
+
+          {/* hint pill (ready state only) */}
+          {status === 'ready' && messages.length === 0 && (
+            <div style={{
+              marginTop: '14px', padding: '8px 20px', borderRadius: '20px',
+              background: 'rgba(255,255,255,0.65)', backdropFilter: 'blur(8px)',
+              border: '1px solid rgba(255,255,255,0.8)', fontSize: '12px',
+              color: '#5c6bc0', fontStyle: 'italic', textAlign: 'center',
+              maxWidth: '280px', zIndex: 1
+            }}>
+              {hints[hintIndex]}
+            </div>
+          )}
+        </div>
+
+        {/* ══════════ RIGHT: COMPACT CHAT ══════════ */}
+        <div style={{
+          flex: 1, display: 'flex', flexDirection: 'column', background: '#f8f9ff',
+          borderLeft: '1.5px solid #e0e4ff', overflow: 'hidden'
+        }}>
+
+          {/* chat header */}
+          <div style={{
+            padding: '10px 16px', background: '#fff',
+            borderBottom: '1px solid #e8eaf6', flexShrink: 0,
+            display: 'flex', alignItems: 'center', gap: '8px'
+          }}>
+            <div style={{
+              width: '8px', height: '8px', borderRadius: '50%',
+              background: { ready: '#43a047', listening: '#43a047', processing: '#7e57c2', speaking: '#e53935' }[status] || '#43a047',
+              transition: 'background 0.3s', boxShadow: '0 0 0 3px rgba(67,160,71,0.15)'
+            }} />
+            <span style={{ fontSize: '13px', fontWeight: '700', color: '#444' }}>Conversation</span>
+            <span style={{ fontSize: '11px', color: '#bbb', marginLeft: 'auto' }}>
+              {messages.length > 0 ? `${messages.length} message${messages.length > 1 ? 's' : ''}` : 'Just started'}
             </span>
           </div>
 
-          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', minHeight: 0, padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
-            {messages.length === 0 && !liveText ? (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '14px' }}>
-                <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#c5cae9" strokeWidth="1.6">
-                  <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z" />
-                </svg>
-                <div style={{ fontSize: '16px', fontWeight: '700', color: '#9aa0b4' }}>
-                  Your conversation with Aria will appear here
+          {/* messages */}
+          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+
+            {messages.length === 0 && !liveText && status !== 'processing' && (
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '30px 12px', textAlign: 'center' }}>
+                <div style={{ fontSize: '36px', lineHeight: 1 }}>💬</div>
+                <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Aria will appear here</div>
+                <div style={{ fontSize: '12px', color: '#c5cae9' }}>Just speak — she&apos;s ready</div>
+              </div>
+            )}
+
+            {messages.map((msg, i) => {
+              const isAria = msg.speaker === 'kiosk';
+              const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
+              return (
+                <div key={i} style={{
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: isAria ? 'flex-start' : 'flex-end',
+                  marginTop: prevSame ? '2px' : '8px'
+                }}>
+                  {!prevSame && (
+                    <span style={{
+                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
+                      paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
+                    }}>
+                      {isAria ? 'Aria' : visitorName}
+                    </span>
+                  )}
+                  <div className="msg-in" style={{
+                    maxWidth: '88%', padding: '8px 12px',
+                    borderRadius: isAria
+                      ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
+                      : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
+                    background: isAria ? '#ffffff' : '#1a237e',
+                    color: isAria ? '#1a1a1a' : '#ffffff',
+                    fontSize: '13.5px', lineHeight: '1.5',
+                    boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+                    wordBreak: 'break-word'
+                  }}>
+                    {msg.text}
+                    <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
+                      {msg.timestamp}
+                    </span>
+                  </div>
                 </div>
-                <div style={{ fontSize: '13px', color: '#c2c7db' }}>
-                  {status === 'listening' ? 'Listening...'
-                    : status === 'processing' ? 'Thinking...'
-                    : status === 'speaking' ? 'Speaking...'
-                    : "Just speak — she's ready"}
+              );
+            })}
+
+            {/* typing indicator */}
+            {status === 'processing' && (
+              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '6px', marginTop: '8px' }}>
+                <div style={{
+                  width: '24px', height: '24px', borderRadius: '50%',
+                  background: 'linear-gradient(135deg,#1a237e,#7c4dff)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0
+                }}>
+                  <svg width="12" height="12" viewBox="0 0 40 40" fill="none">
+                    <circle cx="20" cy="14" r="7" fill="white" /><path d="M4 38C4 28 36 28 36 38" fill="white" />
+                  </svg>
+                </div>
+                <div style={{
+                  background: '#fff', borderRadius: '14px 14px 14px 4px', padding: '10px 14px',
+                  boxShadow: '0 1px 3px rgba(0,0,0,0.08)', display: 'flex', gap: '4px', alignItems: 'center'
+                }}>
+                  <span className="td" style={{ '--d': '0ms' }} />
+                  <span className="td" style={{ '--d': '160ms' }} />
+                  <span className="td" style={{ '--d': '320ms' }} />
                 </div>
               </div>
-            ) : (
-              <>
-                {messages.map((msg, i) => (
-                  <div key={i} style={{ display: 'flex', flexDirection: 'column', alignItems: msg.speaker === 'kiosk' ? 'flex-start' : 'flex-end' }}>
-                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: msg.speaker === 'kiosk' ? '4px' : 0, paddingRight: msg.speaker !== 'kiosk' ? '4px' : 0, fontWeight: '500' }}>
-                      {msg.speaker === 'kiosk' ? 'Aria' : visitorName} &nbsp;·&nbsp; {msg.timestamp}
-                    </div>
-                    <div style={{
-                      animation: 'fadeUp 0.3s ease',
-                      maxWidth: '70%', padding: '15px 19px',
-                      borderRadius: msg.speaker === 'kiosk' ? '4px 18px 18px 18px' : '18px 4px 18px 18px',
-                      background: msg.speaker === 'kiosk' ? '#ffffff' : '#1a237e',
-                      color: msg.speaker === 'kiosk' ? '#222' : '#ffffff',
-                      border: msg.speaker === 'kiosk' ? '1.5px solid #e8eaf6' : 'none',
-                      fontSize: '17px', lineHeight: '1.6',
-                      boxShadow: msg.speaker === 'kiosk' ? '0 2px 8px rgba(0,0,0,0.06)' : '0 2px 8px rgba(26,35,126,0.18)'
-                    }}>
-                      {msg.text}
-                    </div>
-                  </div>
-                ))}
-                {liveText && (
-                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                    <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                      {liveText}
-                    </div>
-                  </div>
-                )}
-              </>
+            )}
+
+            {/* live speech text */}
+            {liveText && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
+                <span style={{ fontSize: '10px', color: '#bbb', marginBottom: '2px', paddingRight: '6px', fontWeight: '600' }}>{visitorName}</span>
+                <div style={{
+                  maxWidth: '88%', padding: '8px 12px', borderRadius: '14px 14px 4px 14px',
+                  background: 'rgba(26,35,126,0.07)', color: '#3949ab', fontSize: '13px',
+                  fontStyle: 'italic', lineHeight: '1.5', border: '1.5px dashed #9fa8da'
+                }}>
+                  {liveText}
+                </div>
+              </div>
             )}
           </div>
 
-          <div style={{ padding: '12px 28px', borderTop: '1.5px solid #e8eaf6', display: 'flex', alignItems: 'center', gap: '12px' }}>
-            <canvas ref={canvasRef} width={200} height={38}
-              style={{ borderRadius: '10px', background: 'rgba(26,35,126,0.05)', display: listening ? 'block' : 'none' }} />
-            {!listening && (
-              <div style={{ width: '30px', height: '30px', borderRadius: '50%', background: '#f0f1f8', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={statusColor} strokeWidth="2">
+          {/* voice footer */}
+          <div style={{
+            padding: '8px 12px', background: '#fff', borderTop: '1px solid #e8eaf6',
+            flexShrink: 0, display: 'flex', alignItems: 'center', gap: '10px'
+          }}>
+            <div style={{
+              width: '36px', height: '36px', borderRadius: '50%', flexShrink: 0,
+              background: { ready: '#f5f5f5', listening: '#e8f5e9', processing: '#ede7f6', speaking: '#fce4ec' }[status],
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              boxShadow: status === 'listening' ? '0 0 0 5px rgba(67,160,71,0.12)' : 'none',
+              transition: 'all 0.3s'
+            }}>
+              {status === 'speaking' ? (
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e53935" strokeWidth="2.2">
+                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
+                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+                </svg>
+              ) : (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                  stroke={status === 'listening' ? '#43a047' : status === 'processing' ? '#7e57c2' : '#aaa'} strokeWidth="2.2">
                   <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
                   <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
                 </svg>
-              </div>
+              )}
+            </div>
+            <canvas ref={canvasRef} width={130} height={32}
+              style={{ borderRadius: '6px', background: 'rgba(67,160,71,0.05)', display: listening ? 'block' : 'none' }} />
+            {!listening && (
+              <span style={{
+                fontSize: '12px', fontWeight: '700',
+                color: { ready: '#aaa', listening: '#43a047', processing: '#7e57c2', speaking: '#e53935' }[status],
+                transition: 'color 0.3s'
+              }}>
+                {statusLabel}
+              </span>
             )}
-            <span style={{ fontSize: '13px', color: '#888', fontWeight: '600' }}>{statusLabel}</span>
+            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Aria AI</span>
           </div>
         </div>
-      </div>{/* end flex row */}
+      </div>
 
+      {/* ── FLOATING CAMERA PIP ── */}
+      <div style={{
+        position: 'fixed', bottom: '16px', right: '16px', width: '80px', height: '80px',
+        borderRadius: '50%', overflow: 'hidden', border: '3px solid #fff',
+        boxShadow: '0 4px 16px rgba(0,0,0,0.22)', zIndex: 20, background: '#c5cae9'
+      }}>
+        <video ref={camVideoRef} autoPlay playsInline muted
+          style={{ width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)', display: 'block' }} />
+      </div>
+
+      {/* ── STYLES ── */}
       <style>{`
-        @keyframes pulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.5;transform:scale(1.4)} }
-        @keyframes ariaPulse { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.4;transform:scale(1.6)} }
-        @keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-        @keyframes ring { 0%{transform:scale(0.65);opacity:1} 100%{transform:scale(1.5);opacity:0} }
-        @keyframes breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(1.06)} }
-        @keyframes ariaBreathe { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
-        @keyframes ariaSway { 0%,100%{transform:rotate(-1deg)} 50%{transform:rotate(1deg)} }
-        .aria-wrap { transition: filter 0.4s ease; }
-        .aria-wrap-ready { animation: ariaBreathe 4.2s ease-in-out infinite; }
-        .aria-wrap-listening { animation: ariaBreathe 2.2s ease-in-out infinite; filter: drop-shadow(0 8px 20px rgba(67,160,71,0.3)); }
-        .aria-wrap-processing { animation: ariaSway 2.4s ease-in-out infinite; filter: drop-shadow(0 8px 20px rgba(126,87,194,0.3)); }
-        .aria-wrap-speaking { animation: ariaBreathe 1.6s ease-in-out infinite; filter: drop-shadow(0 8px 20px rgba(239,83,80,0.3)); }
-        .aria-head-group, .aria-eye { transition: transform 0.35s ease; }
-        .aria-think-dots { opacity: 0; transition: opacity 0.3s ease; }
-        .aria-processing .aria-think-dots { opacity: 1; }
-        .aria-think-dot { animation: ariaThinkDot 1.4s ease-in-out infinite; transform-origin: center; }
-        .aria-think-dot:nth-child(1) { animation-delay: 0s; }
-        .aria-think-dot:nth-child(2) { animation-delay: 0.2s; }
-        .aria-think-dot:nth-child(3) { animation-delay: 0.4s; }
-        @keyframes ariaThinkDot { 0%,100% { opacity: 0.35; transform: scale(0.85); } 50% { opacity: 1; transform: scale(1.1); } }
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        input:focus { border-color: #1a237e !important; box-shadow: 0 0 0 3px rgba(26,35,126,0.1); }
-        ::-webkit-scrollbar { width: 6px; }
-        ::-webkit-scrollbar-track { background: #f5f6fa; }
-        ::-webkit-scrollbar-thumb { background: #c5cae9; border-radius: 3px; }
+        * { box-sizing:border-box; margin:0; padding:0; }
+        ::-webkit-scrollbar { width:4px; }
+        ::-webkit-scrollbar-thumb { background:rgba(0,0,0,0.12); border-radius:4px; }
+        input:focus { border-color:#1a237e !important; box-shadow:0 0 0 3px rgba(26,35,126,0.1); }
+
+        /* ── message bubble spring-in ── */
+        .msg-in { animation: msgIn 0.2s cubic-bezier(0.18,0.89,0.32,1.28) both; }
+        @keyframes msgIn { from{opacity:0;transform:translateY(5px) scale(0.97)} to{opacity:1;transform:none} }
+
+        /* ── typing dots ── */
+        .td { display:inline-block; width:7px; height:7px; border-radius:50%; background:#c5cae9;
+              animation:tdBounce 1.1s ease-in-out infinite; animation-delay:var(--d); }
+        @keyframes tdBounce { 0%,60%,100%{transform:translateY(0);background:#c5cae9} 30%{transform:translateY(-6px);background:#7e57c2} }
+
+        /* ══════════════════════════════
+           ARIA CHARACTER ANIMATIONS
+        ══════════════════════════════ */
+
+        /* BODY — gentle breathing (always on) */
+        .aria-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
+        @keyframes charBreathe { 0%,100%{transform:scaleY(1)} 50%{transform:scaleY(1.016)} }
+
+        /* HEAD — base: idle micro-float */
+        .aria-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
+        @keyframes idleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
+
+        /* ── LISTENING ── */
+        .aria-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
+        @keyframes listenLean { to{transform:translateX(10px) rotate(6deg)} }
+
+        /* pulse ring */
+        .listen-r1 { animation:lRing 2s ease-out infinite; }
+        .listen-r2 { animation:lRing 2s 0.7s ease-out infinite; }
+        @keyframes lRing { 0%{r:92;opacity:0.55} 100%{r:140;opacity:0} }
+
+        /* ── PROCESSING ── */
+        .aria-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
+        @keyframes thinkTilt { to{transform:translateX(-12px) rotate(-7deg)} }
+
+        /* thinking arm rise */
+        .aria-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
+        @keyframes armRise { from{transform:translateY(30px);opacity:0} to{transform:none;opacity:1} }
+
+        /* thinking bubble float */
+        .tbub { animation:tBubFloat 1.6s ease-in-out infinite; }
+        @keyframes tBubFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
+
+        /* furrowed brow when thinking */
+        .brow-think { animation: browFurrow 0.5s ease-out forwards; transform-origin:133px 86px; }
+        @keyframes browFurrow { to{transform:translateY(4px)} }
+
+        /* ── SPEAKING ── */
+        .aria-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
+        @keyframes headBob { 0%,100%{transform:translateY(0) rotate(0)} 30%{transform:translateY(-5px) rotate(1.5deg)} 70%{transform:translateY(2px) rotate(-1deg)} }
+
+        /* mouth alternates: a visible ↔ b visible */
+        .aria-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
+        .aria-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
+        @keyframes mA { 0%,49%{opacity:1} 50%,100%{opacity:0} }
+        @keyframes mB { 0%,49%{opacity:0} 50%,100%{opacity:1} }
+
+        /* sound waves stagger */
+        .wave1 { animation: wv 1s 0.0s ease-in-out infinite; }
+        .wave2 { animation: wv 1s 0.2s ease-in-out infinite; }
+        .wave3 { animation: wv 1s 0.4s ease-in-out infinite; }
+        @keyframes wv { 0%,100%{opacity:0.2;stroke-width:2} 50%{opacity:0.9;stroke-width:3} }
       `}</style>
     </div>
   );
 }
+
+
+// ── Aria's avatar: used in message rows and header ───────────────────────
+const AriaAvatar = ({ size = 38, speaking = false }) => (
+  <div style={{ position: 'relative', flexShrink: 0 }}>
+    {speaking && (
+      <>
+        <div className="avatar-ring r1" style={{ width: size + 14, height: size + 14, top: -7, left: -7 }} />
+        <div className="avatar-ring r2" style={{ width: size + 22, height: size + 22, top: -11, left: -11 }} />
+      </>
+    )}
+    <div style={{
+      width: size, height: size, borderRadius: '50%',
+      background: 'linear-gradient(135deg, #1a237e 0%, #5c35c9 60%, #7c4dff 100%)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      boxShadow: speaking ? '0 0 0 3px #7c4dff55' : '0 2px 8px rgba(26,35,126,0.30)',
+      flexShrink: 0, overflow: 'hidden', position: 'relative',
+    }}>
+      {/* stylised person silhouette */}
+      <svg width={size * 0.62} height={size * 0.62} viewBox="0 0 40 40" fill="none">
+        <circle cx="20" cy="14" r="7" fill="rgba(255,255,255,0.92)" />
+        <path d="M4 38 C4 28 36 28 36 38" fill="rgba(255,255,255,0.92)" />
+      </svg>
+    </div>
+  </div>
+);
+
+// Dynamic header status text
