@@ -894,6 +894,43 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
+  const renderedMessages = messages.map((msg, i) => {
+    const isAria = msg.speaker === 'kiosk';
+    const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
+    return (
+      <div key={i} style={{
+        display: 'flex', flexDirection: 'column',
+        alignItems: isAria ? 'flex-start' : 'flex-end',
+        marginTop: prevSame ? '2px' : '8px'
+      }}>
+        {!prevSame && (
+          <span style={{
+            fontSize: '10px', color: '#bbb', marginBottom: '2px',
+            paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
+          }}>
+            {isAria ? 'Aria' : visitorName}
+          </span>
+        )}
+        <div className="msg-in" style={{
+          maxWidth: '88%', padding: '8px 12px',
+          borderRadius: isAria
+            ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
+            : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
+          background: isAria ? '#ffffff' : '#1a237e',
+          color: isAria ? '#1a1a1a' : '#ffffff',
+          fontSize: '13.5px', lineHeight: '1.5',
+          boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+          wordBreak: 'break-word'
+        }}>
+          {msg.text}
+          <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
+            {msg.timestamp}
+          </span>
+        </div>
+      </div>
+    );
+  });
+
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
@@ -1101,43 +1138,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               </div>
             )}
 
-            {messages.map((msg, i) => {
-              const isAria = msg.speaker === 'kiosk';
-              const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
-              return (
-                <div key={i} style={{
-                  display: 'flex', flexDirection: 'column',
-                  alignItems: isAria ? 'flex-start' : 'flex-end',
-                  marginTop: prevSame ? '2px' : '8px'
-                }}>
-                  {!prevSame && (
-                    <span style={{
-                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
-                      paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
-                    }}>
-                      {isAria ? 'Aria' : visitorName}
-                    </span>
-                  )}
-                  <div className="msg-in" style={{
-                    maxWidth: '88%', padding: '8px 12px',
-                    borderRadius: isAria
-                      ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
-                      : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-                    background: isAria ? '#ffffff' : '#1a237e',
-                    color: isAria ? '#1a1a1a' : '#ffffff',
-                    fontSize: '13.5px', lineHeight: '1.5',
-                    boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
-                    wordBreak: 'break-word'
-                  }}>
-                    {msg.text}
-                    <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
-                      {msg.timestamp}
-                    </span>
-                  </div>
-                </div>
-              ))}
+              {renderedMessages}
 
-              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+                {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
                   while idle (not mid-question). Turns "answer machine" into
                   something that keeps the conversation moving — tapping a
                   chip routes through the SAME sendToBackend() pipeline as a
@@ -1175,23 +1178,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   </div>
                 </div>
               )}
+
               {liveText && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                    {liveText}
+                <>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                    <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                      {liveText}
+                    </div>
                   </div>
-                </div>
-                <div style={{
-                  background: '#fff', borderRadius: '14px 14px 14px 4px', padding: '10px 14px',
-                  boxShadow: '0 1px 3px rgba(0,0,0,0.08)', display: 'flex', gap: '4px', alignItems: 'center'
-                }}>
-                  <span className="td" style={{ '--d': '0ms' }} />
-                  <span className="td" style={{ '--d': '160ms' }} />
-                  <span className="td" style={{ '--d': '320ms' }} />
-                </div>
-              </div>
-            )}
+                  <div style={{
+                    background: '#fff', borderRadius: '14px 14px 14px 4px', padding: '10px 14px',
+                    boxShadow: '0 1px 3px rgba(0,0,0,0.08)', display: 'flex', gap: '4px', alignItems: 'center'
+                  }}>
+                    <span className="td" style={{ '--d': '0ms' }} />
+                    <span className="td" style={{ '--d': '160ms' }} />
+                    <span className="td" style={{ '--d': '320ms' }} />
+                  </div>
+                </>
+              )}
 
             {/* live speech text */}
             {liveText && (
