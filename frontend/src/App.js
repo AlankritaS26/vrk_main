@@ -166,10 +166,38 @@ export default function App() {
     };
     window.addEventListener('vrk-session-ended', onEnded);
 
+    // ── Instant screen switch on session START ──────────────────────────
+    // Without this, App.js only learns a new visitor exists on its next
+    // poll tick — up to IDLE_POLL_MS (750ms) of pure waiting BEFORE the
+    // welcome screen even appears, let alone before the greeting can play.
+    // The backend already broadcasts "session_start" the moment a session
+    // begins (see /session/start and /visitor/greet in main.py) — listen
+    // for it directly and poll() immediately instead of waiting.
+    let startWs;
+    let startWsStopped = false;
+    function connectStartWs() {
+      if (startWsStopped) return;
+      startWs = new WebSocket(WS_BACKEND + '/ws');
+      startWs.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'session_start') {
+            clearInterval(pollRef.current);
+            poll();                          // switch screens right now
+            pollRef.current = setInterval(poll, ACTIVE_POLL_MS);
+          }
+        } catch (_) { }
+      };
+      startWs.onclose = () => { if (!startWsStopped) setTimeout(connectStartWs, 2000); };
+    }
+    connectStartWs();
+
     return () => {
       clearInterval(pollRef.current);
       clearTimeout(goodbyeTimer.current);
       window.removeEventListener('vrk-session-ended', onEnded);
+      startWsStopped = true;
+      startWs?.close();
     };
   }, []);
 

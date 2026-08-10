@@ -10,6 +10,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
+  const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
+  const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
+  const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
+                                               // (explicitly non-interruptible, per spec — it
+                                               // is one short message that must always finish)
   const isListening = useRef(false);
   const analyserRef = useRef(null);
   const animFrameRef = useRef(null);
@@ -21,6 +26,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const playCtxRef = useRef(null);              // Web Audio playback context
   const playCursorRef = useRef(0);               // schedule cursor for gapless clips
   const pendingSpeechRef = useRef(null);         // speech blocked by autoplay policy
+  const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
+  const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
+  const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -61,6 +69,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     return () => clearInterval(t);
   }, []);
   const [liveText, setLiveText] = useState('');
+  const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
 
@@ -74,11 +83,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ? (visitCount > 2
       ? 'Welcome back, ' + visitorName + '! Great to see you again. How may I assist you today?'
       : 'Welcome back, ' + visitorName + '! How may I assist you today?')
-    : 'Welcome, ' + visitorName + '! I am the digital receptionist of R N S Institute of Technology. '
-    + 'I can help you with admissions, departments, placements, fees, and directions. '
+    : 'Welcome to R N S Institute of Technology. I am Voix Nova, your digital receptionist. '
+    + 'I can help you with admissions, departments, placements, fees, and directions around campus. '
     + 'How may I assist you today?');
 
   useEffect(() => { statusRef.current = status; }, [status]);
+  const sessionRef = useRef(null);
+  useEffect(() => { sessionRef.current = session; }, [session]);
 
   useEffect(() => {
     if (scrollRef.current)
@@ -104,6 +115,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         try {
           const msg = JSON.parse(e.data);
           if (msg.type === 'session_end') {
+            // Kill any audio + pending work from the ended session so nothing
+            // bleeds into the next visitor — EXCEPT the farewell, which is the
+            // one line meant to play as the session ends.
+            if (!farewellPlayingRef.current) {
+              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
+              pendingUtteranceRef.current = null;
+            }
             window.dispatchEvent(new Event('vrk-session-ended'));
           }
         } catch (_) { }
@@ -214,7 +232,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleUtterance = useCallback(async (float32Audio) => {
     if (!isMounted.current || askingName) return;
-    if (isSpeaking.current || statusRef.current === 'processing') {
+    if (greetingPlayingRef.current) {
+      // The one-time first-visit greeting is non-interruptible by design —
+      // drop anything spoken while it's still playing rather than cutting
+      // it off. The visitor can speak again the instant it finishes.
+      return;
+    }
+    if (isSpeaking.current) {
+      // The VAD just CONFIRMED real speech (this is onSpeechEnd) while TTS
+      // was still playing — commit the barge-in now and process it right away.
+      interruptSpeaking();
+    } else if (statusRef.current === 'processing') {
       // Visitor spoke while we were busy — save it as the next prompt
       pendingUtteranceRef.current = float32Audio;
       return;
@@ -247,6 +275,56 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [askingName]);
 
+  // Barge-in has two stages, matching the two things the VAD can tell us:
+  //
+  //  1. onSpeechStart fires OPTIMISTICALLY — the instant sound crosses the
+  //     probability threshold, before the VAD knows if it's real speech or
+  //     a cough/click/echo blip. We respond by DUCKING the TTS volume —
+  //     fast, but non-destructive and reversible.
+  //  2. The VAD itself later tells us which it was:
+  //       - onSpeechEnd   -> real speech, confirmed. NOW we hard-stop TTS.
+  //       - onVADMisfire  -> false alarm. We restore TTS volume and carry on.
+  //
+  // This avoids killing the kiosk's sentence over noise/echo while still
+  // reacting within ~80ms when someone genuinely starts talking.
+
+  const duckSpeaking = useCallback(() => {
+    if (!isSpeaking.current || !ttsGainRef.current || !playCtxRef.current) return;
+    const g = ttsGainRef.current.gain;
+    const now = playCtxRef.current.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(0.12, now + 0.08);   // quick, gentle duck — not a hard cut
+  }, []);
+
+  const restoreSpeaking = useCallback(() => {
+    if (!ttsGainRef.current || !playCtxRef.current) return;
+    const g = ttsGainRef.current.gain;
+    const now = playCtxRef.current.currentTime;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(1, now + 0.15);      // false alarm — fade back to full volume
+  }, []);
+
+  // Hard commit: only called once the VAD has CONFIRMED real speech
+  // (onSpeechEnd), or on session-ending events (e.g. goodbye). Stops all
+  // scheduled/playing TTS audio immediately and hands control back to the mic.
+  const interruptSpeaking = useCallback(() => {
+    if (!isSpeaking.current) return;
+    activeSpeakIdRef.current = null;        // any in-flight speak() loop sees this and stops
+    activeNodesRef.current.forEach((n) => { try { n.stop(); } catch (e) { /* already stopped */ } });
+    activeNodesRef.current = [];
+    window.speechSynthesis.cancel();        // in case the browser-voice fallback was speaking
+    if (playCtxRef.current) playCursorRef.current = playCtxRef.current.currentTime;
+    if (ttsGainRef.current && playCtxRef.current) {
+      const now = playCtxRef.current.currentTime;
+      ttsGainRef.current.gain.cancelScheduledValues(now);
+      ttsGainRef.current.gain.setValueAtTime(1, now);   // reset for the next speak() call
+    }
+    isSpeaking.current = false;
+  }, []);
+  useEffect(() => { interruptSpeakingRef.current = interruptSpeaking; }, [interruptSpeaking]);
+
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const startListening = useCallback(async () => {
     if (!isMounted.current || askingName) return;
@@ -267,7 +345,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       const mic = await createKioskMic({
         onStream: (stream) => { streamRef.current = stream; },
         onSpeechStart: () => {
-          if (isSpeaking.current || !isMounted.current) return;
+          if (!isMounted.current) return;
+          // HARD barge-in: the instant the visitor starts speaking, STOP the
+          // kiosk's voice immediately — don't just duck and wait for the VAD
+          // to confirm at speech-end. A receptionist stops talking the moment
+          // you speak; so does this. EXCEPTION: the first-visit greeting is
+          // deliberately NOT interruptible — it's one short message and
+          // every visitor should hear the whole thing once.
+          if (isSpeaking.current && !greetingPlayingRef.current) interruptSpeaking();
           isListening.current = true;
           setListening(true);
           setLiveText('');
@@ -276,20 +361,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         },
         onSpeechEnd: (audio) => handleUtterance(audio),
         onMisfire: () => {
+          // We hard-stopped TTS on speech-start, so there's nothing to
+          // restore. A misfire just means no real question followed — return
+          // to ready and let the visitor speak again.
           isListening.current = false;
           if (isMounted.current) { setListening(false); setStatus('ready'); }
         },
       });
       micRef.current = mic;
-      // If TTS is already playing (greeting started before mic was ready),
-      // immediately park the VAD so it doesn't pick up TTS audio.  finish()
-      // will call startListening() again once speaking is done, at which point
-      // isSpeaking will be false and we take the resume path above.
-      if (isSpeaking.current) {
-        mic.pause();
-      } else {
-        setStatus('ready');
-      }
+      // Leave the VAD running even if TTS is already playing (e.g. the
+      // greeting started before the mic finished initializing) — this lets
+      // the visitor barge in on the very first greeting too. Status stays
+      // whatever speak() already set ('speaking'); only set 'ready' when
+      // nothing is currently talking.
+      if (!isSpeaking.current) setStatus('ready');
     } catch (err) {
       console.error('[MIC] Error:', err);
       if (!isSpeaking.current) setStatus('ready');
@@ -321,18 +406,52 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const sendToBackend = useCallback(async (text) => {
     if (!text) return;
     setLiveText('');
+    setProcessingHint('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
 
-    // NOTE: farewell/greeting detection used to be guessed HERE too, via a
-    // raw substring check on the unnormalized transcript (`text.includes('bye')`
-    // etc). That's gone — it was a duplicate of (and inconsistent with) the
-    // backend's own check, ran on unnormalized text, and had no word-boundary
-    // or length guard, so it could fire on any utterance that merely
-    // contained "bye"/"thanks" as a substring and silently swallow the rest
-    // of the sentence. The backend (/ask) is now the single source of truth:
-    // it returns `session_action: "END"` when it genuinely detects a
-    // farewell, and we act on that below after the real answer comes back.
+    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
+    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
+      const farewells = [
+        'You are most welcome! Have a wonderful day. Goodbye!',
+        'Happy to help! Take care and have a great day.',
+        'Anytime! Wishing you a lovely day ahead. Goodbye!',
+        'My pleasure! All the best, and see you around campus.',
+      ];
+      const farewell = farewells[Math.floor(Math.random() * farewells.length)];
+      micRef.current?.pause();
+      farewellPlayingRef.current = true;     // protect this audio from the session_end stop
+
+      // Switch to the goodbye screen NOW so the farewell voice plays OVER it
+      // (they should appear together). The audio uses Web Audio, which keeps
+      // playing across this component unmounting — and farewellPlayingRef
+      // keeps the session_end handler from stopping it. We clear the flag
+      // when the voice actually finishes.
+      speak(farewell, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
+      window.dispatchEvent(new Event('vrk-session-ended'));   // goodbye screen appears now
+      return;
+    }
+
+    // INSTANT ACKNOWLEDGMENT: a real receptionist reacts the moment you
+    // finish speaking — not after a silent pause. We play a short filler
+    // right away while the actual answer is still being fetched, so there's
+    // never dead air with a spinner. Kept short so it doesn't collide with
+    // the real answer. Skipped for very short/greeting-like inputs.
+    const acks = [
+      'Sure, let me check that for you.',
+      'Good question — one moment.',
+      'Let me look that up for you.',
+      'Of course, just a second.',
+      'Right, let me find that.',
+    ];
+    if (text.split(' ').length >= 3) {
+      const ack = acks[Math.floor(Math.random() * acks.length)];
+      // Show it as a transient indicator bubble too — otherwise the visitor
+      // sees nothing at all while the real answer is being fetched, which
+      // is exactly the "left confused, feels frozen" problem.
+      speak(ack, () => setProcessingHint(ack));
+    }
 
     // 35 s hard cap — prevents status getting stuck at 'processing' if the
     // LLM is slow or the network drops after the request was sent.
@@ -350,26 +469,29 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ]);
       clearTimeout(askTimeout);
       const data = await askRes.json();
+
+      // STALE-ANSWER GUARD: if the session changed while this request was in
+      // flight (visitor said goodbye and left, next visitor arrived), this
+      // answer belongs to nobody on screen — drop it so it never bleeds into
+      // the next person's session.
+      const liveSid = sessionRef.current?.session_id || 'guest';
+      if (data.dropped || liveSid !== sid) {
+        console.info('[sendToBackend] dropped stale answer for', sid);
+        isSpeaking.current = false;
+        setStatus('ready');
+        return;
+      }
+
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
       fetch(BACKEND + '/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
       });
-
-      if (data.session_action === 'END') {
-        // Backend already ended the session (active_session = None) and
-        // broadcast session_end over the websocket — just speak the
-        // farewell and switch screens once it's done playing.
-        micRef.current?.pause();
-        speak(answer, () => addMessage(answer, 'kiosk'));
-        window.dispatchEvent(new Event('vrk-session-ended'));
-        return;
-      }
-
-      speak(answer, () => addMessage(answer, 'kiosk'));
+      speak(answer, () => { setProcessingHint(''); addMessage(answer, 'kiosk'); });
     } catch (e) {
       clearTimeout(askTimeout);
+      setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
       console.error('[sendToBackend]', e);
       const fallback = e.name === 'AbortError'
         ? "I'm sorry, that's taking longer than expected. Please try asking again."
@@ -379,15 +501,28 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, [session, addMessage]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speak = useCallback(async (text, onStart) => {
+  const speak = useCallback(async (text, onStart, onDone) => {
+    // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
+    // (e.g. an acknowledgment like "let me check that" that hasn't finished
+    // yet) before starting this one. Without this, two clips play at once —
+    // this was the cause of garbled/overlapping speech after we added the
+    // instant-acknowledgment feature.
+    if (isSpeaking.current) interruptSpeaking();
+
     window.speechSynthesis.cancel();
-    micRef.current?.pause();          // don't let the kiosk hear itself
+    const myId = Symbol('speak');           // identifies this call so interruptSpeaking() can invalidate it
+    activeSpeakIdRef.current = myId;
+    // Mic is intentionally NOT paused here (unlike before) — it stays live
+    // through TTS so the visitor can barge in. echoCancellation on the mic
+    // stream (kioskMic.js) is what keeps it from hearing its own voice.
     isSpeaking.current = true;
     setStatus('speaking');
 
     const finish = () => {
+      if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
       isSpeaking.current = false;
       setStatus('ready');
+      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
       if (isMounted.current) startListening();
     };
 
@@ -430,17 +565,29 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       return;
     }
     playCursorRef.current = pctx.currentTime;
+    if (!ttsGainRef.current) {
+      ttsGainRef.current = pctx.createGain();
+      ttsGainRef.current.connect(pctx.destination);
+    }
+    ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
+    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
 
     const playClip = (b64) => new Promise(async (resolve) => {
+      if (activeSpeakIdRef.current !== myId) return resolve();   // interrupted before this clip started
       try {
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         const buf = await pctx.decodeAudioData(bytes.buffer);
+        if (activeSpeakIdRef.current !== myId) return resolve();  // interrupted while decoding
         const node = pctx.createBufferSource();
         node.buffer = buf;
-        node.connect(pctx.destination);
-        node.onended = resolve;
+        node.connect(ttsGainRef.current);
+        activeNodesRef.current.push(node);
+        node.onended = () => {
+          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+          resolve();
+        };
         fireStart();                     // text appears the moment audio starts
         const at = Math.max(pctx.currentTime, playCursorRef.current);
         node.start(at);
@@ -491,15 +638,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       let p1 = sentences.length > 1 ? fetchClip(sentences[1]) : null;
 
       for (let i = 0; i < sentences.length; i++) {
+        if (activeSpeakIdRef.current !== myId) break;   // interrupted — stop scheduling more chunks
         const b64 = await p0;
         p0 = p1;
         p1 = i + 2 < sentences.length ? fetchClip(sentences[i + 2]) : null;
         if (b64) { anyPlayed = true; await playClip(b64); }
       }
 
+      if (activeSpeakIdRef.current !== myId) return;    // interrupted — don't fall back to browser voice
       if (!anyPlayed) { browserSpeak(); return; }
       finish();
     } catch (e) {
+      if (activeSpeakIdRef.current !== myId) return;
       console.error('[TTS] backend unavailable, using browser voice', e);
       browserSpeak();
     }
@@ -532,18 +682,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (lastGreetRef.current.text === greeting && now - lastGreetRef.current.ts < 20000) return;
     lastGreetRef.current = { text: greeting, ts: now };
 
-    // Pre-warm the greeting audio: the backend synthesizes + caches it
-    // during our beat, so speak() below plays it near-instantly.
-    fetch(BACKEND + '/tts', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: greeting })
-    }).catch(() => { });
+    // Fire the greeting as SOON as the session/window is active — no
+    // artificial delay. The first-visit line is pre-cached server-side at
+    // startup (see tts.py _PREWARM), so this plays near-instantly without
+    // needing a client-side pre-warm round-trip first.
+    if (isSpeaking.current) return;       // something else already talking
 
-    const t = setTimeout(() => {
-      if (isSpeaking.current) return;     // something else already talking
+    if (!isReturning) {
+      // NEW VISITOR: this greeting is explicitly non-interruptible and
+      // fires exactly once (guarded by visitKey above).
+      greetingPlayingRef.current = true;
+      speak(greeting, () => addMessage(greeting, 'kiosk'), () => {
+        greetingPlayingRef.current = false;
+      });
+    } else {
+      // Returning-visitor greeting keeps normal barge-in behavior.
       speak(greeting, () => addMessage(greeting, 'kiosk'));
-    }, 250);
-    return () => clearTimeout(t);
+    }
   }, [session?.session_id, session?.resumed_at, askingName]);
 
   const handleSubmitName = async (overrideName, overrideSave) => {
@@ -980,20 +1135,52 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                     </span>
                   </div>
                 </div>
-              );
-            })}
+              ))}
 
-            {/* typing indicator */}
-            {status === 'processing' && (
-              <div style={{ display: 'flex', alignItems: 'flex-end', gap: '6px', marginTop: '8px' }}>
-                <div style={{
-                  width: '24px', height: '24px', borderRadius: '50%',
-                  background: 'linear-gradient(135deg,#1a237e,#7c4dff)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0
-                }}>
-                  <svg width="12" height="12" viewBox="0 0 40 40" fill="none">
-                    <circle cx="20" cy="14" r="7" fill="white" /><path d="M4 38C4 28 36 28 36 38" fill="white" />
-                  </svg>
+              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+                  while idle (not mid-question). Turns "answer machine" into
+                  something that keeps the conversation moving — tapping a
+                  chip routes through the SAME sendToBackend() pipeline as a
+                  spoken question, so it inherits every existing guard
+                  (barge-in, stale-answer checks, goodbye handling) for free. */}
+              {status === 'ready' && !processingHint && !liveText &&
+                messages.length > 0 && messages[messages.length - 1].speaker === 'kiosk' && (
+                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', paddingLeft: '4px', marginTop: '2px' }}>
+                  <button
+                    onClick={() => sendToBackend('Anything else you can help with?')}
+                    style={{ padding: '9px 18px', background: '#fff', border: '1.5px solid #c7cbe8',
+                             borderRadius: '20px', fontSize: '14px', fontWeight: '600', color: '#3c4370',
+                             cursor: 'pointer', boxShadow: '0 2px 6px rgba(26,35,126,0.05)' }}>
+                    Ask something else
+                  </button>
+                  <button
+                    onClick={() => sendToBackend('That is all, thank you')}
+                    style={{ padding: '9px 18px', background: '#fff', border: '1.5px solid #c7cbe8',
+                             borderRadius: '20px', fontSize: '14px', fontWeight: '600', color: '#3c4370',
+                             cursor: 'pointer', boxShadow: '0 2px 6px rgba(26,35,126,0.05)' }}>
+                    That's all, thanks
+                  </button>
+                </div>
+              )}
+
+              {processingHint && !liveText && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: '4px', fontWeight: '500' }}>
+                    RNSIT Kiosk &nbsp;·&nbsp; thinking
+                  </div>
+                  <div style={{ maxWidth: '60%', padding: '13px 18px', borderRadius: '4px 18px 18px 18px',
+                                background: '#f3f2fb', color: '#6a6f8c', fontSize: '15.5px', fontStyle: 'italic',
+                                lineHeight: '1.6', border: '1.5px dashed #d8d6ea' }}>
+                    {processingHint}
+                  </div>
+                </div>
+              )}
+              {liveText && (
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
+                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                    {liveText}
+                  </div>
                 </div>
                 <div style={{
                   background: '#fff', borderRadius: '14px 14px 14px 4px', padding: '10px 14px',
