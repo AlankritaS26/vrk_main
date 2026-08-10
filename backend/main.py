@@ -50,9 +50,10 @@ from backend.database import (
     delete_face_by_name,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
-from backend.llm import initialize_rag_knowledge_base, close_llm_client
+from backend.llm import initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
+from backend.tts import PREWARM_DONE
 
 try:
     from backend.detection import run_pipeline as _run_pipeline
@@ -204,6 +205,40 @@ _RAG_STOPWORDS = {
 _RAG_ABBREVS = {"dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "no", "vs", "etc"}
 
 
+def _matches_short_phrase(q_normalized: str, phrases: set[str]) -> bool:
+    """
+    Word-boundary phrase match, deliberately restricted to SHORT utterances
+    (<=4 words). This is the fix for the "random Goodbye" bug: the old code
+    did `phrase in q_normalized`, a raw substring check across the entire
+    sentence with no length cap — so a real question that happened to
+    contain "bye"/"thanks" anywhere (or just drifted semantically close via
+    RAG) could trigger a farewell. A genuine "bye"/"thank you" utterance is
+    always short; a real campus question with those letters buried in it
+    (or a coincidental partial match) is not, so capping length here is a
+    cheap, robust way to tell the two apart without a big keyword tree.
+    """
+    q = q_normalized.strip()
+    if not q or len(q.split()) > 4:
+        return False
+    if q in phrases:
+        return True
+    for phrase in phrases:
+        if re.search(rf"(?:^|\s){re.escape(phrase)}(?:$|\s)", q):
+            return True
+    return False
+
+
+GREETING_PHRASES = {
+    "hi", "hello", "hey", "hiya", "yo",
+    "good morning", "good afternoon", "good evening",
+}
+_GREETING_RESPONSES = [
+    "Hello! Welcome to RNSIT. How can I help you today?",
+    "Hi there! I'm the RNSIT digital receptionist — what would you like to know?",
+    "Hey! Welcome to RNS Institute of Technology. What can I help you with?",
+]
+
+
 # ── Q/A label stripper ────────────────────────────────────────────────────
 # FAQ-derived chunks are seeded (see backend/llm.py::_json_to_text_chunks)
 # as literal "Q: <question>? A: <answer>" strings, on purpose — that extra
@@ -291,9 +326,12 @@ async def query_rag_service(query: str, k: int | None = None) -> str:
     filters out weak matches (RAGService's score = 1 - vector distance, so
     higher is better — 0.35 is a reasonable "actually related" cutoff).
 
-    This is the single place that talks to RAGService — both /ask and
-    /api/chat call through here so caching, logging, and the admin
-    dashboard all see consistent answers.
+    NOTE: as of the Phase 3 fix, the primary voice pipeline (/ask) no longer
+    calls this — it calls backend.llm.generate_rag_kiosk_response, which
+    retrieves the same way but then passes the context to the LOCAL LLM
+    for a real generated answer instead of returning raw retrieved text.
+    This function is kept for /api/chat, a lower-level diagnostic endpoint
+    useful for inspecting exactly what RAGService itself returns.
     """
     k = k or RAG_TOP_K
     try:
@@ -465,8 +503,18 @@ def _log_message(text: str, speaker: str) -> dict:
 # ==========================================
 @app.get("/health")
 def health():
-    """Liveness probe for the launcher and future monitoring."""
-    return {"status": "healthy"}
+    """
+    Liveness probe for the launcher — and the fix for a real bug: this used
+    to report healthy the instant uvicorn was up, before TTS finished
+    pre-caching the fixed phrases (greeting, acknowledgments, farewell).
+    detection.py starts as soon as /health is green, so a visitor could be
+    recognized and greeted BEFORE the greeting audio was actually cached —
+    falling through to slow live synthesis. Now this waits (briefly, with a
+    hard cap so a genuinely broken TTS install can never block startup
+    forever) for that pre-warm to actually finish first.
+    """
+    PREWARM_DONE.wait(timeout=25)   # bounded — degrades gracefully, never hangs
+    return {"status": "healthy", "tts_prewarmed": PREWARM_DONE.is_set()}
 
 
 @app.get("/")
@@ -898,17 +946,38 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
 
 INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
+import random as _random
+
 def build_greeting(name: str, is_returning: bool, resumed: bool) -> str:
-    """The exact spoken lines for first-time vs returning visitors."""
+    """Spoken greeting — varied so it never sounds like a recording.
+
+    First visit explains what the kiosk is (so the visitor knows what to ask);
+    return visits are warmer and shorter. Each picks randomly from a few
+    phrasings, the way a real receptionist naturally varies their words."""
     who = name if name and name not in ("Guest", "Unknown", "") else "there"
+
     if not is_returning:
-        return (f"Welcome {who}! I am the digital receptionist of {INSTITUTE_NAME}. "
-                f"I can help you with admissions, departments, placements, fees, "
-                f"and finding your way around campus. How may I assist you today?")
+        # Fixed script (not randomized) so the ENTIRE line can be
+        # pre-synthesized once at server startup and served from cache —
+        # this is what makes the very first greeting instant instead of
+        # waiting on live TTS synthesis. If you change this text, also
+        # update the matching entry in tts.py's _PREWARM list.
+        return (f"Welcome to {INSTITUTE_NAME}. I am Voix Nova, your digital receptionist. "
+                f"I can help you with admissions, departments, placements, fees, and "
+                f"directions around campus. How may I assist you today?")
+
     if resumed:
-        return (f"Welcome back, {who}! Good to see you again. "
-                f"We can continue where we left off. How may I assist you today?")
-    return f"Welcome back, {who}! How may I assist you today?"
+        return _random.choice([
+            f"Welcome back, {who}! Good to see you again — shall we pick up where we left off?",
+            f"Hey {who}, welcome back! We can carry on from before. What would you like to know?",
+            f"Good to see you again, {who}! How can I help this time?",
+        ])
+
+    return _random.choice([
+        f"Welcome back, {who}! How can I help you today?",
+        f"Hi again, {who}! What can I do for you?",
+        f"Hello {who}, good to see you! How may I help?",
+    ])
 
 
 async def resume_or_create_session(face_id: str, user_name: str,
@@ -1099,31 +1168,105 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
     visitor_entry = _log_message(question, "visitor")
-    await manager.broadcast({"type": "message", **visitor_entry})
+    await manager.broadcast({"type": "message", "session_id": sid, **visitor_entry})
 
-    async def _respond(answer: str, source: str = "") -> dict:
+    async def _respond(answer: str, source: str = "",
+                       is_farewell: bool = False) -> dict:
+        # STALE-ANSWER GUARD: a slow LLM reply can outlive the session that
+        # asked it (visitor said "thank you" and walked off). If the session
+        # changed while we were working, this answer belongs to nobody on
+        # screen — drop it instead of broadcasting into the NEXT visitor.
+        # (The farewell is exempt: it intentionally runs as the session ends.)
+        current_sid = active_session["session_id"] if active_session else None
+        if not is_farewell and sid != "unknown" and current_sid != sid:
+            logger.info(f"[ASK] Dropping stale answer for ended session "
+                        f"{sid[:8]} (current={str(current_sid)[:8]})")
+            return {"question": question, "answer": answer, "dropped": True}
+
         try:
             await save_interaction(sid, question, answer)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
-        await manager.broadcast({"type": "message", **kiosk_entry})
-        result = {"question": question, "answer": answer}
+        await manager.broadcast({"type": "message", "session_id": sid, **kiosk_entry})
+        result = {"question": question, "answer": answer, "session_id": sid}
         if source:
             result["source"] = source
         return result
 
-    # ─── Thank you → end session immediately ─────────────────────────────────
-    THANK_YOU_PHRASES = {
-        "thank you", "thanks", "thank u", "thankyou",
-        "ok thanks", "okay thanks", "ok thank you", "okay thank you",
-        "thats all", "thats all thanks", "bye", "goodbye", "that is all",
+    # ─── Greeting → instant, deterministic reply (no RAG/LLM round-trip) ─────
+    # "Hi"/"Hello" used to be answered via RAG, which is what caused the
+    # "Hi Hi there! Welcome..." echo bug: a greeting isn't a fact lookup, it
+    # doesn't belong in the knowledge base, and it should never wait on an
+    # LLM call. Handled the same deterministic way as the goodbye phrases.
+    GREETING_PHRASES = {
+        "hi", "hello", "hey", "hiya", "yo",
+        "good morning", "good afternoon", "good evening",
     }
-    if any(phrase in q_normalized for phrase in THANK_YOU_PHRASES):
+    if q_normalized in GREETING_PHRASES:
+        import random as _random2
+        reply = _random2.choice([
+            f"Hi{', ' + visitor_name if visitor_name != 'there' else ''}! What can I help you with?",
+            f"Hello{', ' + visitor_name if visitor_name != 'there' else ''}! How can I assist you today?",
+            f"Hey there! What would you like to know?",
+        ])
+        return await _respond(reply)
+
+    # ─── Thank you → end session immediately ─────────────────────────────────
+    # ── Easter eggs — deterministic, instant, no RAG/LLM round-trip ─────────
+    # This is the single thing visitors actually remember and tell their
+    # friends about. A few warm, self-aware replies to the questions people
+    # ask ANY assistant sooner or later.
+    import random as _random3
+    EASTER_EGGS = {
+        "are you a robot": [
+            "I'm a digital receptionist, so yes and no — no body, but I do the job!",
+            "Guilty as charged! But I promise I'm a friendly one.",
+        ],
+        "are you real": [
+            "Real enough to help you find the CSE block! I'm Voix Nova, RNSIT's digital receptionist.",
+        ],
+        "are you human": [
+            "Not quite — I'm Voix Nova, a digital receptionist. But I'll do my best to sound like one!",
+        ],
+        "tell me a joke": [
+            "Why did the student bring a ladder to class? To reach the higher studies!",
+            "What did the router say to the CSE student? Nothing, they just had a falling out over connection issues.",
+        ],
+        "who made you": [
+            "I was built by the students of RNSIT to help visitors like you find your way around!",
+        ],
+        "what is your name": [
+            "I'm Voix Nova, the digital receptionist here at RNSIT. Nice to meet you!",
+        ],
+        "who are you": [
+            "I'm Voix Nova — think of me as RNSIT's always-awake front desk.",
+        ],
+        "i love you": [
+            "That's sweet! I love helping visitors find their way around RNSIT too.",
+        ],
+        "do you sleep": [
+            "Never! I'm here whenever a visitor needs help, day or night.",
+        ],
+    }
+    for _trigger, _replies in EASTER_EGGS.items():
+        if _trigger in q_normalized:
+            return await _respond(_random3.choice(_replies))
+
+    THANK_YOU_PHRASES = {
+        "thank you", "thanks", "thank u", "thankyou", "thank you so much",
+        "ok thanks", "okay thanks", "ok thank you", "okay thank you",
+        "thats all", "thats all thanks", "that is all", "thats it", "that is it",
+        "bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye",
+        "see you", "see ya", "no thanks", "no thank you", "im done",
+        "i am done", "nothing else", "that would be all",
+    }
+    if _matches_short_phrase(q_normalized, THANK_YOU_PHRASES):
         farewell = (
             f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
             "Have a great day. Goodbye!"
         )
+        logger.info("[ROUTE] FAREWELL (deterministic) — '%s'", q_normalized)
         active_session    = None
         _last_activity_ts = 0.0
         await manager.broadcast({
@@ -1131,7 +1274,8 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             "session_id": sid,
             "reason":     "thank_you",
         })
-        return await _respond(farewell)
+        return await _respond(farewell, is_farewell=True)
+        return await _respond(farewell, source="farewell", session_action="END")
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
@@ -1144,13 +1288,23 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── RAGService knowledge-base lookup (port 8600 by default) ────────────────
-    logger.info("[CACHE MISS] Querying RAGService knowledge base for: '%s'", q_normalized)
+    # ─── RNSIT_RAG / GENERAL_LLM / LIVE_INFO / UNSUPPORTED_EXTERNAL ─────────
+    # generate_rag_kiosk_response is the real pipeline: condense follow-up
+    # questions using recent history -> semantic search against RAGService
+    # -> threshold check -> ground the LOCAL LLM in the retrieved context (or
+    # route off-topic questions through _handle_offtopic) -> natural answer.
+    # This is the function that was previously built but never wired up to
+    # any live endpoint — /ask used to call the LLM-free query_rag_service
+    # instead, which is why answers kept working with the LLM disconnected.
+    recent_history = [
+        {"speaker": m["speaker"], "text": m["text"]}
+        for m in message_log[-6:]
+        if m.get("index") != visitor_entry.get("index")
+    ]
 
     try:
-        answer = await query_rag_service(q_normalized)
+        answer = await generate_rag_kiosk_response(question, history=recent_history)
 
-        # Cache the successful response back in Redis
         if redis_client and answer:
             try:
                 redis_client.set(cache_key, answer, ex=3600)
@@ -1158,10 +1312,10 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
                 logger.warning("Redis write error: %s", e)
 
     except Exception as exc:
-        logger.error("RAGService query failed or threw an exception: %s", exc)
+        logger.error("[LLM PIPELINE] generate_rag_kiosk_response failed: %s", exc)
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="rag_service")
+    return await _respond(answer, source="rag_llm")
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
@@ -1316,9 +1470,14 @@ async def greet_visitor(payload: GreetVisitorPayload):
     Orchestration gateway intercepting hits from detection.py hardware loop.
     Routes tracked users directly into session pipelines or triggers identity checks.
     """
-    global active_session, visitor_name_response, _last_activity_ts
+    global active_session, visitor_name_response, _last_activity_ts, message_log
     _last_activity_ts = datetime.now().timestamp()
-    
+    message_log = []  # BUG FIX: this used to be a same-name local shadowing the
+    # module-level `message_log`, so it never actually cleared — a returning or
+    # new visitor's conversation would silently inherit the PREVIOUS visitor's
+    # message history, which corrupts follow-up context resolution ("its",
+    # "what about ISE", etc. could resolve against a stranger's conversation).
+
     # Context handling for unrecognized/new visitors
     if not payload.face_id or payload.name.lower() == "unknown":
         logger.info("[GREET BLOCK] Unrecognized presence captured. Redirecting to initialization context.")
