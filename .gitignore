@@ -8,3 +8,5 @@ faces/
 frontend/build/
 .vscode/
 requirements.lock.txt
+# Chroma DB
+RAGService/data/vectorstore/
