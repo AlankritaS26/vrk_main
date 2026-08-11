@@ -8,6 +8,8 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
+from backend.gemini import gemini_available, gemini_chat_completion, GEMINI_MODEL
+
 
 load_dotenv()
 
@@ -31,6 +33,10 @@ RAG_TOP_K       = int(os.getenv("RAG_TOP_K", "5"))
 # BGE embeddings: >0.55 = relevant, >0.40 = loosely related, <0.30 = noise.
 RAG_SIMILARITY_THRESHOLD = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
 
+# ── Multi-LLM fallback config (Tier 1: local Qwen -> Tier 2: Gemini -> Tier 3: RAG-only) ──
+PRIMARY_LLM            = os.getenv("PRIMARY_LLM", "local").strip().lower()
+ENABLE_GEMINI_FALLBACK = os.getenv("ENABLE_GEMINI_FALLBACK", "false").strip().lower() in ("1", "true", "yes")
+
 JSON_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "college_info.json")
 
 PROFANITY_BLOCKLIST = {
@@ -49,6 +55,11 @@ _STOPWORDS = {
 
 _SHARED_ASYNC_CLIENT: httpx.AsyncClient | None = None
 _rag_seeded: bool = False
+
+# Local copy of main.py's Q/A label stripper — used only by the Tier-3
+# RAG-only safety net below, so raw "Q: ... A: ..." scaffolding from a
+# retrieved chunk never reaches the visitor when both LLM tiers are down.
+_QA_LABEL_RE_LLM = re.compile(r"Q:\s*.+?\?\s*A:\s*", re.IGNORECASE)
 
 
 # ==========================================
@@ -313,6 +324,159 @@ async def chat_completion(
         return content.strip()
 
     raise ValueError(f"Invalid chat completion response format: {data}")
+
+
+# ==========================================
+# 3-TIER LLM FALLBACK ORCHESTRATOR
+#   Tier 1: Local Qwen (always tried first — see project requirement)
+#   Tier 2: Gemini (only on genuine infra failure, not poor quality)
+#   Tier 3: caller's responsibility — see generate_rag_kiosk_response's
+#           RAG-only safety net, triggered when this raises
+# ==========================================
+def _is_infra_failure(exc: Exception) -> bool:
+    """
+    True only for the failure classes the spec calls out as fallback-worthy:
+    connection refused/timeout, network failure, server offline, HTTP 5xx.
+    False for anything else (e.g. a 4xx from a malformed request, which is
+    OUR bug, not the server being down) — falling back to Gemini for that
+    would just paper over a real bug instead of surfacing it. Response
+    *quality* is never a reason to fall back; that's not caught here at all
+    since a successful call never raises.
+    """
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+                         httpx.WriteTimeout, httpx.PoolTimeout, httpx.NetworkError,
+                         httpx.TimeoutException)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    # A response that came back 200 but was empty/unparseable (ValueError from
+    # chat_completion's own validation) means the local server is up but not
+    # producing usable output — treated as infra-level for fallback purposes,
+    # same as the spec's "API unavailable" case.
+    if isinstance(exc, ValueError):
+        return True
+    return False
+
+
+async def chat_completion_with_fallback(
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 300,
+) -> tuple[str, str, str]:
+    """
+    Tries local Qwen first, falls over to Gemini ONLY on genuine infra
+    failure, per project spec. Returns (text, tier_label, model_used) on
+    success. Raises RuntimeError if every enabled tier failed — the caller
+    (generate_rag_kiosk_response) is responsible for the final Tier-3
+    RAG-only safety net, since only it has the retrieved context to build
+    that response from.
+    """
+    # ── Tier 1: Local Qwen ──
+    try:
+        text = await chat_completion(messages, temperature=temperature, max_tokens=max_tokens)
+        logger.info("LLM Attempt: Local Qwen | STATUS: SUCCESS | MODEL USED: %s", LLM_CHAT_MODEL)
+        return text, "local", LLM_CHAT_MODEL
+    except Exception as e:
+        # %s on some httpx timeout/connect exceptions stringifies to "" with
+        # no useful text at all — logging only str(e) then produced literally
+        # blank "Reason: " lines with no way to tell what actually failed.
+        # Including the exception type name guarantees something diagnosable
+        # is always printed, even when the exception has no message body.
+        reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        if not _is_infra_failure(e):
+            # Not an infra failure (e.g. a 4xx from our own bad request) —
+            # don't mask it by silently trying Gemini. Let it propagate.
+            logger.error("LLM Attempt: Local Qwen | STATUS: FAILED (non-infra, not falling back) | Reason: %s", reason)
+            raise
+        logger.warning("LLM Attempt: Local Qwen | STATUS: FAILED | Reason: %s", reason)
+
+    # ── Tier 2: Gemini (only reached on a genuine Tier-1 infra failure) ──
+    if ENABLE_GEMINI_FALLBACK and gemini_available():
+        try:
+            text = await gemini_chat_completion(messages, temperature=temperature, max_tokens=max_tokens)
+            logger.info("Fallback: Gemini | STATUS: SUCCESS | MODEL USED: %s", GEMINI_MODEL)
+            return text, "gemini", GEMINI_MODEL
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            logger.error("Fallback: Gemini | STATUS: FAILED | Reason: %s", reason)
+    elif ENABLE_GEMINI_FALLBACK and not gemini_available():
+        logger.warning("Fallback: Gemini | SKIPPED | Reason: ENABLE_GEMINI_FALLBACK=true but GEMINI_API_KEY not set")
+    else:
+        logger.info("Fallback: Gemini | SKIPPED | Reason: ENABLE_GEMINI_FALLBACK is false")
+
+    # Both tiers exhausted — caller falls back to Tier 3 (RAG-only).
+    raise RuntimeError("Local Qwen and Gemini fallback both failed or unavailable.")
+
+
+# ==========================================
+# MEMORY-AWARE RE-ENGAGEMENT — TOPIC EXTRACTION
+# ==========================================
+# Turns a visitor's recent stored questions from their last session into a
+# short topic summary (e.g. "hostel facilities and fees") so the greeting
+# can say "last time you were asking about X" instead of repeating their
+# question verbatim. Deliberately conservative: cheap, low-temperature,
+# tightly bounded, and guarded on the caller side (build_greeting in
+# main.py) — if this returns nothing usable, the caller MUST fall back to
+# a generic re-engagement line rather than inventing a topic. This function
+# never answers or elaborates, it only labels. Goes through the same
+# chat_completion() used by the main pipeline, so it's subject to the same
+# provider/auth configuration — no separate LLM wiring needed.
+_TOPIC_EXTRACT_PROMPT = (
+    "You will be given one or more visitor questions asked at a college "
+    "kiosk during their last visit, oldest first. Summarize what they "
+    "were asking about in 2 to 6 words (a short noun phrase covering all "
+    "of them if there's more than one), e.g. 'hostel facilities', "
+    "'placement statistics and fees', 'admission process'. Do not answer "
+    "the question(s). Do not add punctuation, quotes, or a leading "
+    "article like 'the'. If everything given is only a greeting, "
+    "farewell, or too vague to label, reply with exactly: NONE.\n\n"
+    "Visitor questions:\n{questions}\n"
+    "Topic:"
+)
+
+async def extract_topic_label(questions) -> str | None:
+    """
+    Returns a short topic phrase summarizing `questions`, or None if
+    extraction is empty/uncertain. Accepts either a single question
+    string or a list of question strings (oldest first).
+    """
+    if isinstance(questions, str):
+        questions = [questions]
+    questions = [q.strip() for q in (questions or []) if q and q.strip()]
+    if not questions:
+        return None
+
+    questions_block = "\n".join(f"- {q}" for q in questions)
+    try:
+        # THE FIX: this used to call the bare chat_completion() (Local Qwen
+        # only, no fallback), so whenever the local server was down, topic
+        # extraction failed even though the main answer pipeline was
+        # successfully falling back to Gemini at that exact same moment —
+        # producing a generic "no record" greeting/recall despite real
+        # history existing (see get_recent_interactions succeeding right
+        # above this call). Using the same 3-tier fallback the rest of the
+        # app uses means a Local Qwen outage no longer silently disables
+        # re-engagement.
+        raw, _tier, _model = await chat_completion_with_fallback(
+            messages=[{"role": "user", "content": _TOPIC_EXTRACT_PROMPT.format(questions=questions_block)}],
+            temperature=0.0,
+            max_tokens=16,
+        )
+    except Exception as e:
+        logger.warning("[TOPIC EXTRACT] LLM call failed on all tiers, skipping topic label: %s", e)
+        return None
+
+    label = (raw or "").strip().strip(".\"'").strip()
+
+    # Confidence gate — reject anything that isn't a clean short label.
+    if not label or label.lower() in ("none", "unknown"):
+        return None
+    if len(label.split()) > 8:
+        return None
+    if any(ch in label for ch in ("\n", "{", "}", ":")):
+        return None
+
+    return label
 
 
 # ==========================================
@@ -742,22 +906,36 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
     messages.append({"role": "user", "content": question})
 
     try:
-        text_out = await chat_completion(
+        answer, tier, model_used = await chat_completion_with_fallback(
             messages=messages,
             temperature=0.2,
             max_tokens=180,
         )
-        answer = text_out.strip() if text_out else "I am having trouble formatting the response. Please try again."
-        logger.info("FINAL RESPONSE: %r", answer)
+        answer = answer.strip() if answer else "I am having trouble formatting the response. Please try again."
+        logger.info("FINAL RESPONSE: %r (tier=%s, model=%s)", answer, tier, model_used)
         logger.info("=" * 60)
         return answer
 
-    except httpx.HTTPStatusError as e:
-        logger.error("[LLM API] Status %s: %s", e.response.status_code, e.response.text)
-        return "I am having trouble accessing my AI engine. Please try again in a moment."
     except Exception as e:
-        logger.exception("[LLM API] Connection failure: %s", e)
-        return "The kiosk AI engine is currently experiencing connectivity issues. Please visit the Admin Block."
+        # ── Tier 3: both Local Qwen and Gemini failed — return the top
+        # retrieved RAG fact directly instead of an internal error. This is
+        # the "never crash, never show a stack trace" last resort — a plain,
+        # honest answer built straight from context_text rather than nothing.
+        logger.error("Local Qwen: FAILED")
+        logger.error("Gemini: FAILED (or disabled) — %s", e)
+        logger.info("Returning: Top RAG Answer")
+        top_fact = raw_results[0].get("text", "") if raw_results else ""
+        top_fact = _QA_LABEL_RE_LLM.sub("", top_fact).strip()
+        if top_fact:
+            answer = (
+                "I am currently unable to generate a conversational response, "
+                f"but based on the available RNSIT information: {top_fact}"
+            )
+        else:
+            answer = "The kiosk AI engine is currently experiencing connectivity issues. Please visit the Admin Block."
+        logger.info("FINAL RESPONSE: %r (tier=rag_only)", answer)
+        logger.info("=" * 60)
+        return answer
 
 
 # ==========================================
@@ -874,7 +1052,7 @@ async def _try_fetch_traffic(question: str) -> str | None:
 
 async def _handle_offtopic(question: str, history: list) -> tuple[str, str]:
     try:
-        raw = await chat_completion(
+        raw, _tier, _model = await chat_completion_with_fallback(
             messages=[
                 {"role": "system", "content": "You are a strict single-word classifier plus optional short answer generator."},
                 {"role": "user", "content": _OFFTOPIC_ROUTER_PROMPT.format(question=question)},
@@ -883,7 +1061,7 @@ async def _handle_offtopic(question: str, history: list) -> tuple[str, str]:
             max_tokens=120,
         )
     except Exception as e:
-        logger.warning("[ROUTER] Classification call failed (%s) — defaulting to RNSIT_UNKNOWN.", e)
+        logger.warning("[ROUTER] Classification call failed on all tiers (%s) — defaulting to RNSIT_UNKNOWN.", e)
         raw = "RNSIT_UNKNOWN"
 
     lines = (raw or "").strip().splitlines()

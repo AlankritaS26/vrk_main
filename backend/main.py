@@ -10,7 +10,6 @@ import uuid
 import shutil
 import logging
 import hashlib
-import httpx
 import string
 import re
 import asyncio
@@ -45,15 +44,17 @@ os.environ["BACKEND_URL"] = "http://127.0.0.1:8001"
 # Imports matching your async MongoDB database layout
 from backend.database import (
     get_kiosk_data,
-    save_session, save_interaction,
+    save_session, save_interaction, get_last_interaction, get_recent_interactions,
     update_face_seen, save_face_encoding, get_all_face_encodings,
     delete_face_by_name,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
-from backend.llm import initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response
+from backend.llm import (
+    initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
+    extract_topic_label,
+)
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
-from backend.tts import PREWARM_DONE
 
 try:
     from backend.detection import run_pipeline as _run_pipeline
@@ -105,6 +106,28 @@ DOMAINS_CORRECTIONS = {
     "libary":    "library",
     "placment":  "placement",
     "fees":      "fee",
+    # Common STT mis-hearings of "RNSIT" (the college's own name!) — these
+    # were silently NOT being fixed before: see the note further down
+    # where q_normalized is built vs. what actually got sent to RAG.
+    "rnsfit":    "rnsit",
+    "ransit":    "rnsit",
+    "rnscit":    "rnsit",
+    "arnsit":    "rnsit",
+    "rnsit's":   "rnsit",
+    "rnsits":    "rnsit",
+}
+
+# STT sometimes splits "RNSIT" across multiple tokens instead of mishearing
+# it as one word (e.g. "R N S fit", "run sit") — those can't be fixed by a
+# single-word dict lookup, so they're corrected as whole phrases BEFORE the
+# text is split into words.
+PHRASE_CORRECTIONS = {
+    "rns fit":     "rnsit",
+    "r n s fit":   "rnsit",
+    "run sit":     "rnsit",
+    "rn sit":      "rnsit",
+    "r and s fit": "rnsit",
+    "r n site":    "rnsit",
 }
 # --- REDIS / MEMURAI CACHING ---
 try:
@@ -157,7 +180,7 @@ async def _session_timeout_loop():
             if active_session and _last_activity_ts > 0:
                 idle = datetime.now().timestamp() - _last_activity_ts
                 if idle >= SESSION_TIMEOUT_SECONDS:
-                    logger.info(f"[SESSION] Timeout after {idle:.0f}s idle - ending session")
+                    logger.info(f"[SESSION] Timeout after {idle:.0f}s idle — ending session")
                     sid = active_session.get("session_id")
                     active_session    = None
                     _last_activity_ts = 0.0
@@ -237,6 +260,21 @@ _GREETING_RESPONSES = [
     "Hi there! I'm the RNSIT digital receptionist — what would you like to know?",
     "Hey! Welcome to RNS Institute of Technology. What can I help you with?",
 ]
+
+# ── Replies to the "continue with X, or something else?" re-engagement ──
+# These only carry meaning right after that specific greeting question,
+# so they're intercepted deterministically (see the awaiting_topic_choice
+# check in /ask) rather than being sent to RAG, where a bare "something
+# else" was scoring a coincidental similarity hit and coming back as
+# "I don't have that detail."
+TOPIC_DECLINE_PHRASES = {
+    "something else", "no", "nah", "not that", "different",
+    "something different", "new topic", "no thanks", "not really",
+}
+TOPIC_CONTINUE_PHRASES = {
+    "yes", "yeah", "yep", "sure", "continue", "yes please",
+    "that one", "ok continue", "please continue", "continue with that",
+}
 
 
 # ── Q/A label stripper ────────────────────────────────────────────────────
@@ -503,18 +541,8 @@ def _log_message(text: str, speaker: str) -> dict:
 # ==========================================
 @app.get("/health")
 def health():
-    """
-    Liveness probe for the launcher — and the fix for a real bug: this used
-    to report healthy the instant uvicorn was up, before TTS finished
-    pre-caching the fixed phrases (greeting, acknowledgments, farewell).
-    detection.py starts as soon as /health is green, so a visitor could be
-    recognized and greeted BEFORE the greeting audio was actually cached —
-    falling through to slow live synthesis. Now this waits (briefly, with a
-    hard cap so a genuinely broken TTS install can never block startup
-    forever) for that pre-warm to actually finish first.
-    """
-    PREWARM_DONE.wait(timeout=25)   # bounded — degrades gracefully, never hangs
-    return {"status": "healthy", "tts_prewarmed": PREWARM_DONE.is_set()}
+    """Liveness probe for the launcher and future monitoring."""
+    return {"status": "healthy"}
 
 
 @app.get("/")
@@ -541,6 +569,7 @@ async def proxy_to_rag(payload: QueryRequest):
         raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
 
     sid = active_session["session_id"] if active_session else "unknown"
+    fid = active_session.get("face_id") if active_session else None
 
     visitor_entry = _log_message(payload.query, "visitor")
     await manager.broadcast({"type": "message", **visitor_entry})
@@ -548,7 +577,7 @@ async def proxy_to_rag(payload: QueryRequest):
     answer = await query_rag_service(payload.query)
 
     try:
-        await save_interaction(sid, payload.query, answer)
+        await save_interaction(sid, payload.query, answer, face_id=fid)
     except Exception as exc:
         logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
 
@@ -946,38 +975,30 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
 
 INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
-import random as _random
+def build_greeting(name: str, is_returning: bool, resumed: bool,
+                    previous_topic: str | None = None) -> str:
+    """The exact spoken lines for first-time vs returning visitors.
 
-def build_greeting(name: str, is_returning: bool, resumed: bool) -> str:
-    """Spoken greeting — varied so it never sounds like a recording.
-
-    First visit explains what the kiosk is (so the visitor knows what to ask);
-    return visits are warmer and shorter. Each picks randomly from a few
-    phrasings, the way a real receptionist naturally varies their words."""
+    MEMORY-AWARE RE-ENGAGEMENT: when we resume a visitor's thread AND we
+    have a high-confidence topic label for their last stored question,
+    the greeting names that topic and asks (never assumes) whether they
+    want to continue with it. If no topic is available, we fall back to
+    the generic resumed-session line — we never guess or hallucinate a
+    previous topic.
+    """
     who = name if name and name not in ("Guest", "Unknown", "") else "there"
-
     if not is_returning:
-        # Fixed script (not randomized) so the ENTIRE line can be
-        # pre-synthesized once at server startup and served from cache —
-        # this is what makes the very first greeting instant instead of
-        # waiting on live TTS synthesis. If you change this text, also
-        # update the matching entry in tts.py's _PREWARM list.
-        return (f"Welcome to {INSTITUTE_NAME}. I am Voix Nova, your digital receptionist. "
-                f"I can help you with admissions, departments, placements, fees, and "
-                f"directions around campus. How may I assist you today?")
-
+        return (f"Welcome {who}! I am the digital receptionist of {INSTITUTE_NAME}. "
+                f"I can help you with admissions, departments, placements, fees, "
+                f"and finding your way around campus. How may I assist you today?")
     if resumed:
-        return _random.choice([
-            f"Welcome back, {who}! Good to see you again — shall we pick up where we left off?",
-            f"Hey {who}, welcome back! We can carry on from before. What would you like to know?",
-            f"Good to see you again, {who}! How can I help this time?",
-        ])
-
-    return _random.choice([
-        f"Welcome back, {who}! How can I help you today?",
-        f"Hi again, {who}! What can I do for you?",
-        f"Hello {who}, good to see you! How may I help?",
-    ])
+        if previous_topic:
+            return (f"Welcome back, {who}! Last time you were asking about "
+                    f"{previous_topic} — would you like to continue with that, "
+                    f"or help with something else today?")
+        return (f"Welcome back, {who}! Good to see you again. "
+                f"We can continue where we left off. How may I assist you today?")
+    return f"Welcome back, {who}! How may I assist you today?"
 
 
 async def resume_or_create_session(face_id: str, user_name: str,
@@ -992,6 +1013,7 @@ async def resume_or_create_session(face_id: str, user_name: str,
     resumed = False
     continued_from = None
     session_id = None
+    previous_topic = None
 
     if face_id:
         prev = await find_recent_session_by_face(face_id, days=30)
@@ -1004,6 +1026,29 @@ async def resume_or_create_session(face_id: str, user_name: str,
     if not session_id:
         session_id = str(uuid.uuid4())               # never face_id
 
+    # ── Memory-aware re-engagement: look up what they last asked about ──
+    # Pulls the last few (not just one) stored questions from their
+    # previous session so the topic summary covers everything they were
+    # asking about (e.g. "hostel facilities and fees"), not only their
+    # final message. Only attempted for resumed sessions; failures here
+    # are non-fatal and simply fall back to the generic greeting (see
+    # build_greeting).
+    if resumed:
+        try:
+            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=3)
+            recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
+            if recent_questions:
+                previous_topic = await extract_topic_label(recent_questions)
+                logger.info(
+                    "[SESSION] Re-engagement lookup: last_qs=%r -> topic=%r",
+                    recent_questions, previous_topic,
+                )
+            else:
+                logger.info("[SESSION] Re-engagement lookup: no prior interaction on file for face=%s session=%s", face_id, session_id)
+        except Exception as e:
+            logger.warning(f"[SESSION] Skipping re-engagement topic lookup: {e}")
+            previous_topic = None
+
     sess = {
         "session_id":   session_id,
         "user_name":    user_name,
@@ -1014,7 +1059,14 @@ async def resume_or_create_session(face_id: str, user_name: str,
         "asking_name":  False,
         "resumed":      resumed,
         "resumed_at":   datetime.now().isoformat(),
-        "greeting":     build_greeting(user_name, is_returning, resumed),
+        "previous_topic": previous_topic,
+        # True only when the greeting actually named a topic and asked a
+        # "continue with that, or something else?" question — the NEXT
+        # visitor reply, if it's a short accept/decline like "something
+        # else" or "yes", is about THAT offer, not a new RAG-worthy
+        # question, and must be intercepted before RAG (see /ask).
+        "awaiting_topic_choice": bool(previous_topic),
+        "greeting":     build_greeting(user_name, is_returning, resumed, previous_topic),
     }
 
     await save_session(session_id, face_id or None, user_name,
@@ -1074,36 +1126,9 @@ async def start_session(
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
-    """
-    BUG FIX: previously this cleared `active_session` unconditionally, even
-    when the caller's `session_id` didn't match the currently active one (or
-    was omitted). That's a real race: detection.py's own recheck loop and
-    the voice/conversation flow can both call this endpoint, and a stale
-    call arriving just after a NEW session has already started would wipe
-    out that new session instead of the one it actually meant to end —
-    which would then make detection.py (which cross-checks /session/current)
-    think ITS brand-new session was "ended elsewhere" and immediately drop
-    it. Now: if a session_id is supplied, it must match the active session,
-    otherwise the request is ignored (not an error — just a no-op, since the
-    thing it wanted to end is already gone).
-    """
     global active_session, _last_activity_ts
-
-    if active_session is None:
-        return {"status": "success", "note": "no active session"}
-
-    if session_id and active_session.get("session_id") != session_id:
-        logger.info(
-            f"[SESSION] Ignoring /session/end for session_id={session_id} — "
-            f"active session is {active_session.get('session_id')}"
-        )
-        return {
-            "status": "ignored",
-            "reason": "session_id mismatch (a newer session is active)",
-            "active_session_id": active_session.get("session_id"),
-        }
-
-    sid = active_session.get("session_id")
+    sid = session_id or (active_session["session_id"] if active_session else None)
+    
     active_session    = None
     _last_activity_ts = 0.0
     await manager.broadcast({"type": "session_end", "session_id": sid})
@@ -1160,106 +1185,47 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     q_clean = question.lower().strip()
     q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
 
+    # Multi-word mis-hearings (e.g. "r n s fit") first, then single-word
+    # ones — both feed into q_normalized, which is what's actually sent
+    # to retrieval below (see the "corrected_question" note further down).
+    for wrong_phrase, right_phrase in PHRASE_CORRECTIONS.items():
+        q_clean = re.sub(rf"(?:^|\s){re.escape(wrong_phrase)}(?:$|\s)", f" {right_phrase} ", q_clean)
+    q_clean = q_clean.strip()
+
     words           = q_clean.split()
     corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
     q_normalized    = " ".join(corrected_words)
 
     sid          = active_session["session_id"] if active_session else "unknown"
+    fid          = active_session.get("face_id") if active_session else None
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
     visitor_entry = _log_message(question, "visitor")
-    await manager.broadcast({"type": "message", "session_id": sid, **visitor_entry})
+    await manager.broadcast({"type": "message", **visitor_entry})
 
-    async def _respond(answer: str, source: str = "",
-                       is_farewell: bool = False) -> dict:
-        # STALE-ANSWER GUARD: a slow LLM reply can outlive the session that
-        # asked it (visitor said "thank you" and walked off). If the session
-        # changed while we were working, this answer belongs to nobody on
-        # screen — drop it instead of broadcasting into the NEXT visitor.
-        # (The farewell is exempt: it intentionally runs as the session ends.)
-        current_sid = active_session["session_id"] if active_session else None
-        if not is_farewell and sid != "unknown" and current_sid != sid:
-            logger.info(f"[ASK] Dropping stale answer for ended session "
-                        f"{sid[:8]} (current={str(current_sid)[:8]})")
-            return {"question": question, "answer": answer, "dropped": True}
-
+    async def _respond(answer: str, source: str = "", session_action: str = "CONTINUE") -> dict:
         try:
-            await save_interaction(sid, question, answer)
+            await save_interaction(sid, question, answer, face_id=fid)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
-        await manager.broadcast({"type": "message", "session_id": sid, **kiosk_entry})
-        result = {"question": question, "answer": answer, "session_id": sid}
+        await manager.broadcast({"type": "message", **kiosk_entry})
+        result = {"question": question, "answer": answer, "session_action": session_action}
         if source:
             result["source"] = source
         return result
 
-    # ─── Greeting → instant, deterministic reply (no RAG/LLM round-trip) ─────
-    # "Hi"/"Hello" used to be answered via RAG, which is what caused the
-    # "Hi Hi there! Welcome..." echo bug: a greeting isn't a fact lookup, it
-    # doesn't belong in the knowledge base, and it should never wait on an
-    # LLM call. Handled the same deterministic way as the goodbye phrases.
-    GREETING_PHRASES = {
-        "hi", "hello", "hey", "hiya", "yo",
-        "good morning", "good afternoon", "good evening",
-    }
-    if q_normalized in GREETING_PHRASES:
-        import random as _random2
-        reply = _random2.choice([
-            f"Hi{', ' + visitor_name if visitor_name != 'there' else ''}! What can I help you with?",
-            f"Hello{', ' + visitor_name if visitor_name != 'there' else ''}! How can I assist you today?",
-            f"Hey there! What would you like to know?",
-        ])
-        return await _respond(reply)
+    # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
+    if _matches_short_phrase(q_normalized, GREETING_PHRASES):
+        answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
+        logger.info("[ROUTE] GREETING (deterministic) — '%s'", q_normalized)
+        return await _respond(answer, source="greeting")
 
-    # ─── Thank you → end session immediately ─────────────────────────────────
-    # ── Easter eggs — deterministic, instant, no RAG/LLM round-trip ─────────
-    # This is the single thing visitors actually remember and tell their
-    # friends about. A few warm, self-aware replies to the questions people
-    # ask ANY assistant sooner or later.
-    import random as _random3
-    EASTER_EGGS = {
-        "are you a robot": [
-            "I'm a digital receptionist, so yes and no — no body, but I do the job!",
-            "Guilty as charged! But I promise I'm a friendly one.",
-        ],
-        "are you real": [
-            "Real enough to help you find the CSE block! I'm Voix Nova, RNSIT's digital receptionist.",
-        ],
-        "are you human": [
-            "Not quite — I'm Voix Nova, a digital receptionist. But I'll do my best to sound like one!",
-        ],
-        "tell me a joke": [
-            "Why did the student bring a ladder to class? To reach the higher studies!",
-            "What did the router say to the CSE student? Nothing, they just had a falling out over connection issues.",
-        ],
-        "who made you": [
-            "I was built by the students of RNSIT to help visitors like you find your way around!",
-        ],
-        "what is your name": [
-            "I'm Voix Nova, the digital receptionist here at RNSIT. Nice to meet you!",
-        ],
-        "who are you": [
-            "I'm Voix Nova — think of me as RNSIT's always-awake front desk.",
-        ],
-        "i love you": [
-            "That's sweet! I love helping visitors find their way around RNSIT too.",
-        ],
-        "do you sleep": [
-            "Never! I'm here whenever a visitor needs help, day or night.",
-        ],
-    }
-    for _trigger, _replies in EASTER_EGGS.items():
-        if _trigger in q_normalized:
-            return await _respond(_random3.choice(_replies))
-
+    # ─── Thank you / bye → end session immediately ──────────────────────────
     THANK_YOU_PHRASES = {
-        "thank you", "thanks", "thank u", "thankyou", "thank you so much",
+        "thank you", "thanks", "thank u", "thankyou",
         "ok thanks", "okay thanks", "ok thank you", "okay thank you",
-        "thats all", "thats all thanks", "that is all", "thats it", "that is it",
-        "bye", "bye bye", "goodbye", "good bye", "ok bye", "okay bye",
-        "see you", "see ya", "no thanks", "no thank you", "im done",
-        "i am done", "nothing else", "that would be all",
+        "thats all", "thats all thanks", "bye", "goodbye", "that is all",
     }
     if _matches_short_phrase(q_normalized, THANK_YOU_PHRASES):
         farewell = (
@@ -1274,8 +1240,72 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             "session_id": sid,
             "reason":     "thank_you",
         })
-        return await _respond(farewell, is_farewell=True)
         return await _respond(farewell, source="farewell", session_action="END")
+
+    # ─── "What was my last session about?" → answer from stored memory ──────
+    # Fixes the real gap: a visitor explicitly asking about their previous
+    # visit was previously falling through to RAG, scoring a coincidental
+    # similarity hit on unrelated FAQ chunks, and answering "I don't have
+    # that detail" — it never looked at the memory we already captured at
+    # session-resume time. This intercepts that class of question BEFORE
+    # RAG runs (same pattern as greetings/farewells above) and answers
+    # straight from active_session["previous_topic"], falling back to a
+    # fresh DB lookup if that wasn't set, and to an honest "no record"
+    # reply if neither exists — never inventing a topic.
+    MEMORY_RECALL_PHRASES = (
+        "last session", "last time", "previous session", "previous time",
+        "what did i ask", "what did we talk about", "what did i talk about",
+        "earlier session", "my last visit", "last visit",
+    )
+    if any(phrase in q_normalized for phrase in MEMORY_RECALL_PHRASES):
+        prev_topic = (active_session or {}).get("previous_topic")
+        if not prev_topic and active_session and (active_session.get("face_id") or active_session.get("session_id")):
+            try:
+                recent = await get_recent_interactions(
+                    session_id=active_session.get("session_id"),
+                    face_id=active_session.get("face_id"),
+                    limit=3,
+                )
+                recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
+                if recent_questions:
+                    prev_topic = await extract_topic_label(recent_questions)
+            except Exception as e:
+                logger.warning(f"[MEMORY RECALL] Lookup failed: {e}")
+
+        if prev_topic:
+            answer = (f"Last time you were asking about {prev_topic}. "
+                      f"Want me to continue with that, or help with something else?")
+        else:
+            answer = ("I don't have a record of an earlier session for you — "
+                      "this looks like the start of a fresh conversation. "
+                      "What would you like help with today?")
+        logger.info("[ROUTE] MEMORY_RECALL (deterministic) — '%s' -> topic=%r", q_normalized, prev_topic)
+        return await _respond(answer, source="memory_recall")
+
+    # ─── Reply to "continue with X, or something else?" re-engagement ───────
+    # Only fires for the ONE reply immediately following that greeting
+    # (awaiting_topic_choice is set at session-resume time and cleared the
+    # instant any reply arrives, whatever it is). A short accept/decline is
+    # answered directly; anything longer or unrecognized is treated as the
+    # visitor's real question and falls through to RAG normally.
+    if active_session and active_session.get("awaiting_topic_choice"):
+        active_session["awaiting_topic_choice"] = False  # applies to this one reply only
+        prev_topic = active_session.get("previous_topic")
+
+        if _matches_short_phrase(q_normalized, TOPIC_DECLINE_PHRASES):
+            answer = "Sure! What would you like help with today?"
+            logger.info("[ROUTE] TOPIC_CHOICE_DECLINE (deterministic) — '%s'", q_normalized)
+            return await _respond(answer, source="topic_choice_decline")
+
+        if _matches_short_phrase(q_normalized, TOPIC_CONTINUE_PHRASES):
+            if prev_topic:
+                answer = f"Great, let's continue with {prev_topic}. What would you like to know?"
+            else:
+                answer = "Sure, what would you like to know?"
+            logger.info("[ROUTE] TOPIC_CHOICE_CONTINUE (deterministic) — '%s'", q_normalized)
+            return await _respond(answer, source="topic_choice_continue")
+        # else: not a short accept/decline — treat as a real question and
+        # fall straight through to the normal pipeline below.
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
@@ -1302,12 +1332,42 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         if m.get("index") != visitor_entry.get("index")
     ]
 
+    # Fallback/apology-shaped answers are NEVER cached at the normal 1-hour
+    # TTL. Without this guard, a question asked during a temporary outage
+    # (RAGService down, LLM down) gets its "I don't know" answer cached as
+    # if it were correct, and keeps serving that same apology for an hour
+    # even after everything recovers — exactly what happened with "where is
+    # canteen" during a RAGService outage tonight.
+    _UNCACHEABLE_PATTERNS = (
+        "i don't have that detail",
+        "temporarily unavailable",
+        "having trouble accessing",
+        "having trouble processing",
+        "having trouble formatting",
+        "connectivity issues",
+        "couldn't generate a conversational response",   # Tier-3 degraded answer
+    )
+
+    def _is_cacheable(ans: str) -> bool:
+        a = (ans or "").lower()
+        return not any(p in a for p in _UNCACHEABLE_PATTERNS)
+
     try:
-        answer = await generate_rag_kiosk_response(question, history=recent_history)
+        # THE FIX: q_normalized already has DOMAINS_CORRECTIONS/PHRASE_
+        # CORRECTIONS applied (typos, and STT mis-hearings of "RNSIT"
+        # itself) but was previously only used for greeting/farewell/
+        # memory-recall matching — RAG retrieval was still getting the
+        # raw, uncorrected `question`, so a misheard "RNSFIT" never got
+        # normalized back to "RNSIT" before the embedding search ran.
+        answer = await generate_rag_kiosk_response(q_normalized, history=recent_history)
 
         if redis_client and answer:
             try:
-                redis_client.set(cache_key, answer, ex=3600)
+                if _is_cacheable(answer):
+                    redis_client.set(cache_key, answer, ex=3600)
+                else:
+                    logger.info("[REDIS] Skipped caching a fallback/apology answer "
+                               "(would have poisoned this question for 1 hour): %r", answer[:80])
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
 
