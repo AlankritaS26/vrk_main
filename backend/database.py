@@ -67,15 +67,26 @@ async def save_session(session_id: str, face_id: str | None, user_name: str,
     except Exception as e:
         logger.error(f"Error tracking session: {e}")
 
-async def save_interaction(session_id: str, question: str, answer: str):
-    """Logs individual conversational components directly into cloud transactions."""
+async def save_interaction(session_id: str, question: str, answer: str, face_id: str | None = None):
+    """
+    Logs individual conversational components directly into cloud transactions.
+
+    Also stamps `face_id` (the PERSON, not the visit-thread) when available,
+    so history can be recovered by face_id even if session_id ever gets
+    fragmented (e.g. a question landing before a session was fully
+    established, previously silently logged under session_id="unknown"
+    and orphaned forever). face_id is the durable identity to key off.
+    """
     try:
-        await interactions_collection.insert_one({
+        doc = {
             "session_id": session_id,
             "input_text": question,
             "response_text": answer,
-            "timestamp": datetime.now().isoformat()
-        })
+            "timestamp": datetime.now().isoformat(),
+        }
+        if face_id:
+            doc["face_id"] = face_id
+        await interactions_collection.insert_one(doc)
     except Exception as e:
         logger.error(f"Error logging conversational interaction: {e}")
 
@@ -182,6 +193,58 @@ async def find_recent_session_by_face(face_id: str, days: int = 30):
     except Exception as e:
         logger.error(f"[DB] find_recent_session_by_face failed: {e}")
         return None
+
+
+async def get_last_interaction(session_id: str):
+    """
+    Returns the single most recent stored {question, answer, timestamp}
+    for a given session_id, or None if nothing is on file. Kept for the
+    explicit "what was my last session about" recall route in main.py.
+    Reads the LITERAL last question straight from Mongo (no LLM, no
+    guessing) — either a real prior question exists or it doesn't.
+    """
+    if not session_id:
+        return None
+    try:
+        return await interactions_collection.find_one(
+            {"session_id": session_id},
+            sort=[("timestamp", -1)],
+        )
+    except Exception as e:
+        logger.error(f"[DB] get_last_interaction failed: {e}")
+        return None
+
+
+async def get_recent_interactions(session_id: str | None = None, face_id: str | None = None, limit: int = 3):
+    """
+    Returns up to `limit` most recent stored interactions, OLDEST first
+    (chronological order) — used to summarize the *topics* of a visitor's
+    previous session(s) for the "welcome back, last time you were asking
+    about X" greeting, rather than just echoing their final message.
+
+    Prefers `face_id` when given: it's the durable per-person identity,
+    so it finds a visitor's real history even across any session_id
+    fragmentation (e.g. a stray interaction that got logged under
+    session_id="unknown" because no session was active yet at that
+    moment — that Q&A is otherwise permanently orphaned from the
+    session-based lookup). Falls back to session_id only if no face_id
+    is available. Empty list if nothing is on file; never guesses.
+    """
+    if not face_id and not session_id:
+        return []
+    try:
+        query = {"face_id": face_id} if face_id else {"session_id": session_id}
+        cursor = interactions_collection.find(
+            query,
+            sort=[("timestamp", -1)],
+            limit=limit,
+        )
+        docs = [doc async for doc in cursor]
+        docs.reverse()  # oldest first, so the topic summary reads naturally
+        return docs
+    except Exception as e:
+        logger.error(f"[DB] get_recent_interactions failed: {e}")
+        return []
 
 
 async def touch_session(session_id: str):
