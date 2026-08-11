@@ -1,11 +1,29 @@
+# Python
 venv/
-node_modules/
 __pycache__/
 *.pyc
-.env
-faces/
-*.log
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Node
+node_modules/
 frontend/build/
+
+# Secrets / Environment
+.env
+
+# Local editors and OS files
 .vscode/
-requirements.lock.txt
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Data and generated assets
+faces/
 RAGService/data/vectorstore/
+
+# Dependency lock files
+requirements.lock.txt
