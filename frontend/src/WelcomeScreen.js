@@ -53,9 +53,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [name, setName] = useState('');
   const [saveData, setSaveData] = useState(true);
   const [submitted, setSubmitted] = useState(false);
-  const [deleteMode, setDeleteMode] = useState(false);
-  const [deleteName, setDeleteName] = useState('');
-  const [deleted, setDeleted] = useState(false);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
     'Try asking: "What courses does RNSIT offer?"',
@@ -516,7 +514,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // through TTS so the visitor can barge in. echoCancellation on the mic
     // stream (kioskMic.js) is what keeps it from hearing its own voice.
     isSpeaking.current = true;
-    setStatus('speaking');
 
     const finish = () => {
       if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
@@ -526,15 +523,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (isMounted.current) startListening();
     };
 
-    const fireStart = () => { if (onStart) { onStart(); onStart = null; } };
+    // Visual "speaking" state (mouth animation, waves, badge) is set here —
+    // NOT above, at speak()-call-time — so Aria only *looks* like she's
+    // talking once audio has actually started (or is about to, for the
+    // scheduled Web Audio clip). This removes the visible lag between the
+    // avatar animating and sound actually being heard.
+    const fireStart = () => {
+      setStatus('speaking');
+      if (onStart) { onStart(); onStart = null; }
+    };
 
     // Fallback: robotic browser voice, only if backend TTS is unavailable
     const browserSpeak = () => {
-      fireStart();
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = 'en-US';
       utter.rate = 1.0;
       utter.volume = 1;
+      utter.onstart = fireStart;   // flip to 'speaking' exactly when the voice engine actually starts
       utter.onend = finish;
       utter.onerror = finish;
       window.speechSynthesis.speak(utter);
@@ -588,7 +593,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
           resolve();
         };
-        fireStart();                     // text appears the moment audio starts
+        fireStart();                     // avatar + text flip to "speaking" right as this clip is scheduled
         const at = Math.max(pctx.currentTime, playCursorRef.current);
         node.start(at);
         playCursorRef.current = at + buf.duration;
@@ -707,16 +712,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setSubmitted(true);
     try {
       await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) + '&save=' + finalSave, { method: 'POST' });
-    } catch (e) { console.error(e); }
-  };
-
-  const handleDeleteData = async () => {
-    const trimmed = deleteName.trim();
-    if (!trimmed) return;
-    try {
-      await fetch(BACKEND + '/visitor/delete_my_data?name=' + encodeURIComponent(trimmed), { method: 'POST' });
-      setDeleted(true);
-      setTimeout(() => { setDeleteMode(false); setDeleted(false); setDeleteName(''); }, 3500);
     } catch (e) { console.error(e); }
   };
 
@@ -894,6 +889,43 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
+  const renderedMessages = messages.map((msg, i) => {
+    const isAria = msg.speaker === 'kiosk';
+    const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
+    return (
+      <div key={i} style={{
+        display: 'flex', flexDirection: 'column',
+        alignItems: isAria ? 'flex-start' : 'flex-end',
+        marginTop: prevSame ? '2px' : '8px'
+      }}>
+        {!prevSame && (
+          <span style={{
+            fontSize: '10px', color: '#bbb', marginBottom: '2px',
+            paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
+          }}>
+            {isAria ? 'Aria' : visitorName}
+          </span>
+        )}
+        <div className="msg-in" style={{
+          maxWidth: '88%', padding: '8px 12px',
+          borderRadius: isAria
+            ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
+            : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
+          background: isAria ? '#ffffff' : '#1a237e',
+          color: isAria ? '#1a1a1a' : '#ffffff',
+          fontSize: '13.5px', lineHeight: '1.5',
+          boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+          wordBreak: 'break-word'
+        }}>
+          {msg.text}
+          <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
+            {msg.timestamp}
+          </span>
+        </div>
+      </div>
+    );
+  });
+
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
@@ -901,40 +933,70 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }}>
 
       {/* ── MODALS ── */}
-      {deleteMode && (
-        <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
+      {privacyOpen && (
+        <div onClick={e => e.target === e.currentTarget && setPrivacyOpen(false)}
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '420px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
-            {deleted ? (
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-                </div>
-                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted</div>
-                <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed.</p>
+          <div style={{ background: '#fff', borderRadius: '20px', padding: '36px', width: '460px', maxHeight: '80vh', overflowY: 'auto', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '18px' }}>
+              <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2">
+                  <path d="M12 2 4 6v6c0 5 3.5 9 8 10 4.5-1 8-5 8-10V6l-8-4z" />
+                  <path d="M9 12l2 2 4-4" />
+                </svg>
               </div>
-            ) : (<>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-                <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>
-                </div>
-                <div>
-                  <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
-                  <div style={{ fontSize: '12px', color: '#999' }}>This cannot be undone</div>
-                </div>
+              <div>
+                <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
+                <div style={{ fontSize: '12px', color: '#999' }}>How Aria sees and remembers you</div>
               </div>
-              <p style={{ color: '#666', marginBottom: '16px', fontSize: '14px', lineHeight: '1.6' }}>Enter your registered name to permanently remove your face data.</p>
-              <input style={inputStyle} placeholder="Your registered name" value={deleteName} onChange={e => setDeleteName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
-              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
-                <button onClick={() => setDeleteMode(false)} style={btnSecondary}>Cancel</button>
-                <button onClick={handleDeleteData} style={{ ...btnPrimary, background: '#c62828' }}>Delete Permanently</button>
-              </div>
-            </>)}
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              {[
+                {
+                  icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
+                  title: 'The camera is only used to greet you',
+                  body: 'The kiosk camera looks for a face so Aria knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
+                },
+                {
+                  icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
+                  title: 'Face data is saved only if you say yes',
+                  body: 'When you\u2019re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Aria can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
+                },
+                {
+                  icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
+                  title: 'Conversations are used only to help you',
+                  body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\u2019t used for advertising or shared outside the institute.'
+                },
+                {
+                  icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
+                  title: 'Your session ends automatically',
+                  body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
+                },
+              ].map((item, i) => (
+                <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
+                    {item.icon}
+                  </svg>
+                  <div>
+                    <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
+                    <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
+              Questions about your data? Speak to a staff member at the Admin Block.
+            </p>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
+              <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
+            </div>
           </div>
         </div>
       )}
 
-      {askingName && !deleteMode && (
+      {askingName && !privacyOpen && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '440px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
             {submitted ? (
@@ -1007,7 +1069,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
             </div>
           </div>
-          <button onClick={() => setDeleteMode(d => !d)}
+          <button onClick={() => setPrivacyOpen(o => !o)}
             style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
             ⚙ Privacy
           </button>
@@ -1101,44 +1163,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               </div>
             )}
 
-            {messages.map((msg, i) => {
-              const isAria = msg.speaker === 'kiosk';
-              const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
-              return (
-                <div key={i} style={{
-                  display: 'flex', flexDirection: 'column',
-                  alignItems: isAria ? 'flex-start' : 'flex-end',
-                  marginTop: prevSame ? '2px' : '8px'
-                }}>
-                  {!prevSame && (
-                    <span style={{
-                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
-                      paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
-                    }}>
-                      {isAria ? 'Aria' : visitorName}
-                    </span>
-                  )}
-                  <div className="msg-in" style={{
-                    maxWidth: '88%', padding: '8px 12px',
-                    borderRadius: isAria
-                      ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
-                      : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-                    background: isAria ? '#ffffff' : '#1a237e',
-                    color: isAria ? '#1a1a1a' : '#ffffff',
-                    fontSize: '13.5px', lineHeight: '1.5',
-                    boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
-                    wordBreak: 'break-word'
-                  }}>
-                    {msg.text}
-                    <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
-                      {msg.timestamp}
-                    </span>
-                  </div>
-                </div>
-              );
-            })}
+              {renderedMessages}
 
-              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+                {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
                   while idle (not mid-question). Turns "answer machine" into
                   something that keeps the conversation moving — tapping a
                   chip routes through the SAME sendToBackend() pipeline as a
@@ -1176,6 +1203,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   </div>
                 </div>
               )}
+
               {liveText && (
                 <>
                   <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
