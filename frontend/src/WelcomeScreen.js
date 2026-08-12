@@ -70,6 +70,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
+  const rnsLogo = `${process.env.PUBLIC_URL}/rnslogo.png`;
 
   const visitorName = session?.user_name || 'Guest';
   const isReturning = session?.is_returning || false;
@@ -1055,8 +1056,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT"
-            style={{ height: '36px', objectFit: 'contain', filter: 'brightness(0) invert(1)', opacity: 0.9 }} />
+          <img src={rnsLogo} onError={e => { e.currentTarget.src = '/logo192.png'; e.currentTarget.style.filter = 'none'; }} alt="RNSIT Logo"
+            style={{ height: '40px', width: 'auto', objectFit: 'contain', filter: 'none', opacity: 1 }} />
           <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
             RNS Institute of Technology
             <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
@@ -1156,8 +1157,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
 
             {messages.length === 0 && !liveText && status !== 'processing' && (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '30px 12px', textAlign: 'center' }}>
-                <div style={{ fontSize: '36px', lineHeight: 1 }}>💬</div>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '20px 12px', textAlign: 'center' }}>
+                <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT Logo"
+                  style={{ width: '120px', height: 'auto', objectFit: 'contain', opacity: 0.95, filter: 'drop-shadow(0 10px 20px rgba(26,35,126,0.18))' }} />
                 <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Aria will appear here</div>
                 <div style={{ fontSize: '12px', color: '#c5cae9' }}>Just speak — she&apos;s ready</div>
               </div>
