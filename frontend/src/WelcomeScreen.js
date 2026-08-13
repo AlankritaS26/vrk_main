@@ -55,9 +55,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [name, setName] = useState('');
   const [saveData, setSaveData] = useState(true);
   const [submitted, setSubmitted] = useState(false);
-  const [deleteMode, setDeleteMode] = useState(false);
-  const [deleteName, setDeleteName] = useState('');
-  const [deleted, setDeleted] = useState(false);
+  const [privacyOpen, setPrivacyOpen] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
     'Try asking: "What courses does RNSIT offer?"',
@@ -825,15 +823,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch (e) { console.error(e); }
   };
 
-  const handleDeleteData = async () => {
-    const trimmed = deleteName.trim();
-    if (!trimmed) return;
-    try {
-      await fetch(BACKEND + '/visitor/delete_my_data?name=' + encodeURIComponent(trimmed), { method: 'POST' });
-      setDeleted(true);
-      setTimeout(() => { setDeleteMode(false); setDeleted(false); setDeleteName(''); }, 3500);
-    } catch (e) { console.error(e); }
-  };
+
 
   const inputStyle = {
     width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
@@ -1016,40 +1006,70 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }}>
 
       {/* ── MODALS ── */}
-      {deleteMode && (
-        <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
+      {privacyOpen && (
+        <div onClick={e => e.target === e.currentTarget && setPrivacyOpen(false)}
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '420px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
-            {deleted ? (
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+          <div style={{ background: '#fff', borderRadius: '20px', padding: '36px', width: '460px', maxHeight: '80vh', overflowY: 'auto', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '18px' }}>
+              <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2">
+                  <path d="M12 2 4 6v6c0 5 3.5 9 8 10 4.5-1 8-5 8-10V6l-8-4z" />
+                      <path d="M9 12l2 2 4-4" />
+                    </svg>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
+                    <div style={{ fontSize: '12px', color: '#999' }}>How Aria sees and remembers you</div>
+                  </div>
                 </div>
-                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted</div>
-                <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed.</p>
-              </div>
-            ) : (<>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
-                <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  {[
+                    {
+                      icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
+                      title: 'The camera is only used to greet you',
+                      body: 'The kiosk camera looks for a face so Aria knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
+                    },
+                    {
+                      icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
+                      title: 'Face data is saved only if you say yes',
+                      body: 'When you\'re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Aria can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
+                    },
+                    {
+                      icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
+                      title: 'Conversations are used only to help you',
+                      body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\'t used for advertising or shared outside the institute.'
+                    },
+                    {
+                      icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
+                      title: 'Your session ends automatically',
+                      body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
+                    },
+                  ].map((item, i) => (
+                    <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
+                        {item.icon}
+                      </svg>
+                      <div>
+                        <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
+                        <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
+                      </div>
+                    </div>
+                  ))}
                 </div>
-                <div>
-                  <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
-                  <div style={{ fontSize: '12px', color: '#999' }}>This cannot be undone</div>
-                </div>
-              </div>
-              <p style={{ color: '#666', marginBottom: '16px', fontSize: '14px', lineHeight: '1.6' }}>Enter your registered name to permanently remove your face data.</p>
-              <input style={inputStyle} placeholder="Your registered name" value={deleteName} onChange={e => setDeleteName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
-              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
-                <button onClick={() => setDeleteMode(false)} style={btnSecondary}>Cancel</button>
-                <button onClick={handleDeleteData} style={{ ...btnPrimary, background: '#c62828' }}>Delete Permanently</button>
-              </div>
-            </>)}
+
+                <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
+                  Questions about your data? Speak to a staff member at the Admin Block.
+                </p>
+
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
+              <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
+            </div>
           </div>
         </div>
       )}
 
-      {askingName && !deleteMode && (
+      {askingName && !privacyOpen && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '440px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
             {submitted ? (
@@ -1108,8 +1128,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT"
-            style={{ height: '36px', objectFit: 'contain', filter: 'brightness(0) invert(1)', opacity: 0.9 }} />
+          <img src="/rnslogo.png" alt="RNSIT"
+            style={{ height: '40px', width: '40px', objectFit: 'contain' }} />
           <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
             RNS Institute of Technology
             <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
@@ -1122,9 +1142,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
             </div>
           </div>
-          <button onClick={() => setDeleteMode(d => !d)}
+          <button onClick={() => setPrivacyOpen(o => !o)}
             style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
-            ⚙ Privacy
+            🔒 Privacy
           </button>
         </div>
       </header>
@@ -1209,8 +1229,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
 
             {messages.length === 0 && !liveText && status !== 'processing' && (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '30px 12px', textAlign: 'center' }}>
-                <div style={{ fontSize: '36px', lineHeight: 1 }}>💬</div>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '30px 12px', textAlign: 'center' }}>
+                <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT Logo"
+                  style={{ width: '120px', height: 'auto', objectFit: 'contain', opacity: 0.95, filter: 'drop-shadow(0 10px 20px rgba(26,35,126,0.18))' }} />
                 <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Aria will appear here</div>
                 <div style={{ fontSize: '12px', color: '#c5cae9' }}>Just speak — she&apos;s ready</div>
               </div>
