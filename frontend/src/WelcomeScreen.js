@@ -3,31 +3,6 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
-// Tiny async queue: push() from the SSE reader as sentences arrive,
-// next() from the playback loop to consume them — next() waits (via a
-// pending Promise) if nothing has arrived yet, so the playback loop can
-// stay simple ("await the next sentence") instead of polling.
-function makeSentenceQueue() {
-  const items = [];
-  let waiting = null;      // resolve function for a pending next() call
-  let closed = false;
-  return {
-    push(item) {
-      if (waiting) { const w = waiting; waiting = null; w(item); }
-      else items.push(item);
-    },
-    close() {
-      closed = true;
-      if (waiting) { const w = waiting; waiting = null; w(null); }
-    },
-    next() {
-      if (items.length) return Promise.resolve(items.shift());
-      if (closed) return Promise.resolve(null);
-      return new Promise((resolve) => { waiting = resolve; });
-    },
-  };
-}
-
 export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
@@ -35,6 +10,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
+  const awaitingAnswerRef = useRef(false);     // true from "ack started" until the real answer's speech starts/fails —
+                                               // keeps status at 'processing' (not 'ready') through that gap
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
@@ -54,11 +31,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
-  // True from the moment the acknowledgment ("Sure, let me check that for
-  // you.") starts until the real /ask answer is ready to speak. Lets the
-  // ack's onDone below know whether it finished BEFORE the real answer
-  // arrived (RAG/LLM still in flight) or the answer already pre-empted it.
-  const awaitingAnswerRef = useRef(false);
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -83,7 +55,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [name, setName] = useState('');
   const [saveData, setSaveData] = useState(true);
   const [submitted, setSubmitted] = useState(false);
-  const [privacyOpen, setPrivacyOpen] = useState(false);
+  const [deleteMode, setDeleteMode] = useState(false);
+  const [deleteName, setDeleteName] = useState('');
+  const [deleted, setDeleted] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
     'Try asking: "What courses does RNSIT offer?"',
@@ -100,7 +74,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
-  const rnsLogo = `${process.env.PUBLIC_URL}/rnslogo.png`;
 
   const visitorName = session?.user_name || 'Guest';
   const isReturning = session?.is_returning || false;
@@ -123,7 +96,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   useEffect(() => {
     if (scrollRef.current)
       scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, liveText]);
+  }, [messages, liveText, processingHint]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -193,6 +166,26 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       text, speaker,
       timestamp: new Date().toLocaleTimeString()
     }]);
+  }, [setMessages]);
+
+  // Starts an EMPTY kiosk bubble and returns an appender that grows it one
+  // sentence at a time (used by sendToBackend + speakStream's onSentence so
+  // the bubble fills in exactly as fast as the voice speaks it).
+  const startProgressiveMessage = useCallback((speaker) => {
+    setMessages(prev => [...prev, {
+      text: '', speaker,
+      timestamp: new Date().toLocaleTimeString()
+    }]);
+    return (sentence) => {
+      setMessages(prev => {
+        if (!prev.length) return prev;
+        const next = prev.slice();
+        const last = next[next.length - 1];
+        const sep = last.text ? ' ' : '';
+        next[next.length - 1] = { ...last, text: cleanText(last.text + sep + sentence) };
+        return next;
+      });
+    };
   }, [setMessages]);
 
   // ── WAVEFORM ─────────────────────────────────────────────────────────────
@@ -431,191 +424,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [status, askingName]);
 
+  // speakStream(text, { onStart, onSentence, onDone }):
+  //   - onStart fires once, the moment the FIRST clip's audio starts playing
+  //     (kept for callers that just want a single "speech began" hook, e.g.
+  //     the ack bubble / farewell / greeting).
+  //   - onSentence(sentenceText, index) fires once PER CLIP, exactly when
+  //     that clip's audio starts playing — this is what keeps the on-screen
+  //     text in sync with what's actually being heard, instead of dumping
+  //     the whole answer the moment the first sentence starts.
+  //   - onDone fires once, when playback finishes (or is interrupted/falls
+  //     back to the browser voice).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const sendToBackend = useCallback(async (text) => {
-    if (!text) return;
-    setLiveText('');
-    setProcessingHint('');
-    const sid = session?.session_id || 'guest';
-    addMessage(text, 'user');
-
-    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
-    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
-      const farewells = [
-        'You are most welcome! Have a wonderful day. Goodbye!',
-        'Happy to help! Take care and have a great day.',
-        'Anytime! Wishing you a lovely day ahead. Goodbye!',
-        'My pleasure! All the best, and see you around campus.',
-      ];
-      const farewell = farewells[Math.floor(Math.random() * farewells.length)];
-      micRef.current?.pause();
-      farewellPlayingRef.current = true;     // protect this audio from the session_end stop
-
-      // Switch to the goodbye screen NOW so the farewell voice plays OVER it
-      // (they should appear together). The audio uses Web Audio, which keeps
-      // playing across this component unmounting — and farewellPlayingRef
-      // keeps the session_end handler from stopping it. We clear the flag
-      // when the voice actually finishes.
-      speak(farewell, null, () => { farewellPlayingRef.current = false; });
-      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
-      window.dispatchEvent(new Event('vrk-session-ended'));   // goodbye screen appears now
-      return;
-    }
-
-    // INSTANT ACKNOWLEDGMENT: a real receptionist reacts the moment you
-    // finish speaking — not after a silent pause. We play a short filler
-    // right away while the actual answer is still being fetched, so there's
-    // never dead air with a spinner. Kept short so it doesn't collide with
-    // the real answer. Skipped for very short/greeting-like inputs.
-    //
-    // BUG THIS FIXES: speak()'s finish() always calls setStatus('ready')
-    // when a clip ends. The ack clip is short (~1.5-2s); the RAG/LLM round
-    // trip behind it regularly takes 5-9s (see backend/llm.py's Gemini
-    // fallback path). So the ack would finish, status would drop to
-    // 'ready' (avatar goes idle — no mouth movement, no "thinking" glow),
-    // and the kiosk would sit there visibly silent/idle for the remaining
-    // several seconds before the real answer suddenly started playing.
-    // That's the "doesn't speak for ~5 seconds then starts speaking" gap.
-    // Fix: once the ack finishes, if the real answer isn't back yet, push
-    // status to 'processing' instead of 'ready' so the avatar keeps
-    // showing "still working on it" for the whole wait, not just the ack.
-    awaitingAnswerRef.current = true;
-    const acks = [
-      'Sure, let me check that for you.',
-      'Good question — one moment.',
-      'Let me look that up for you.',
-      'Of course, just a second.',
-      'Right, let me find that.',
-    ];
-    if (text.split(' ').length >= 3) {
-      const ack = acks[Math.floor(Math.random() * acks.length)];
-      // Show it as a transient indicator bubble too — otherwise the visitor
-      // sees nothing at all while the real answer is being fetched, which
-      // is exactly the "left confused, feels frozen" problem.
-      speak(ack, () => setProcessingHint(ack), () => {
-        if (awaitingAnswerRef.current) setStatus('processing');
-      });
-    }
-
-    // 35 s hard cap — prevents status getting stuck at 'processing' if the
-    // LLM is slow or the network drops after the request was sent.
-    const askController = new AbortController();
-    const askTimeout = setTimeout(() => askController.abort(), 35000);
-    try {
-      fetch(BACKEND + '/message', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
-      });
-
-      // STREAMING: /ask/stream sends the answer as Server-Sent Events, one
-      // sentence at a time, as soon as each is ready — instead of one big
-      // JSON blob only once the ENTIRE answer has finished generating.
-      // Feed sentences into `queue` as they arrive; speakStream (below)
-      // consumes the queue and starts playing sentence 1 the moment it's
-      // ready, without waiting for sentence 2+ to exist yet. See
-      // backend/main.py's ask_kiosk_stream and backend/llm.py's
-      // generate_rag_kiosk_response_stream for the server side of this.
-      const queue = makeSentenceQueue();
-      let doneMeta = null;
-      let streamErr = null;
-      let messageShown = false;
-
-      // Shows the kiosk's chat bubble the moment we actually know the full
-      // text — NOT after all audio finishes playing. Audio playback takes
-      // as long as it takes to speak the whole answer (several seconds for
-      // a multi-sentence reply); the text itself is usually fully known
-      // seconds before that, once the network stream ends. Without this,
-      // the visitor could only LISTEN and had nothing to read until the
-      // kiosk stopped talking — exactly backwards from what streaming was
-      // supposed to fix.
-      const showAnswer = (ans) => {
-        if (messageShown || !ans) return;
-        messageShown = true;
-        addMessage(ans, 'kiosk');
-      };
-
-      const pump = (async () => {
-        try {
-          const res = await fetch(BACKEND + '/ask/stream?question=' + encodeURIComponent(text),
-            { signal: askController.signal });
-          if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
-          const reader = res.body.getReader();
-          const decoder = new TextDecoder();
-          let buf = '';
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buf += decoder.decode(value, { stream: true });
-            let idx;
-            while ((idx = buf.indexOf('\n\n')) !== -1) {
-              const rawEvent = buf.slice(0, idx);
-              buf = buf.slice(idx + 2);
-              const dataLine = rawEvent.split('\n').find(l => l.startsWith('data:'));
-              if (!dataLine) continue;
-              let payload;
-              try { payload = JSON.parse(dataLine.slice(5).trim()); } catch (e) { continue; }
-              if (payload.sentence) queue.push(payload.sentence);
-              if (payload.done) doneMeta = payload;
-            }
-          }
-        } catch (e) {
-          streamErr = e;
-        } finally {
-          queue.close();
-        }
-      })();
-
-      // Fires as soon as the network stream ends (text fully known) —
-      // runs CONCURRENTLY with speakStream's (much longer) audio playback
-      // below, not after it.
-      pump.then(() => {
-        const liveSid = sessionRef.current?.session_id || 'guest';
-        if (liveSid !== sid) return;   // stale — don't show a dead session's answer
-        if (doneMeta && doneMeta.answer) showAnswer(doneMeta.answer);
-      });
-
-      awaitingAnswerRef.current = false;
-      const spokenText = await speakStream(queue, () => setProcessingHint(''));
-      await pump;   // make sure the reader loop (and thus doneMeta) has settled
-      clearTimeout(askTimeout);
-
-      // STALE-ANSWER GUARD — same purpose as the old one: if the session
-      // changed while this was streaming (visitor left, next one arrived),
-      // this answer belongs to nobody on screen anymore.
-      const liveSid = sessionRef.current?.session_id || 'guest';
-      if (liveSid !== sid) {
-        console.info('[sendToBackend] dropped stale streamed answer for', sid);
-        return;
-      }
-
-      if (streamErr && !doneMeta) throw streamErr;   // nothing usable came through at all
-
-      // Normally already shown by the pump.then() above, well before this
-      // point — this is just the safety net for the rare case doneMeta
-      // never arrived (e.g. the "done" event itself got dropped) but
-      // speakStream still managed to speak something.
-      const answer = (doneMeta && doneMeta.answer) || spokenText ||
-        'Sorry, I do not have that information. Please visit the Admin Block.';
-      showAnswer(answer);
-      // NOTE: unlike the old /ask flow, we do NOT also POST /message for the
-      // kiosk's answer here — backend/main.py's ask_kiosk_stream already
-      // logs and broadcasts it server-side (see _finish() there), so doing
-      // it again here would double up the chat history.
-    } catch (e) {
-      clearTimeout(askTimeout);
-      awaitingAnswerRef.current = false;
-      setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
-      console.error('[sendToBackend]', e);
-      const fallback = e.name === 'AbortError'
-        ? "I'm sorry, that's taking longer than expected. Please try asking again."
-        : 'Sorry, something went wrong. Please try again.';
-      speak(fallback, () => addMessage(fallback, 'kiosk'));
-    }
-  }, [session, addMessage]);
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speak = useCallback(async (text, onStart, onDone) => {
+  const speakStream = useCallback(async (text, { onStart, onSentence, onDone } = {}) => {
     // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
     // (e.g. an acknowledgment like "let me check that" that hasn't finished
     // yet) before starting this one. Without this, two clips play at once —
@@ -630,32 +450,44 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // through TTS so the visitor can barge in. echoCancellation on the mic
     // stream (kioskMic.js) is what keeps it from hearing its own voice.
     isSpeaking.current = true;
+    // NOTE: status is intentionally NOT set to 'speaking' here. Setting it
+    // this early makes the avatar (and anything else keyed off `status`)
+    // start its "speaking" animation before any audio has actually started
+    // playing — e.g. right after the network answer arrives, while TTS is
+    // still being fetched/synthesized. That reads as the avatar "speaking"
+    // before the voice/text actually show up. It's set inside fireStart()
+    // below instead, at the exact moment the first clip's audio begins.
 
     const finish = () => {
       if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
       isSpeaking.current = false;
-      setStatus('ready');
+      if (isMounted.current) startListening();   // resume mic for barge-in regardless
+      // Only settle on 'ready' if there's genuinely nothing left to do. If
+      // this was the instant-acknowledgment ("let me check that for you")
+      // finishing before the real answer has arrived, go back to
+      // 'processing' instead — otherwise the avatar sits idle/ready for a
+      // few seconds while the kiosk is still actually working, which reads
+      // as "did it hear me?" to the visitor. startListening() above may
+      // have just set 'ready' synchronously; this runs right after and wins.
+      setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
       if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
-      if (isMounted.current) startListening();
     };
 
-    // Visual "speaking" state (mouth animation, waves, badge) is set here —
-    // NOT above, at speak()-call-time — so Aria only *looks* like she's
-    // talking once audio has actually started (or is about to, for the
-    // scheduled Web Audio clip). This removes the visible lag between the
-    // avatar animating and sound actually being heard.
     const fireStart = () => {
-      setStatus('speaking');
+      setStatus('speaking');    // avatar flips to "speaking" exactly when audio starts
       if (onStart) { onStart(); onStart = null; }
     };
 
-    // Fallback: robotic browser voice, only if backend TTS is unavailable
+    // Fallback: robotic browser voice, only if backend TTS is unavailable.
+    // No per-sentence audio boundaries here, so the full text reveals at once
+    // (still correct: it's the moment THIS voice actually starts talking).
     const browserSpeak = () => {
+      fireStart();
+      if (onSentence) { try { onSentence(text, 0); } catch (e) {} }
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = 'en-US';
       utter.rate = 1.0;
       utter.volume = 1;
-      utter.onstart = fireStart;   // flip to 'speaking' exactly when the voice engine actually starts
       utter.onend = finish;
       utter.onerror = finish;
       window.speechSynthesis.speak(utter);
@@ -693,28 +525,45 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
 
-    const playClip = (b64) => new Promise(async (resolve) => {
-      if (activeSpeakIdRef.current !== myId) return resolve();   // interrupted before this clip started
+    // playClip resolves once the clip's audio has actually STARTED (not once
+    // it finishes) — the caller loop awaits it just long enough to fire
+    // onSentence in sync, then moves on to prefetch/schedule the next clip.
+    // Playback itself is scheduled back-to-back on playCursorRef regardless,
+    // so audio stays gapless even though we don't await full playback here.
+    const playClip = (b64, sentenceText, sentenceIndex) => new Promise(async (resolveStarted) => {
+      if (activeSpeakIdRef.current !== myId) return resolveStarted();   // interrupted before this clip started
       try {
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         const buf = await pctx.decodeAudioData(bytes.buffer);
-        if (activeSpeakIdRef.current !== myId) return resolve();  // interrupted while decoding
+        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
         const node = pctx.createBufferSource();
         node.buffer = buf;
         node.connect(ttsGainRef.current);
         activeNodesRef.current.push(node);
         node.onended = () => {
           activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-          resolve();
         };
-        fireStart();                     // avatar + text flip to "speaking" right as this clip is scheduled
+
         const at = Math.max(pctx.currentTime, playCursorRef.current);
+        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
         node.start(at);
         playCursorRef.current = at + buf.duration;
+
+        // Fire onStart/onSentence exactly when THIS clip's audio begins —
+        // if it's scheduled to start later than "now" (queued behind an
+        // earlier clip that's still playing), wait for that moment instead
+        // of firing immediately, so text and voice stay in lockstep.
+        const announce = () => {
+          fireStart();                                     // status + first-clip-only hook
+          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) {} }
+          resolveStarted();
+        };
+        if (delayMs > 0) setTimeout(announce, delayMs);
+        else announce();
       } catch (e) {
-        resolve();                       // any decode failure -> skip clip
+        resolveStarted();                       // any decode failure -> skip clip
       }
     });
 
@@ -753,8 +602,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         sentences.shift();
       }
 
-      // Prefetch two chunks ahead — playback almost never waits on synthesis
+      // Prefetch two chunks ahead — playback almost never waits on synthesis.
+      // Each playClip() resolves as soon as ITS audio starts (see above), so
+      // this loop moves to fetching/queuing the next chunk immediately, while
+      // the actual audio for every chunk still plays back-to-back via the
+      // shared playCursorRef — sound stays gapless, text reveal stays synced.
       let anyPlayed = false;
+      let lastClipPromise = Promise.resolve();
       let p0 = fetchClip(sentences[0]);
       let p1 = sentences.length > 1 ? fetchClip(sentences[1]) : null;
 
@@ -763,11 +617,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         const b64 = await p0;
         p0 = p1;
         p1 = i + 2 < sentences.length ? fetchClip(sentences[i + 2]) : null;
-        if (b64) { anyPlayed = true; await playClip(b64); }
+        if (b64) {
+          anyPlayed = true;
+          lastClipPromise = playClip(b64, sentences[i], i);
+          await lastClipPromise;
+        }
       }
 
       if (activeSpeakIdRef.current !== myId) return;    // interrupted — don't fall back to browser voice
       if (!anyPlayed) { browserSpeak(); return; }
+
+      // Wait for the actual audio (not just the "started" signal) of the
+      // final scheduled clip before calling finish() — otherwise finish()
+      // (and startListening()) can fire while the last sentence is still
+      // being heard.
+      const lastEnd = playCursorRef.current;
+      const remainingMs = Math.max(0, (lastEnd - pctx.currentTime) * 1000);
+      await lastClipPromise;
+      if (remainingMs > 0) await new Promise(r => setTimeout(r, remainingMs));
+      if (activeSpeakIdRef.current !== myId) return;
       finish();
     } catch (e) {
       if (activeSpeakIdRef.current !== myId) return;
@@ -776,147 +644,131 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [startListening]);
 
-  // Streaming sibling of speak() — consumes sentences from a queue (see
-  // makeSentenceQueue) as they arrive over the network instead of a
-  // precomputed array, so playback of sentence 1 can start the instant
-  // it's ready rather than waiting for the whole answer to finish
-  // generating first. This is what actually shortens the "why is there a
-  // silent gap before she starts talking" delay — speak()'s existing
-  // sentence-pipeline only ever got to help AFTER the full answer already
-  // came back from the backend; this lets it start working DURING
-  // generation instead.
-  //
-  // Same Web Audio/finish/fireStart/browserSpeak shape as speak() — kept
-  // as a separate function rather than merged in, since speak() takes a
-  // known, complete string up front and this takes an open-ended stream;
-  // forcing both through one signature would have made speak() itself
-  // harder to follow for the (still far more common) non-streaming case.
-  //
-  // Prefetch depth here is ONE sentence ahead, not two like speak() — we
-  // simply don't know sentence N+2 yet until the network delivers it, so
-  // there's nothing further to prefetch. In practice this still removes
-  // essentially all dead air: the network's own delivery pace is normally
-  // the bottleneck long before a single sentence's ~200-400ms TTS synth
-  // time would be.
-  //
-  // Returns the full reconstructed text once done, so the caller can log/
-  // display it without having tracked every chunk itself.
+  // Thin wrapper over speakStream for callers that don't need per-sentence
+  // sync (ack bubble, farewell, greeting, error fallback) — same (onStart,
+  // onDone) signature as before.
+  const speak = useCallback((text, onStart, onDone) => (
+    speakStream(text, { onStart, onDone })
+  ), [speakStream]);
+
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speakStream = useCallback(async (queue, onStart, onDone) => {
-    if (isSpeaking.current) interruptSpeaking();
-    window.speechSynthesis.cancel();
-    const myId = Symbol('speakStream');
-    activeSpeakIdRef.current = myId;
-    isSpeaking.current = true;
+  const sendToBackend = useCallback(async (text) => {
+    if (!text) return;
+    setLiveText('');
+    setProcessingHint('');
+    const sid = session?.session_id || 'guest';
+    addMessage(text, 'user');
 
-    let accumulatedText = '';
+    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
+    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
+      const farewells = [
+        'You are most welcome! Have a wonderful day. Goodbye!',
+        'Happy to help! Take care and have a great day.',
+        'Anytime! Wishing you a lovely day ahead. Goodbye!',
+        'My pleasure! All the best, and see you around campus.',
+      ];
+      const farewell = farewells[Math.floor(Math.random() * farewells.length)];
+      micRef.current?.pause();
+      farewellPlayingRef.current = true;     // protect this audio from the session_end stop
 
-    const finish = () => {
-      if (activeSpeakIdRef.current !== myId) return;
-      isSpeaking.current = false;
-      setStatus('ready');
-      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
-      if (isMounted.current) startListening();
-    };
+      // Switch to the goodbye screen NOW so the farewell voice plays OVER it
+      // (they should appear together). The audio uses Web Audio, which keeps
+      // playing across this component unmounting — and farewellPlayingRef
+      // keeps the session_end handler from stopping it. We clear the flag
+      // when the voice actually finishes.
+      speak(farewell, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
+      window.dispatchEvent(new Event('vrk-session-ended'));   // goodbye screen appears now
+      return;
+    }
 
-    const fireStart = () => {
-      setStatus('speaking');
-      if (onStart) { onStart(); onStart = null; }
-    };
+    // Set BEFORE the ack fires: from this point until the real answer's
+    // speech actually starts (or the request fails/is dropped), finish()
+    // in speakStream will treat any in-between "ready" moment (e.g. the ack
+    // finishing early) as still 'processing' — see awaitingAnswerRef above.
+    awaitingAnswerRef.current = true;
 
-    const browserSpeak = () => {
-      const utter = new SpeechSynthesisUtterance(accumulatedText);
-      utter.lang = 'en-US';
-      utter.rate = 1.0;
-      utter.volume = 1;
-      utter.onstart = fireStart;
-      utter.onend = finish;
-      utter.onerror = finish;
-      window.speechSynthesis.speak(utter);
-    };
+    // INSTANT ACKNOWLEDGMENT: a real receptionist reacts the moment you
+    // finish speaking — not after a silent pause. We play a short filler
+    // right away while the actual answer is still being fetched, so there's
+    // never dead air with a spinner. Kept short so it doesn't collide with
+    // the real answer. Skipped for very short/greeting-like inputs.
+    const acks = [
+      'Sure, let me check that for you.',
+      'Good question — one moment.',
+      'Let me look that up for you.',
+      'Of course, just a second.',
+      'Right, let me find that.',
+    ];
+    if (text.split(' ').length >= 3) {
+      const ack = acks[Math.floor(Math.random() * acks.length)];
+      // Show it as a transient indicator bubble too — otherwise the visitor
+      // sees nothing at all while the real answer is being fetched, which
+      // is exactly the "left confused, feels frozen" problem.
+      speak(ack, () => setProcessingHint(ack));
+    }
 
-    const fetchClip = (s) =>
-      fetch(BACKEND + '/tts', {
+    // 35 s hard cap — prevents status getting stuck at 'processing' if the
+    // LLM is slow or the network drops after the request was sent.
+    const askController = new AbortController();
+    const askTimeout = setTimeout(() => askController.abort(), 35000);
+    try {
+      const [, askRes] = await Promise.all([
+        fetch(BACKEND + '/message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
+        }),
+        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text),
+          { signal: askController.signal })
+      ]);
+      clearTimeout(askTimeout);
+      const data = await askRes.json();
+
+      // STALE-ANSWER GUARD: if the session changed while this request was in
+      // flight (visitor said goodbye and left, next visitor arrived), this
+      // answer belongs to nobody on screen — drop it so it never bleeds into
+      // the next person's session.
+      const liveSid = sessionRef.current?.session_id || 'guest';
+      if (data.dropped || liveSid !== sid) {
+        console.info('[sendToBackend] dropped stale answer for', sid);
+        awaitingAnswerRef.current = false;
+        isSpeaking.current = false;
+        setStatus('ready');
+        return;
+      }
+
+      const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
+      fetch(BACKEND + '/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: s })
-      }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
+        body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
+      });
 
-    if (!playCtxRef.current) {
-      playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    const pctx = playCtxRef.current;
-    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
-    if (pctx.state === 'suspended') {
-      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice once the stream finishes.');
-      // Still have to drain the queue so accumulatedText is complete before falling back.
-      for (let s = await queue.next(); s !== null; s = await queue.next()) accumulatedText += s;
-      browserSpeak();
-      return accumulatedText;
-    }
-    playCursorRef.current = pctx.currentTime;
-    if (!ttsGainRef.current) {
-      ttsGainRef.current = pctx.createGain();
-      ttsGainRef.current.connect(pctx.destination);
-    }
-    ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
-    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
-
-    const playClip = (b64) => new Promise(async (resolve) => {
-      if (activeSpeakIdRef.current !== myId) return resolve();
-      try {
-        const bin = atob(b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const buf = await pctx.decodeAudioData(bytes.buffer);
-        if (activeSpeakIdRef.current !== myId) return resolve();
-        const node = pctx.createBufferSource();
-        node.buffer = buf;
-        node.connect(ttsGainRef.current);
-        activeNodesRef.current.push(node);
-        node.onended = () => {
-          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-          resolve();
-        };
-        fireStart();
-        const at = Math.max(pctx.currentTime, playCursorRef.current);
-        node.start(at);
-        playCursorRef.current = at + buf.duration;
-      } catch (e) {
-        resolve();
-      }
-    });
-
-    try {
-      let anyPlayed = false;
-      let currentSentence = await queue.next();
-      let currentClipPromise = currentSentence ? fetchClip(currentSentence) : null;
-
-      while (currentSentence !== null) {
-        if (activeSpeakIdRef.current !== myId) break;
-        accumulatedText += currentSentence;
-        const b64 = await currentClipPromise;
-        // Wait for the network to deliver the NEXT sentence, then kick off
-        // its TTS fetch right away so it overlaps with this sentence's
-        // playback below instead of happening after it.
-        const nextSentence = await queue.next();
-        const nextClipPromise = nextSentence ? fetchClip(nextSentence) : null;
-        if (b64) { anyPlayed = true; await playClip(b64); }
-        currentSentence = nextSentence;
-        currentClipPromise = nextClipPromise;
-      }
-
-      if (activeSpeakIdRef.current !== myId) return accumulatedText;
-      if (!anyPlayed) { browserSpeak(); return accumulatedText; }
-      finish();
-      return accumulatedText;
+      // Text and voice move together: an empty kiosk bubble opens the
+      // instant speech begins, then grows one sentence at a time — each
+      // sentence appears exactly when its audio starts playing, never
+      // before. No more "reveal the whole answer as soon as it's fetched".
+      let appendSentence = null;
+      speakStream(answer, {
+        onStart: () => {
+          awaitingAnswerRef.current = false;   // real answer is speaking now — resting state is 'ready' again
+          setProcessingHint('');
+          appendSentence = startProgressiveMessage('kiosk');
+        },
+        onSentence: (sentence) => { if (appendSentence) appendSentence(sentence); },
+      });
     } catch (e) {
-      if (activeSpeakIdRef.current !== myId) return accumulatedText;
-      console.error('[TTS stream] backend unavailable, using browser voice', e);
-      browserSpeak();
-      return accumulatedText;
+      clearTimeout(askTimeout);
+      awaitingAnswerRef.current = false;
+      setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
+      console.error('[sendToBackend]', e);
+      const fallback = e.name === 'AbortError'
+        ? "I'm sorry, that's taking longer than expected. Please try asking again."
+        : 'Sorry, something went wrong. Please try again.';
+      speak(fallback, () => addMessage(fallback, 'kiosk'));
     }
-  }, [startListening]);
+  }, [session, addMessage, speakStream, startProgressiveMessage]);
 
   useEffect(() => {
     if (askingName) return;
@@ -970,6 +822,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setSubmitted(true);
     try {
       await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) + '&save=' + finalSave, { method: 'POST' });
+    } catch (e) { console.error(e); }
+  };
+
+  const handleDeleteData = async () => {
+    const trimmed = deleteName.trim();
+    if (!trimmed) return;
+    try {
+      await fetch(BACKEND + '/visitor/delete_my_data?name=' + encodeURIComponent(trimmed), { method: 'POST' });
+      setDeleted(true);
+      setTimeout(() => { setDeleteMode(false); setDeleted(false); setDeleteName(''); }, 3500);
     } catch (e) { console.error(e); }
   };
 
@@ -1147,43 +1009,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
-  const renderedMessages = messages.map((msg, i) => {
-    const isAria = msg.speaker === 'kiosk';
-    const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
-    return (
-      <div key={i} style={{
-        display: 'flex', flexDirection: 'column',
-        alignItems: isAria ? 'flex-start' : 'flex-end',
-        marginTop: prevSame ? '2px' : '8px'
-      }}>
-        {!prevSame && (
-          <span style={{
-            fontSize: '10px', color: '#bbb', marginBottom: '2px',
-            paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
-          }}>
-            {isAria ? 'Aria' : visitorName}
-          </span>
-        )}
-        <div className="msg-in" style={{
-          maxWidth: '88%', padding: '8px 12px',
-          borderRadius: isAria
-            ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
-            : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-          background: isAria ? '#ffffff' : '#1a237e',
-          color: isAria ? '#1a1a1a' : '#ffffff',
-          fontSize: '13.5px', lineHeight: '1.5',
-          boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
-          wordBreak: 'break-word'
-        }}>
-          {msg.text}
-          <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
-            {msg.timestamp}
-          </span>
-        </div>
-      </div>
-    );
-  });
-
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
@@ -1191,70 +1016,40 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }}>
 
       {/* ── MODALS ── */}
-      {privacyOpen && (
-        <div onClick={e => e.target === e.currentTarget && setPrivacyOpen(false)}
+      {deleteMode && (
+        <div onClick={e => e.target === e.currentTarget && setDeleteMode(false)}
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '20px', padding: '36px', width: '460px', maxHeight: '80vh', overflowY: 'auto', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '18px' }}>
-              <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
-                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2">
-                  <path d="M12 2 4 6v6c0 5 3.5 9 8 10 4.5-1 8-5 8-10V6l-8-4z" />
-                  <path d="M9 12l2 2 4-4" />
-                </svg>
-              </div>
-              <div>
-                <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
-                <div style={{ fontSize: '12px', color: '#999' }}>How Aria sees and remembers you</div>
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              {[
-                {
-                  icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
-                  title: 'The camera is only used to greet you',
-                  body: 'The kiosk camera looks for a face so Aria knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
-                },
-                {
-                  icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
-                  title: 'Face data is saved only if you say yes',
-                  body: 'When you\u2019re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Aria can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
-                },
-                {
-                  icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
-                  title: 'Conversations are used only to help you',
-                  body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\u2019t used for advertising or shared outside the institute.'
-                },
-                {
-                  icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
-                  title: 'Your session ends automatically',
-                  body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
-                },
-              ].map((item, i) => (
-                <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
-                    {item.icon}
-                  </svg>
-                  <div>
-                    <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
-                    <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
-                  </div>
+          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '420px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
+            {deleted ? (
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8f5e9', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
+                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#43a047" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
                 </div>
-              ))}
-            </div>
-
-            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-              Questions about your data? Speak to a staff member at the Admin Block.
-            </p>
-
-            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
-              <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
-            </div>
+                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>Data Deleted</div>
+                <p style={{ color: '#666', marginTop: '8px', fontSize: '14px' }}>Your face data has been permanently removed.</p>
+              </div>
+            ) : (<>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '16px' }}>
+                <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#ffebee', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#c62828" strokeWidth="2"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14H6L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4h6v2" /></svg>
+                </div>
+                <div>
+                  <div style={{ fontSize: '17px', fontWeight: '700', color: '#c62828' }}>Delete My Data</div>
+                  <div style={{ fontSize: '12px', color: '#999' }}>This cannot be undone</div>
+                </div>
+              </div>
+              <p style={{ color: '#666', marginBottom: '16px', fontSize: '14px', lineHeight: '1.6' }}>Enter your registered name to permanently remove your face data.</p>
+              <input style={inputStyle} placeholder="Your registered name" value={deleteName} onChange={e => setDeleteName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleDeleteData()} autoFocus />
+              <div style={{ display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '20px' }}>
+                <button onClick={() => setDeleteMode(false)} style={btnSecondary}>Cancel</button>
+                <button onClick={handleDeleteData} style={{ ...btnPrimary, background: '#c62828' }}>Delete Permanently</button>
+              </div>
+            </>)}
           </div>
         </div>
       )}
 
-      {askingName && !privacyOpen && (
+      {askingName && !deleteMode && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
           <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '440px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
             {submitted ? (
@@ -1313,8 +1108,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <img src={rnsLogo} onError={e => { e.currentTarget.src = '/logo192.png'; e.currentTarget.style.filter = 'none'; }} alt="RNSIT Logo"
-            style={{ height: '40px', width: 'auto', objectFit: 'contain', filter: 'none', opacity: 1 }} />
+          <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT"
+            style={{ height: '36px', objectFit: 'contain', filter: 'brightness(0) invert(1)', opacity: 0.9 }} />
           <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
             RNS Institute of Technology
             <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
@@ -1327,7 +1122,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
             </div>
           </div>
-          <button onClick={() => setPrivacyOpen(o => !o)}
+          <button onClick={() => setDeleteMode(d => !d)}
             style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
             ⚙ Privacy
           </button>
@@ -1414,17 +1209,51 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
 
             {messages.length === 0 && !liveText && status !== 'processing' && (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '20px 12px', textAlign: 'center' }}>
-                <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT Logo"
-                  style={{ width: '120px', height: 'auto', objectFit: 'contain', opacity: 0.95, filter: 'drop-shadow(0 10px 20px rgba(26,35,126,0.18))' }} />
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '10px', padding: '30px 12px', textAlign: 'center' }}>
+                <div style={{ fontSize: '36px', lineHeight: 1 }}>💬</div>
                 <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Aria will appear here</div>
                 <div style={{ fontSize: '12px', color: '#c5cae9' }}>Just speak — she&apos;s ready</div>
               </div>
             )}
 
-              {renderedMessages}
+            {messages.map((msg, i) => {
+              const isAria = msg.speaker === 'kiosk';
+              const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
+              return (
+                <div key={i} style={{
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: isAria ? 'flex-start' : 'flex-end',
+                  marginTop: prevSame ? '2px' : '8px'
+                }}>
+                  {!prevSame && (
+                    <span style={{
+                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
+                      paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
+                    }}>
+                      {isAria ? 'Aria' : visitorName}
+                    </span>
+                  )}
+                  <div className="msg-in" style={{
+                    maxWidth: '88%', padding: '8px 12px',
+                    borderRadius: isAria
+                      ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
+                      : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
+                    background: isAria ? '#ffffff' : '#1a237e',
+                    color: isAria ? '#1a1a1a' : '#ffffff',
+                    fontSize: '13.5px', lineHeight: '1.5',
+                    boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+                    wordBreak: 'break-word'
+                  }}>
+                    {msg.text}
+                    <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
+                      {msg.timestamp}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
 
-                {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
                   while idle (not mid-question). Turns "answer machine" into
                   something that keeps the conversation moving — tapping a
                   chip routes through the SAME sendToBackend() pipeline as a
@@ -1462,39 +1291,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   </div>
                 </div>
               )}
-
               {liveText && (
-                <>
-                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                    <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                      {liveText}
-                    </div>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
+                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                    {liveText}
                   </div>
-                  <div style={{
-                    background: '#fff', borderRadius: '14px 14px 14px 4px', padding: '10px 14px',
-                    boxShadow: '0 1px 3px rgba(0,0,0,0.08)', display: 'flex', gap: '4px', alignItems: 'center'
-                  }}>
-                    <span className="td" style={{ '--d': '0ms' }} />
-                    <span className="td" style={{ '--d': '160ms' }} />
-                    <span className="td" style={{ '--d': '320ms' }} />
-                  </div>
-                </>
-              )}
-
-            {/* live speech text */}
-            {liveText && (
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
-                <span style={{ fontSize: '10px', color: '#bbb', marginBottom: '2px', paddingRight: '6px', fontWeight: '600' }}>{visitorName}</span>
-                <div style={{
-                  maxWidth: '88%', padding: '8px 12px', borderRadius: '14px 14px 4px 14px',
-                  background: 'rgba(26,35,126,0.07)', color: '#3949ab', fontSize: '13px',
-                  fontStyle: 'italic', lineHeight: '1.5', border: '1.5px dashed #9fa8da'
-                }}>
-                  {liveText}
                 </div>
-              </div>
-            )}
+              )}
           </div>
 
           {/* voice footer */}
@@ -1649,5 +1453,3 @@ const AriaAvatar = ({ size = 38, speaking = false }) => (
     </div>
   </div>
 );
-
-// Dynamic header status text
