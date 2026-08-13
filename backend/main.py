@@ -25,7 +25,7 @@ from contextlib import asynccontextmanager
 import redis
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
@@ -51,6 +51,7 @@ from backend.database import (
 )
 from backend.llm import (
     initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
+    generate_rag_kiosk_response_stream,
     extract_topic_label,
 )
 from backend.stt import transcribe_audio, transcribe_pcm
@@ -275,6 +276,64 @@ TOPIC_CONTINUE_PHRASES = {
     "yes", "yeah", "yep", "sure", "continue", "yes please",
     "that one", "ok continue", "please continue", "continue with that",
 }
+
+# ── Farewell markers ──────────────────────────────────────────────────────
+# THANK_YOU_PHRASES used to be declared inline inside the /ask endpoint;
+# moved up here (module scope) so _is_farewell (also module scope) can see
+# it, and so it sits alongside the other deterministic-route phrase sets.
+THANK_YOU_PHRASES = {
+    "thank you", "thanks", "thank u", "thankyou",
+    "ok thanks", "okay thanks", "ok thank you", "okay thank you",
+    "thats all", "thats all thanks", "bye", "goodbye", "that is all",
+}
+
+# THANK_YOU_PHRASES (below, used with the strict <=4-word _matches_short_
+# phrase check) only ever caught bare "bye"/"thank you"-style utterances.
+# Real visitors close a conversation in much longer, more natural ways —
+# "Okay, nice talking to you.", "It was really nice talking to you. We'll
+# meet you next time.", "That's it." — none of which matched, so those
+# sessions never ended: the visitor's sign-off got treated as a fresh
+# question, routed all the way through RAG/LLM (slow, and often answered
+# with an irrelevant "I don't have that detail"), and the kiosk just sat
+# there still "listening" instead of closing out.
+#
+# FAREWELL_MARKERS below catches those natural sign-offs as substrings
+# (word-boundary matched) without the 4-word cap, since a closing remark is
+# reliably short and distinctive even when the whole sentence isn't. It's
+# intentionally still a fixed marker list (not "contains bye anywhere") so
+# a genuine campus question is never misrouted.
+FAREWELL_MARKERS = {
+    "nice talking", "nice chatting", "great talking", "great chatting",
+    "lovely talking", "meet you next time", "see you next time",
+    "see you later", "see you soon", "catch you later", "catch you next time",
+    "thats it", "that's it", "thats all", "that's all",
+    "no more questions", "nothing else", "no other questions",
+    "im done", "i am done", "im good", "im all set", "all set thanks",
+    "gotta go", "got to go", "have to go", "need to go", "i should go",
+    "ok bye", "okay bye", "alright bye", "bye bye", "gtg",
+}
+
+
+def _is_farewell(q_normalized: str) -> bool:
+    """
+    True for both the strict short farewells in THANK_YOU_PHRASES and the
+    longer, natural sign-off phrasings in FAREWELL_MARKERS. See the
+    FAREWELL_MARKERS comment above for why the two need different length
+    rules. Capped at 15 words even for markers so a long, unrelated
+    question that happens to contain one of these short phrases deep
+    inside it doesn't get misrouted as a goodbye.
+    """
+    q = (q_normalized or "").strip()
+    if not q:
+        return False
+    if _matches_short_phrase(q, THANK_YOU_PHRASES):
+        return True
+    if len(q.split()) > 15:
+        return False
+    for marker in FAREWELL_MARKERS:
+        if re.search(rf"(?:^|\s){re.escape(marker)}(?:$|\s)", q):
+            return True
+    return False
 
 
 # ── Q/A label stripper ────────────────────────────────────────────────────
@@ -1173,6 +1232,120 @@ async def post_message(payload: MessagePayload):
 # ==========================================
 # CORE WORKFLOW ROUTING ENGINE (ASK)
 # =========================================
+# Fallback/apology-shaped answers are NEVER cached at the normal 1-hour
+# TTL. Without this guard, a question asked during a temporary outage
+# (RAGService down, LLM down) gets its "I don't know" answer cached as
+# if it were correct, and keeps serving that same apology for an hour
+# even after everything recovers — exactly what happened with "where is
+# canteen" during a RAGService outage tonight.
+# Module-level (was previously defined inline inside ask_kiosk) so both
+# /ask and /ask/stream share the exact same cacheability rule.
+_UNCACHEABLE_PATTERNS = (
+    "i don't have that detail",
+    "temporarily unavailable",
+    "having trouble accessing",
+    "having trouble processing",
+    "having trouble formatting",
+    "connectivity issues",
+    "couldn't generate a conversational response",   # Tier-3 degraded answer
+)
+
+
+def _is_cacheable(ans: str) -> bool:
+    a = (ans or "").lower()
+    return not any(p in a for p in _UNCACHEABLE_PATTERNS)
+
+
+async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
+    """
+    All the fast, deterministic pre-RAG routes — greeting, farewell,
+    memory-recall, and topic-choice reply — factored out of ask_kiosk so
+    /ask and /ask/stream take EXACTLY the same fast path for these and can
+    never drift apart. Performs whatever side effects each route needs
+    (session-state mutation, the farewell's session_end broadcast) itself,
+    since those don't depend on which endpoint is asking.
+
+    Returns (answer, source, session_action) if one of these matched, or
+    None if the question needs the real RAG/LLM pipeline.
+    """
+    global active_session, _last_activity_ts
+
+    # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
+    if _matches_short_phrase(q_normalized, GREETING_PHRASES):
+        answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
+        logger.info("[ROUTE] GREETING (deterministic) — '%s'", q_normalized)
+        return answer, "greeting", "CONTINUE"
+
+    # ─── Thank you / bye / natural sign-off → end session immediately ───────
+    if _is_farewell(q_normalized):
+        farewell = (
+            f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
+            "Have a great day. Goodbye!"
+        )
+        logger.info("[ROUTE] FAREWELL (deterministic) — '%s'", q_normalized)
+        active_session    = None
+        _last_activity_ts = 0.0
+        await manager.broadcast({
+            "type":       "session_end",
+            "session_id": sid,
+            "reason":     "thank_you",
+        })
+        return farewell, "farewell", "END"
+
+    # ─── "What was my last session about?" → answer from stored memory ──────
+    MEMORY_RECALL_PHRASES = (
+        "last session", "last time", "previous session", "previous time",
+        "what did i ask", "what did we talk about", "what did i talk about",
+        "earlier session", "my last visit", "last visit",
+    )
+    if any(phrase in q_normalized for phrase in MEMORY_RECALL_PHRASES):
+        prev_topic = (active_session or {}).get("previous_topic")
+        if not prev_topic and active_session and (active_session.get("face_id") or active_session.get("session_id")):
+            try:
+                recent = await get_recent_interactions(
+                    session_id=active_session.get("session_id"),
+                    face_id=active_session.get("face_id"),
+                    limit=3,
+                )
+                recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
+                if recent_questions:
+                    prev_topic = await extract_topic_label(recent_questions)
+            except Exception as e:
+                logger.warning(f"[MEMORY RECALL] Lookup failed: {e}")
+
+        if prev_topic:
+            answer = (f"Last time you were asking about {prev_topic}. "
+                      f"Want me to continue with that, or help with something else?")
+        else:
+            answer = ("I don't have a record of an earlier session for you — "
+                      "this looks like the start of a fresh conversation. "
+                      "What would you like help with today?")
+        logger.info("[ROUTE] MEMORY_RECALL (deterministic) — '%s' -> topic=%r", q_normalized, prev_topic)
+        return answer, "memory_recall", "CONTINUE"
+
+    # ─── Reply to "continue with X, or something else?" re-engagement ───────
+    if active_session and active_session.get("awaiting_topic_choice"):
+        active_session["awaiting_topic_choice"] = False  # applies to this one reply only
+        prev_topic = active_session.get("previous_topic")
+
+        if _matches_short_phrase(q_normalized, TOPIC_DECLINE_PHRASES):
+            answer = "Sure! What would you like help with today?"
+            logger.info("[ROUTE] TOPIC_CHOICE_DECLINE (deterministic) — '%s'", q_normalized)
+            return answer, "topic_choice_decline", "CONTINUE"
+
+        if _matches_short_phrase(q_normalized, TOPIC_CONTINUE_PHRASES):
+            if prev_topic:
+                answer = f"Great, let's continue with {prev_topic}. What would you like to know?"
+            else:
+                answer = "Sure, what would you like to know?"
+            logger.info("[ROUTE] TOPIC_CHOICE_CONTINUE (deterministic) — '%s'", q_normalized)
+            return answer, "topic_choice_continue", "CONTINUE"
+        # else: not a short accept/decline — treat as a real question and
+        # fall straight through to the normal pipeline.
+
+    return None
+
+
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     global _last_activity_ts, active_session
@@ -1215,97 +1388,13 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             result["source"] = source
         return result
 
-    # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
-    if _matches_short_phrase(q_normalized, GREETING_PHRASES):
-        answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
-        logger.info("[ROUTE] GREETING (deterministic) — '%s'", q_normalized)
-        return await _respond(answer, source="greeting")
-
-    # ─── Thank you / bye → end session immediately ──────────────────────────
-    THANK_YOU_PHRASES = {
-        "thank you", "thanks", "thank u", "thankyou",
-        "ok thanks", "okay thanks", "ok thank you", "okay thank you",
-        "thats all", "thats all thanks", "bye", "goodbye", "that is all",
-    }
-    if _matches_short_phrase(q_normalized, THANK_YOU_PHRASES):
-        farewell = (
-            f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
-            "Have a great day. Goodbye!"
-        )
-        logger.info("[ROUTE] FAREWELL (deterministic) — '%s'", q_normalized)
-        active_session    = None
-        _last_activity_ts = 0.0
-        await manager.broadcast({
-            "type":       "session_end",
-            "session_id": sid,
-            "reason":     "thank_you",
-        })
-        return await _respond(farewell, source="farewell", session_action="END")
-
-    # ─── "What was my last session about?" → answer from stored memory ──────
-    # Fixes the real gap: a visitor explicitly asking about their previous
-    # visit was previously falling through to RAG, scoring a coincidental
-    # similarity hit on unrelated FAQ chunks, and answering "I don't have
-    # that detail" — it never looked at the memory we already captured at
-    # session-resume time. This intercepts that class of question BEFORE
-    # RAG runs (same pattern as greetings/farewells above) and answers
-    # straight from active_session["previous_topic"], falling back to a
-    # fresh DB lookup if that wasn't set, and to an honest "no record"
-    # reply if neither exists — never inventing a topic.
-    MEMORY_RECALL_PHRASES = (
-        "last session", "last time", "previous session", "previous time",
-        "what did i ask", "what did we talk about", "what did i talk about",
-        "earlier session", "my last visit", "last visit",
-    )
-    if any(phrase in q_normalized for phrase in MEMORY_RECALL_PHRASES):
-        prev_topic = (active_session or {}).get("previous_topic")
-        if not prev_topic and active_session and (active_session.get("face_id") or active_session.get("session_id")):
-            try:
-                recent = await get_recent_interactions(
-                    session_id=active_session.get("session_id"),
-                    face_id=active_session.get("face_id"),
-                    limit=3,
-                )
-                recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
-                if recent_questions:
-                    prev_topic = await extract_topic_label(recent_questions)
-            except Exception as e:
-                logger.warning(f"[MEMORY RECALL] Lookup failed: {e}")
-
-        if prev_topic:
-            answer = (f"Last time you were asking about {prev_topic}. "
-                      f"Want me to continue with that, or help with something else?")
-        else:
-            answer = ("I don't have a record of an earlier session for you — "
-                      "this looks like the start of a fresh conversation. "
-                      "What would you like help with today?")
-        logger.info("[ROUTE] MEMORY_RECALL (deterministic) — '%s' -> topic=%r", q_normalized, prev_topic)
-        return await _respond(answer, source="memory_recall")
-
-    # ─── Reply to "continue with X, or something else?" re-engagement ───────
-    # Only fires for the ONE reply immediately following that greeting
-    # (awaiting_topic_choice is set at session-resume time and cleared the
-    # instant any reply arrives, whatever it is). A short accept/decline is
-    # answered directly; anything longer or unrecognized is treated as the
-    # visitor's real question and falls through to RAG normally.
-    if active_session and active_session.get("awaiting_topic_choice"):
-        active_session["awaiting_topic_choice"] = False  # applies to this one reply only
-        prev_topic = active_session.get("previous_topic")
-
-        if _matches_short_phrase(q_normalized, TOPIC_DECLINE_PHRASES):
-            answer = "Sure! What would you like help with today?"
-            logger.info("[ROUTE] TOPIC_CHOICE_DECLINE (deterministic) — '%s'", q_normalized)
-            return await _respond(answer, source="topic_choice_decline")
-
-        if _matches_short_phrase(q_normalized, TOPIC_CONTINUE_PHRASES):
-            if prev_topic:
-                answer = f"Great, let's continue with {prev_topic}. What would you like to know?"
-            else:
-                answer = "Sure, what would you like to know?"
-            logger.info("[ROUTE] TOPIC_CHOICE_CONTINUE (deterministic) — '%s'", q_normalized)
-            return await _respond(answer, source="topic_choice_continue")
-        # else: not a short accept/decline — treat as a real question and
-        # fall straight through to the normal pipeline below.
+    # ─── Deterministic fast paths (greeting/farewell/memory-recall/topic-
+    # choice), shared with /ask/stream — see _deterministic_route for why
+    # this is factored out instead of inlined here. ─────────────────────
+    det = await _deterministic_route(q_normalized, sid, visitor_name)
+    if det is not None:
+        answer, source, session_action = det
+        return await _respond(answer, source=source, session_action=session_action)
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
@@ -1332,26 +1421,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         if m.get("index") != visitor_entry.get("index")
     ]
 
-    # Fallback/apology-shaped answers are NEVER cached at the normal 1-hour
-    # TTL. Without this guard, a question asked during a temporary outage
-    # (RAGService down, LLM down) gets its "I don't know" answer cached as
-    # if it were correct, and keeps serving that same apology for an hour
-    # even after everything recovers — exactly what happened with "where is
-    # canteen" during a RAGService outage tonight.
-    _UNCACHEABLE_PATTERNS = (
-        "i don't have that detail",
-        "temporarily unavailable",
-        "having trouble accessing",
-        "having trouble processing",
-        "having trouble formatting",
-        "connectivity issues",
-        "couldn't generate a conversational response",   # Tier-3 degraded answer
-    )
-
-    def _is_cacheable(ans: str) -> bool:
-        a = (ans or "").lower()
-        return not any(p in a for p in _UNCACHEABLE_PATTERNS)
-
     try:
         # THE FIX: q_normalized already has DOMAINS_CORRECTIONS/PHRASE_
         # CORRECTIONS applied (typos, and STT mis-hearings of "RNSIT"
@@ -1376,6 +1445,123 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
     return await _respond(answer, source="rag_llm")
+
+
+@app.get("/ask/stream")
+async def ask_kiosk_stream(question: str = Query(..., description="Visitor question")):
+    """
+    Streaming sibling of /ask — sends the answer as Server-Sent Events,
+    one event per SENTENCE, as soon as each sentence is ready, instead of
+    one big JSON blob after the whole answer (and its whole LLM generation)
+    is done. Lets the frontend start speaking the first sentence while the
+    rest is still being generated (see generate_rag_kiosk_response_stream
+    and chat_completion_with_fallback_stream in llm.py for where the actual
+    streaming happens).
+
+    Event shapes sent (each a `data: {...}\\n\\n` line):
+      {"sentence": "..."}   — one for each completed sentence, in order
+      {"done": true, "answer": "...", "session_action": "CONTINUE"|"END"}
+        — always sent last, with the full reconstructed answer (so the
+        frontend can still show/log the complete text) and whatever
+        session_action a matched deterministic route (e.g. farewell) needs.
+
+    Shares ALL the same routing (deterministic fast paths, Redis cache) as
+    /ask via _deterministic_route — the only thing that's actually
+    different between the two endpoints is HOW the RNSIT_RAG/LLM answer is
+    delivered to the client once we know it's going through the slow path.
+    """
+    global _last_activity_ts, active_session
+    _last_activity_ts = datetime.now().timestamp()
+
+    if not verify_input_safety(question):
+        raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
+
+    q_clean = question.lower().strip()
+    q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
+    for wrong_phrase, right_phrase in PHRASE_CORRECTIONS.items():
+        q_clean = re.sub(rf"(?:^|\s){re.escape(wrong_phrase)}(?:$|\s)", f" {right_phrase} ", q_clean)
+    q_clean = q_clean.strip()
+    words           = q_clean.split()
+    corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
+    q_normalized    = " ".join(corrected_words)
+
+    sid          = active_session["session_id"] if active_session else "unknown"
+    fid          = active_session.get("face_id") if active_session else None
+    visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
+
+    visitor_entry = _log_message(question, "visitor")
+    await manager.broadcast({"type": "message", **visitor_entry})
+
+    async def _finish(answer: str, session_action: str = "CONTINUE"):
+        try:
+            await save_interaction(sid, question, answer, face_id=fid)
+        except Exception as exc:
+            logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
+        kiosk_entry = _log_message(answer, "kiosk")
+        await manager.broadcast({"type": "message", **kiosk_entry})
+
+    async def _sse_gen():
+        # ── Deterministic fast paths — identical decision to /ask ────────
+        det = await _deterministic_route(q_normalized, sid, visitor_name)
+        if det is not None:
+            answer, source, session_action = det
+            yield f"data: {json.dumps({'sentence': answer})}\n\n"
+            await _finish(answer, session_action)
+            yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': session_action})}\n\n"
+            return
+
+        # ── Redis cache — also a single instant chunk, same as /ask ──────
+        cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
+        if redis_client:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    logger.info("[REDIS HIT] For normalized key: '%s'", q_normalized)
+                    yield f"data: {json.dumps({'sentence': cached})}\n\n"
+                    await _finish(cached, "CONTINUE")
+                    yield f"data: {json.dumps({'done': True, 'answer': cached, 'session_action': 'CONTINUE'})}\n\n"
+                    return
+            except Exception as e:
+                logger.warning("Redis read error: %s", e)
+
+        # ── Real streaming path: RNSIT_RAG / off-topic / etc. ─────────────
+        recent_history = [
+            {"speaker": m["speaker"], "text": m["text"]}
+            for m in message_log[-6:]
+            if m.get("index") != visitor_entry.get("index")
+        ]
+
+        parts: list[str] = []
+        try:
+            async for sentence in generate_rag_kiosk_response_stream(q_normalized, history=recent_history):
+                parts.append(sentence)
+                yield f"data: {json.dumps({'sentence': sentence})}\n\n"
+            answer = "".join(parts).strip()
+            if not answer:
+                answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
+                yield f"data: {json.dumps({'sentence': answer})}\n\n"
+        except Exception as exc:
+            logger.error("[LLM PIPELINE] generate_rag_kiosk_response_stream failed: %s", exc)
+            answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
+            yield f"data: {json.dumps({'sentence': answer})}\n\n"
+
+        if redis_client and answer:
+            try:
+                if _is_cacheable(answer):
+                    redis_client.set(cache_key, answer, ex=3600)
+                else:
+                    logger.info("[REDIS] Skipped caching a fallback/apology answer "
+                               "(would have poisoned this question for 1 hour): %r", answer[:80])
+            except Exception as e:
+                logger.warning("Redis write error: %s", e)
+
+        await _finish(answer, "CONTINUE")
+        yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': 'CONTINUE'})}\n\n"
+
+    return StreamingResponse(_sse_gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",   # nginx: don't buffer the stream if this ever sits behind one
+    })
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================

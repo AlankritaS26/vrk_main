@@ -271,9 +271,9 @@ _known_faces_lock = threading.Lock()
 
 
 # ─── Backend HTTP ─────────────────────────────────────────────────────────────
-def _post(path, **kw):
+def _post(path, timeout: float = 8, **kw):
     try:
-        return httpx.post(f"{BACKEND_URL}{path}", timeout=8, **kw)
+        return httpx.post(f"{BACKEND_URL}{path}", timeout=timeout, **kw)
     except Exception as e:
         logger.warning(f"POST {path} failed: {e}")
         return None
@@ -454,7 +454,27 @@ def _start_session(face: dict, anchor: list, sim: float, gen: int):
         return
 
     face_id = face["face_id"]
-    r = _post("/visitor/greet", json={
+    # LONGER TIMEOUT, DELIBERATELY: /visitor/greet does a real-time LLM call
+    # server-side (the "re-engagement lookup" that builds the "Welcome back,
+    # last time you asked about X" summary — see backend.llm's Gemini
+    # fallback path). That round trip regularly took 8-13+ seconds in
+    # practice (RAG search + Local-Qwen connect-timeout + Gemini fallback),
+    # well past the old blanket 8s timeout here.
+    #
+    # BUG THIS FIXES: when this 8s timeout fired, we treated it as a failed
+    # greet and retried — but the ORIGINAL request kept running on the
+    # server and usually finished anyway a few seconds later, completing
+    # the session resume and broadcasting its own "session_start" + greeting
+    # audio. The retry then did the same thing again. Visitors would see
+    # "Welcome back" appear two or three times and hear overlapping/
+    # interrupted greeting audio — and because each new greeting's speak()
+    # call interrupts whatever audio was already playing (see WelcomeScreen.
+    # js's interruptSpeaking()), a real answer already in flight could get
+    # silently cut off too, which is what showed up as "voice not coming."
+    # 25s comfortably covers the worst case we've observed and stops the
+    # client from abandoning a request that the server was going to finish
+    # anyway.
+    r = _post("/visitor/greet", timeout=25, json={
         "face_id": face_id,
         "name": face.get("name", "Guest"),
         "is_returning": True,

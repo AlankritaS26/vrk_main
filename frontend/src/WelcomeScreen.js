@@ -3,6 +3,31 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
+// Tiny async queue: push() from the SSE reader as sentences arrive,
+// next() from the playback loop to consume them — next() waits (via a
+// pending Promise) if nothing has arrived yet, so the playback loop can
+// stay simple ("await the next sentence") instead of polling.
+function makeSentenceQueue() {
+  const items = [];
+  let waiting = null;      // resolve function for a pending next() call
+  let closed = false;
+  return {
+    push(item) {
+      if (waiting) { const w = waiting; waiting = null; w(item); }
+      else items.push(item);
+    },
+    close() {
+      closed = true;
+      if (waiting) { const w = waiting; waiting = null; w(null); }
+    },
+    next() {
+      if (items.length) return Promise.resolve(items.shift());
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => { waiting = resolve; });
+    },
+  };
+}
+
 export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
   const scrollRef = useRef(null);
   const inputRef = useRef(null);
@@ -29,6 +54,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
+  // True from the moment the acknowledgment ("Sure, let me check that for
+  // you.") starts until the real /ask answer is ready to speak. Lets the
+  // ack's onDone below know whether it finished BEFORE the real answer
+  // arrived (RAG/LLM still in flight) or the answer already pre-empted it.
+  const awaitingAnswerRef = useRef(false);
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -436,6 +466,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // right away while the actual answer is still being fetched, so there's
     // never dead air with a spinner. Kept short so it doesn't collide with
     // the real answer. Skipped for very short/greeting-like inputs.
+    //
+    // BUG THIS FIXES: speak()'s finish() always calls setStatus('ready')
+    // when a clip ends. The ack clip is short (~1.5-2s); the RAG/LLM round
+    // trip behind it regularly takes 5-9s (see backend/llm.py's Gemini
+    // fallback path). So the ack would finish, status would drop to
+    // 'ready' (avatar goes idle — no mouth movement, no "thinking" glow),
+    // and the kiosk would sit there visibly silent/idle for the remaining
+    // several seconds before the real answer suddenly started playing.
+    // That's the "doesn't speak for ~5 seconds then starts speaking" gap.
+    // Fix: once the ack finishes, if the real answer isn't back yet, push
+    // status to 'processing' instead of 'ready' so the avatar keeps
+    // showing "still working on it" for the whole wait, not just the ack.
+    awaitingAnswerRef.current = true;
     const acks = [
       'Sure, let me check that for you.',
       'Good question — one moment.',
@@ -448,7 +491,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // Show it as a transient indicator bubble too — otherwise the visitor
       // sees nothing at all while the real answer is being fetched, which
       // is exactly the "left confused, feels frozen" problem.
-      speak(ack, () => setProcessingHint(ack));
+      speak(ack, () => setProcessingHint(ack), () => {
+        if (awaitingAnswerRef.current) setStatus('processing');
+      });
     }
 
     // 35 s hard cap — prevents status getting stuck at 'processing' if the
@@ -456,39 +501,109 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const askController = new AbortController();
     const askTimeout = setTimeout(() => askController.abort(), 35000);
     try {
-      const [, askRes] = await Promise.all([
-        fetch(BACKEND + '/message', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
-        }),
-        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text),
-          { signal: askController.signal })
-      ]);
-      clearTimeout(askTimeout);
-      const data = await askRes.json();
-
-      // STALE-ANSWER GUARD: if the session changed while this request was in
-      // flight (visitor said goodbye and left, next visitor arrived), this
-      // answer belongs to nobody on screen — drop it so it never bleeds into
-      // the next person's session.
-      const liveSid = sessionRef.current?.session_id || 'guest';
-      if (data.dropped || liveSid !== sid) {
-        console.info('[sendToBackend] dropped stale answer for', sid);
-        isSpeaking.current = false;
-        setStatus('ready');
-        return;
-      }
-
-      const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
       fetch(BACKEND + '/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
+        body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
       });
-      speak(answer, () => { setProcessingHint(''); addMessage(answer, 'kiosk'); });
+
+      // STREAMING: /ask/stream sends the answer as Server-Sent Events, one
+      // sentence at a time, as soon as each is ready — instead of one big
+      // JSON blob only once the ENTIRE answer has finished generating.
+      // Feed sentences into `queue` as they arrive; speakStream (below)
+      // consumes the queue and starts playing sentence 1 the moment it's
+      // ready, without waiting for sentence 2+ to exist yet. See
+      // backend/main.py's ask_kiosk_stream and backend/llm.py's
+      // generate_rag_kiosk_response_stream for the server side of this.
+      const queue = makeSentenceQueue();
+      let doneMeta = null;
+      let streamErr = null;
+      let messageShown = false;
+
+      // Shows the kiosk's chat bubble the moment we actually know the full
+      // text — NOT after all audio finishes playing. Audio playback takes
+      // as long as it takes to speak the whole answer (several seconds for
+      // a multi-sentence reply); the text itself is usually fully known
+      // seconds before that, once the network stream ends. Without this,
+      // the visitor could only LISTEN and had nothing to read until the
+      // kiosk stopped talking — exactly backwards from what streaming was
+      // supposed to fix.
+      const showAnswer = (ans) => {
+        if (messageShown || !ans) return;
+        messageShown = true;
+        addMessage(ans, 'kiosk');
+      };
+
+      const pump = (async () => {
+        try {
+          const res = await fetch(BACKEND + '/ask/stream?question=' + encodeURIComponent(text),
+            { signal: askController.signal });
+          if (!res.ok || !res.body) throw new Error('HTTP ' + res.status);
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          let buf = '';
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf('\n\n')) !== -1) {
+              const rawEvent = buf.slice(0, idx);
+              buf = buf.slice(idx + 2);
+              const dataLine = rawEvent.split('\n').find(l => l.startsWith('data:'));
+              if (!dataLine) continue;
+              let payload;
+              try { payload = JSON.parse(dataLine.slice(5).trim()); } catch (e) { continue; }
+              if (payload.sentence) queue.push(payload.sentence);
+              if (payload.done) doneMeta = payload;
+            }
+          }
+        } catch (e) {
+          streamErr = e;
+        } finally {
+          queue.close();
+        }
+      })();
+
+      // Fires as soon as the network stream ends (text fully known) —
+      // runs CONCURRENTLY with speakStream's (much longer) audio playback
+      // below, not after it.
+      pump.then(() => {
+        const liveSid = sessionRef.current?.session_id || 'guest';
+        if (liveSid !== sid) return;   // stale — don't show a dead session's answer
+        if (doneMeta && doneMeta.answer) showAnswer(doneMeta.answer);
+      });
+
+      awaitingAnswerRef.current = false;
+      const spokenText = await speakStream(queue, () => setProcessingHint(''));
+      await pump;   // make sure the reader loop (and thus doneMeta) has settled
+      clearTimeout(askTimeout);
+
+      // STALE-ANSWER GUARD — same purpose as the old one: if the session
+      // changed while this was streaming (visitor left, next one arrived),
+      // this answer belongs to nobody on screen anymore.
+      const liveSid = sessionRef.current?.session_id || 'guest';
+      if (liveSid !== sid) {
+        console.info('[sendToBackend] dropped stale streamed answer for', sid);
+        return;
+      }
+
+      if (streamErr && !doneMeta) throw streamErr;   // nothing usable came through at all
+
+      // Normally already shown by the pump.then() above, well before this
+      // point — this is just the safety net for the rare case doneMeta
+      // never arrived (e.g. the "done" event itself got dropped) but
+      // speakStream still managed to speak something.
+      const answer = (doneMeta && doneMeta.answer) || spokenText ||
+        'Sorry, I do not have that information. Please visit the Admin Block.';
+      showAnswer(answer);
+      // NOTE: unlike the old /ask flow, we do NOT also POST /message for the
+      // kiosk's answer here — backend/main.py's ask_kiosk_stream already
+      // logs and broadcasts it server-side (see _finish() there), so doing
+      // it again here would double up the chat history.
     } catch (e) {
       clearTimeout(askTimeout);
+      awaitingAnswerRef.current = false;
       setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
       console.error('[sendToBackend]', e);
       const fallback = e.name === 'AbortError'
@@ -657,6 +772,148 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (activeSpeakIdRef.current !== myId) return;
       console.error('[TTS] backend unavailable, using browser voice', e);
       browserSpeak();
+    }
+  }, [startListening]);
+
+  // Streaming sibling of speak() — consumes sentences from a queue (see
+  // makeSentenceQueue) as they arrive over the network instead of a
+  // precomputed array, so playback of sentence 1 can start the instant
+  // it's ready rather than waiting for the whole answer to finish
+  // generating first. This is what actually shortens the "why is there a
+  // silent gap before she starts talking" delay — speak()'s existing
+  // sentence-pipeline only ever got to help AFTER the full answer already
+  // came back from the backend; this lets it start working DURING
+  // generation instead.
+  //
+  // Same Web Audio/finish/fireStart/browserSpeak shape as speak() — kept
+  // as a separate function rather than merged in, since speak() takes a
+  // known, complete string up front and this takes an open-ended stream;
+  // forcing both through one signature would have made speak() itself
+  // harder to follow for the (still far more common) non-streaming case.
+  //
+  // Prefetch depth here is ONE sentence ahead, not two like speak() — we
+  // simply don't know sentence N+2 yet until the network delivers it, so
+  // there's nothing further to prefetch. In practice this still removes
+  // essentially all dead air: the network's own delivery pace is normally
+  // the bottleneck long before a single sentence's ~200-400ms TTS synth
+  // time would be.
+  //
+  // Returns the full reconstructed text once done, so the caller can log/
+  // display it without having tracked every chunk itself.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const speakStream = useCallback(async (queue, onStart, onDone) => {
+    if (isSpeaking.current) interruptSpeaking();
+    window.speechSynthesis.cancel();
+    const myId = Symbol('speakStream');
+    activeSpeakIdRef.current = myId;
+    isSpeaking.current = true;
+
+    let accumulatedText = '';
+
+    const finish = () => {
+      if (activeSpeakIdRef.current !== myId) return;
+      isSpeaking.current = false;
+      setStatus('ready');
+      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
+      if (isMounted.current) startListening();
+    };
+
+    const fireStart = () => {
+      setStatus('speaking');
+      if (onStart) { onStart(); onStart = null; }
+    };
+
+    const browserSpeak = () => {
+      const utter = new SpeechSynthesisUtterance(accumulatedText);
+      utter.lang = 'en-US';
+      utter.rate = 1.0;
+      utter.volume = 1;
+      utter.onstart = fireStart;
+      utter.onend = finish;
+      utter.onerror = finish;
+      window.speechSynthesis.speak(utter);
+    };
+
+    const fetchClip = (s) =>
+      fetch(BACKEND + '/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: s })
+      }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
+
+    if (!playCtxRef.current) {
+      playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const pctx = playCtxRef.current;
+    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
+    if (pctx.state === 'suspended') {
+      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice once the stream finishes.');
+      // Still have to drain the queue so accumulatedText is complete before falling back.
+      for (let s = await queue.next(); s !== null; s = await queue.next()) accumulatedText += s;
+      browserSpeak();
+      return accumulatedText;
+    }
+    playCursorRef.current = pctx.currentTime;
+    if (!ttsGainRef.current) {
+      ttsGainRef.current = pctx.createGain();
+      ttsGainRef.current.connect(pctx.destination);
+    }
+    ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
+    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
+
+    const playClip = (b64) => new Promise(async (resolve) => {
+      if (activeSpeakIdRef.current !== myId) return resolve();
+      try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const buf = await pctx.decodeAudioData(bytes.buffer);
+        if (activeSpeakIdRef.current !== myId) return resolve();
+        const node = pctx.createBufferSource();
+        node.buffer = buf;
+        node.connect(ttsGainRef.current);
+        activeNodesRef.current.push(node);
+        node.onended = () => {
+          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+          resolve();
+        };
+        fireStart();
+        const at = Math.max(pctx.currentTime, playCursorRef.current);
+        node.start(at);
+        playCursorRef.current = at + buf.duration;
+      } catch (e) {
+        resolve();
+      }
+    });
+
+    try {
+      let anyPlayed = false;
+      let currentSentence = await queue.next();
+      let currentClipPromise = currentSentence ? fetchClip(currentSentence) : null;
+
+      while (currentSentence !== null) {
+        if (activeSpeakIdRef.current !== myId) break;
+        accumulatedText += currentSentence;
+        const b64 = await currentClipPromise;
+        // Wait for the network to deliver the NEXT sentence, then kick off
+        // its TTS fetch right away so it overlaps with this sentence's
+        // playback below instead of happening after it.
+        const nextSentence = await queue.next();
+        const nextClipPromise = nextSentence ? fetchClip(nextSentence) : null;
+        if (b64) { anyPlayed = true; await playClip(b64); }
+        currentSentence = nextSentence;
+        currentClipPromise = nextClipPromise;
+      }
+
+      if (activeSpeakIdRef.current !== myId) return accumulatedText;
+      if (!anyPlayed) { browserSpeak(); return accumulatedText; }
+      finish();
+      return accumulatedText;
+    } catch (e) {
+      if (activeSpeakIdRef.current !== myId) return accumulatedText;
+      console.error('[TTS stream] backend unavailable, using browser voice', e);
+      browserSpeak();
+      return accumulatedText;
     }
   }, [startListening]);
 
