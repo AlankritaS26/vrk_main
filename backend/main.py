@@ -262,6 +262,48 @@ _GREETING_RESPONSES = [
     "Hey! Welcome to RNS Institute of Technology. What can I help you with?",
 ]
 
+# ── Easter eggs: the handful of off-topic, personality questions every
+# visitor asks an assistant sooner or later ("are you a robot?", "tell me
+# a joke"). This is the single thing visitors actually remember and tell
+# their friends about, so these get warm, self-aware, instant replies
+# instead of falling through to RAG (which has no campus-fact grounding
+# for them and would either hallucinate or bounce to the offtopic fallback).
+# Matched the same way as GREETING_PHRASES — via _matches_short_phrase, so
+# only short, standalone utterances trigger this, never a real question
+# that happens to share a few words with one of these keys.
+EASTER_EGGS = {
+    "are you a robot": [
+        "I'm a digital receptionist, so yes and no — no body, but I do the job!",
+        "Guilty as charged! But I promise I'm a friendly one.",
+    ],
+    "are you real": [
+        "Real enough to help you find the CSE block! I'm Voix Nova, RNSIT's digital receptionist.",
+    ],
+    "are you human": [
+        "Not quite — I'm Voix Nova, a digital receptionist. But I'll do my best to sound like one!",
+    ],
+    "tell me a joke": [
+        "Why did the student bring a ladder to class? To reach the higher studies!",
+        "What did the router say to the CSE student? Nothing, they just had a falling out over connection issues.",
+    ],
+    "who made you": [
+        "I was built by the students of RNSIT to help visitors like you find your way around!",
+    ],
+    "what is your name": [
+        "I'm Voix Nova, the digital receptionist here at RNSIT. Nice to meet you!",
+    ],
+    "who are you": [
+        "I'm Voix Nova — think of me as RNSIT's always-awake front desk.",
+    ],
+    "i love you": [
+        "That's sweet! I love helping visitors find their way around RNSIT too.",
+    ],
+    "do you sleep": [
+        "Never! I'm here whenever a visitor needs help, day or night.",
+    ],
+}
+
+
 # ── Replies to the "continue with X, or something else?" re-engagement ──
 # These only carry meaning right after that specific greeting question,
 # so they're intercepted deterministically (see the awaiting_topic_choice
@@ -1047,12 +1089,12 @@ def build_greeting(name: str, is_returning: bool, resumed: bool,
     """
     who = name if name and name not in ("Guest", "Unknown", "") else "there"
     if not is_returning:
-        return (f"Welcome {who}! I am the digital receptionist of {INSTITUTE_NAME}. "
+        return (f"Welcome {who}! I am Voix Nova, the digital receptionist of {INSTITUTE_NAME}. "
                 f"I can help you with admissions, departments, placements, fees, "
                 f"and finding your way around campus. How may I assist you today?")
     if resumed:
         if previous_topic:
-            return (f"Welcome back, {who}! Last time you were asking about "
+            return (f"Welcome back, {who}!Good to see you again, Last time you were asking about "
                     f"{previous_topic} — would you like to continue with that, "
                     f"or help with something else today?")
         return (f"Welcome back, {who}! Good to see you again. "
@@ -1275,6 +1317,16 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
         answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
         logger.info("[ROUTE] GREETING (deterministic) — '%s'", q_normalized)
         return answer, "greeting", "CONTINUE"
+
+    # ─── Easter eggs → instant, deterministic, zero RAG/LLM round-trip ──────
+    # Same short-utterance safety net as GREETING_PHRASES: only fires for a
+    # standalone match (<=4 words), never for a real question that happens
+    # to contain one of these phrases as a fragment.
+    for phrase, responses in EASTER_EGGS.items():
+        if _matches_short_phrase(q_normalized, {phrase}):
+            answer = responses[hash(sid + phrase) % len(responses)]
+            logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
+            return answer, "easter_egg", "CONTINUE"
 
     # ─── Thank you / bye / natural sign-off → end session immediately ───────
     if _is_farewell(q_normalized):

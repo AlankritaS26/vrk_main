@@ -188,6 +188,15 @@ def main():
                   "next to 'backend' and 'frontend' in your project root, then rerun.")
         sys.exit(1)
 
+    # ── PARALLEL BOOT ─────────────────────────────────────────────────────
+    # RAG and Backend don't depend on each other — the old code ran them
+    # sequentially (start RAG -> wait up to 120s for its health -> start
+    # Backend -> wait up to 180s for its health) which serializes two
+    # multi-minute model loads (sentence-transformers for RAG, faster-whisper
+    # + Kokoro for the backend) even though nothing stops them loading at
+    # the same time. The kiosk browser still only OPENS once RAG + backend
+    # are healthy and the frontend is reachable, but "npm start" itself now
+    # starts alongside the two Python services instead of after both.
     say("RUN", "Starting RAG microservice on port 8600...")
     # RAGService's app.py uses bare imports ("import config", "from rag_store import ...")
     # so it must be launched with RAGService/ itself as the working directory —
@@ -197,37 +206,70 @@ def main():
     start("RAG", [PY, "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8600"],
           cwd=RAG_DIR)
 
-    say("RUN", "Waiting for RAG microservice health (embedding model loads on first boot)...")
-    if not wait_for_rag():
+    say("RUN", "Starting main backend...")
+    start("BACKEND", [PY, "-m", "uvicorn", "backend.main:app",
+                      "--host", "0.0.0.0", "--port", "8001"])
+
+    # Also kick off `npm start` immediately instead of waiting on both Python
+    # services first — webpack's cold-start compile (the slowest single part
+    # of the whole boot, often 60-90s+ on first run) can now overlap with the
+    # RAG/backend model loads instead of happening strictly after them.
+    say("RUN", "Starting frontend (npm start)...")
+    env = os.environ.copy()
+    env["BROWSER"] = "none"            # we open the kiosk browser ourselves, with flags
+    # Skips CRA's fork-ts-checker/eslint type-check worker process on dev
+    # boot — pure time cost for a kiosk app, not needed to serve the page.
+    env.setdefault("DISABLE_ESLINT_PLUGIN", "true")
+    env.setdefault("TSC_COMPILE_ON_ERROR", "true")
+    start("FRONTEND", "npm start", cwd=os.path.join(ROOT, "frontend"),
+          shell=True, env=env)
+
+    say("RUN", "Waiting for RAG + backend health in parallel "
+              "(embedding/Whisper/Kokoro models load on first boot)...")
+    results = {}
+    def _wait(name, fn):
+        results[name] = fn()
+    t_rag = threading.Thread(target=_wait, args=("rag", wait_for_rag))
+    t_backend = threading.Thread(target=_wait, args=("backend", wait_for_backend))
+    t_rag.start()
+    t_backend.start()
+    t_rag.join()
+    t_backend.join()
+
+    if not results.get("rag"):
         say("RUN", "RAG microservice never became healthy — check [RAG] logs above.")
         say("RUN", "Common cause: RAGService's own dependencies (chromadb, "
                   "sentence-transformers, torch, etc. from RAGService/requirements.txt) "
                   "aren't installed in this venv. Run:")
         say("RUN", f"    {PY} -m pip install -r RAGService/requirements.txt")
         shutdown()
-
-    say("RUN", "RAG microservice healthy.")
-
-    say("RUN", "Starting main backend...")
-    start("BACKEND", [PY, "-m", "uvicorn", "backend.main:app",
-                      "--host", "0.0.0.0", "--port", "8001"])
-
-    say("RUN", "Waiting for backend health (models loading — first boot takes longer)...")
-    if not wait_for_backend():
+    if not results.get("backend"):
         say("RUN", "Backend never became healthy — check [BACKEND] logs above.")
         shutdown()
 
-    say("RUN", "Backend healthy. Camera detection runs in the browser — no separate process needed.")
+    say("RUN", "RAG microservice + backend healthy. "
+              "Camera detection runs in the browser — no separate process needed.")
 
-    say("RUN", "Starting frontend (npm start)...")
-    env = os.environ.copy()
-    env["BROWSER"] = "none"            # we open the kiosk browser ourselves, with flags
-    start("FRONTEND", "npm start", cwd=os.path.join(ROOT, "frontend"),
-          shell=True, env=env)
+    # Open the kiosk browser with autoplay ENABLED so the greeting can speak.
+    # Polls for the CRA dev server instead of a blind sleep(10) — opens the
+    # moment it's actually ready (often well under 10s once webpack already
+    # had a head start from being launched in parallel above), and won't
+    # open too early on a slow first-ever compile either.
+    def wait_for_frontend(timeout: float = 180) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen("http://localhost:3000", timeout=2):
+                    return True
+            except Exception:
+                time.sleep(0.5)
+        return False
 
-    # Open the kiosk browser with autoplay ENABLED so the greeting can speak
     def open_kiosk_browser():
-        time.sleep(10)                # let the CRA dev server come up
+        if not wait_for_frontend():
+            say("RUN", "Frontend dev server didn't come up in time — open "
+                      "http://localhost:3000 manually once it does.")
+            return
         url   = "http://localhost:3000"
         flags = ["--autoplay-policy=no-user-gesture-required", f"--app={url}"]
 
