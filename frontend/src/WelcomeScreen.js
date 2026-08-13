@@ -83,7 +83,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ? (visitCount > 2
       ? 'Welcome back, ' + visitorName + '! Great to see you again. How may I assist you today?'
       : 'Welcome back, ' + visitorName + '! How may I assist you today?')
-    : 'Welcome to R N S Institute of Technology. I am Voix Nova, your digital receptionist. '
+    : 'Welcome to R N S Institute of Technology. I am Nova, your digital receptionist. '
     + 'I can help you with admissions, departments, placements, fees, and directions around campus. '
     + 'How may I assist you today?');
 
@@ -833,9 +833,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
   const btnSecondary = { padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px', background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px' };
 
-  /* ── ANIMATED ARIA CHARACTER ─────────────────────────────────────────── */
-  const AriaCharacter = ({ st }) => (
-    <svg className={`aria-svg aria-${st}`} viewBox="0 0 320 500"
+  /* ── ANIMATED NOVA CHARACTER ─────────────────────────────────────────── */
+  const NovaCharacter = ({ st }) => (
+    <svg className={`nova-svg nova-${st}`} viewBox="0 0 320 500"
       style={{ width: '100%', maxWidth: '340px', overflow: 'visible', display: 'block' }}>
       <defs>
         <linearGradient id="skinG" x1="0" y1="0" x2="0" y2="1">
@@ -1019,7 +1019,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   </div>
                   <div>
                     <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
-                    <div style={{ fontSize: '12px', color: '#999' }}>How Aria sees and remembers you</div>
+                    <div style={{ fontSize: '12px', color: '#999' }}>How Nova sees and remembers you</div>
                   </div>
                 </div>
 
@@ -1028,12 +1028,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                     {
                       icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
                       title: 'The camera is only used to greet you',
-                      body: 'The kiosk camera looks for a face so Aria knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
+                      body: 'The kiosk camera looks for a face so Nova knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
                     },
                     {
                       icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
                       title: 'Face data is saved only if you say yes',
-                      body: 'When you\'re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Aria can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
+                      body: 'When you\'re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Nova can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
                     },
                     {
                       icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
@@ -1093,7 +1093,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   <path d="M12 72 Q12 54 40 54 Q68 54 68 72" fill="#FFCFA0" />
                 </svg>
                 <div>
-                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Aria 👋</div>
+                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Nova 👋</div>
                   <div style={{ fontSize: '13px', color: '#888' }}>I don&apos;t recognise you yet — what&apos;s your name?</div>
                 </div>
               </div>
@@ -1152,7 +1152,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       {/* ── MAIN BODY ── */}
       <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
 
-        {/* ══════════ LEFT: ANIMATED ARIA CHARACTER ══════════ */}
+        {/* ══════════ LEFT: ANIMATED Nova CHARACTER ══════════ */}
         <div style={{
           width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
@@ -1167,9 +1167,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
           }} />
 
-          {/* ── Aria SVG character ── */}
+          {/* ── Nova SVG character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
-            <AriaCharacter st={status} />
+            <NovaCharacter st={status} />
           </div>
 
           {/* ── Name + status badge ── */}
@@ -1177,7 +1177,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
             zIndex: 1, marginTop: '8px'
           }}>
-            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Aria</div>
+            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Nova</div>
             <div style={{ fontSize: '12px', color: '#5c6bc0', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
             <div style={{
               padding: '5px 18px', borderRadius: '20px', background: statusBg,
@@ -1232,41 +1232,41 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '30px 12px', textAlign: 'center' }}>
                 <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT Logo"
                   style={{ width: '120px', height: 'auto', objectFit: 'contain', opacity: 0.95, filter: 'drop-shadow(0 10px 20px rgba(26,35,126,0.18))' }} />
-                <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Aria will appear here</div>
+                <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Nova will appear here</div>
                 <div style={{ fontSize: '12px', color: '#c5cae9' }}>Just speak — she&apos;s ready</div>
               </div>
             )}
 
             {messages.map((msg, i) => {
-              const isAria = msg.speaker === 'kiosk';
+              const isNova = msg.speaker === 'kiosk';
               const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
               return (
                 <div key={i} style={{
                   display: 'flex', flexDirection: 'column',
-                  alignItems: isAria ? 'flex-start' : 'flex-end',
+                  alignItems: isNova ? 'flex-start' : 'flex-end',
                   marginTop: prevSame ? '2px' : '8px'
                 }}>
                   {!prevSame && (
                     <span style={{
                       fontSize: '10px', color: '#bbb', marginBottom: '2px',
-                      paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
+                      paddingLeft: isNova ? '6px' : 0, paddingRight: !isNova ? '6px' : 0, fontWeight: '600'
                     }}>
-                      {isAria ? 'Aria' : visitorName}
+                      {isNova ? 'Nova' : visitorName}
                     </span>
                   )}
                   <div className="msg-in" style={{
                     maxWidth: '88%', padding: '8px 12px',
-                    borderRadius: isAria
+                    borderRadius: isNova
                       ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
                       : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-                    background: isAria ? '#ffffff' : '#1a237e',
-                    color: isAria ? '#1a1a1a' : '#ffffff',
+                    background: isNova ? '#ffffff' : '#1a237e',
+                    color: isNova ? '#1a1a1a' : '#ffffff',
                     fontSize: '13.5px', lineHeight: '1.5',
-                    boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+                    boxShadow: isNova ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
                     wordBreak: 'break-word'
                   }}>
                     {msg.text}
-                    <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
+                    <span style={{ fontSize: '9px', color: isNova ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
                       {msg.timestamp}
                     </span>
                   </div>
@@ -1361,7 +1361,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 {statusLabel}
               </span>
             )}
-            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Aria AI</span>
+            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Nova AI</span>
           </div>
         </div>
       </div>
@@ -1393,19 +1393,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         @keyframes tdBounce { 0%,60%,100%{transform:translateY(0);background:#c5cae9} 30%{transform:translateY(-6px);background:#7e57c2} }
 
         /* ══════════════════════════════
-           ARIA CHARACTER ANIMATIONS
+             Nova CHARACTER ANIMATIONS
         ══════════════════════════════ */
 
         /* BODY — gentle breathing (always on) */
-        .aria-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
+        .nova-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
         @keyframes charBreathe { 0%,100%{transform:scaleY(1)} 50%{transform:scaleY(1.016)} }
 
         /* HEAD — base: idle micro-float */
-        .aria-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
+        .nova-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
         @keyframes idleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
 
         /* ── LISTENING ── */
-        .aria-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
+        .nova-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
         @keyframes listenLean { to{transform:translateX(10px) rotate(6deg)} }
 
         /* pulse ring */
@@ -1414,11 +1414,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         @keyframes lRing { 0%{r:92;opacity:0.55} 100%{r:140;opacity:0} }
 
         /* ── PROCESSING ── */
-        .aria-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
+        .nova-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
         @keyframes thinkTilt { to{transform:translateX(-12px) rotate(-7deg)} }
 
         /* thinking arm rise */
-        .aria-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
+        .nova-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
         @keyframes armRise { from{transform:translateY(30px);opacity:0} to{transform:none;opacity:1} }
 
         /* thinking bubble float */
@@ -1430,12 +1430,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         @keyframes browFurrow { to{transform:translateY(4px)} }
 
         /* ── SPEAKING ── */
-        .aria-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
+        .nova-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
         @keyframes headBob { 0%,100%{transform:translateY(0) rotate(0)} 30%{transform:translateY(-5px) rotate(1.5deg)} 70%{transform:translateY(2px) rotate(-1deg)} }
 
         /* mouth alternates: a visible ↔ b visible */
-        .aria-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
-        .aria-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
+        .nova-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
+        .nova-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
         @keyframes mA { 0%,49%{opacity:1} 50%,100%{opacity:0} }
         @keyframes mB { 0%,49%{opacity:0} 50%,100%{opacity:1} }
 
@@ -1450,8 +1450,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 }
 
 
-// ── Aria's avatar: used in message rows and header ───────────────────────
-const AriaAvatar = ({ size = 38, speaking = false }) => (
+// ── Nova's avatar: used in message rows and header ───────────────────────
+const NovaAvatar = ({ size = 38, speaking = false }) => (
   <div style={{ position: 'relative', flexShrink: 0 }}>
     {speaking && (
       <>

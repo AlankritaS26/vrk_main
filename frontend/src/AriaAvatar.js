@@ -60,7 +60,7 @@ export default function AriaAvatar({ status = 'ready', size = 220 }) {
       <span className="human-glow" style={{ background: `radial-gradient(circle, ${color}40, transparent 68%)` }} />
 
       <div className="human-frame">
-        <img src={portrait} alt="Aria — RNSIT Digital Receptionist" className="human-photo" />
+        <img src={portrait} alt="Nova — RNSIT Digital Receptionist" className="human-photo" />
 
         {/* warm shadow that peeks through as the mouth layer shifts — reads as "opening" */}
         <span className="human-mouth-shadow" style={{ left: `${MOUTH.x}%`, top: `${MOUTH.y}%`, width: `${MOUTH.rx * 2}%`, height: `${MOUTH.ry * 2.2}%` }} />

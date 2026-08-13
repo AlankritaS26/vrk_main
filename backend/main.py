@@ -277,10 +277,10 @@ EASTER_EGGS = {
         "Guilty as charged! But I promise I'm a friendly one.",
     ],
     "are you real": [
-        "Real enough to help you find the CSE block! I'm Voix Nova, RNSIT's digital receptionist.",
+        "Real enough to help you find the CSE block! I'm Nova, RNSIT's digital receptionist.",
     ],
     "are you human": [
-        "Not quite — I'm Voix Nova, a digital receptionist. But I'll do my best to sound like one!",
+        "Not quite — I'm Nova, a digital receptionist. But I'll do my best to sound like one!",
     ],
     "tell me a joke": [
         "Why did the student bring a ladder to class? To reach the higher studies!",
@@ -290,10 +290,10 @@ EASTER_EGGS = {
         "I was built by the students of RNSIT to help visitors like you find your way around!",
     ],
     "what is your name": [
-        "I'm Voix Nova, the digital receptionist here at RNSIT. Nice to meet you!",
+        "I'm Nova, the digital receptionist here at RNSIT. Nice to meet you!",
     ],
     "who are you": [
-        "I'm Voix Nova — think of me as RNSIT's always-awake front desk.",
+        "I'm Nova — think of me as RNSIT's always-awake front desk.",
     ],
     "i love you": [
         "That's sweet! I love helping visitors find their way around RNSIT too.",
@@ -1089,7 +1089,7 @@ def build_greeting(name: str, is_returning: bool, resumed: bool,
     """
     who = name if name and name not in ("Guest", "Unknown", "") else "there"
     if not is_returning:
-        return (f"Welcome {who}! I am Voix Nova, the digital receptionist of {INSTITUTE_NAME}. "
+        return (f"Welcome {who}! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
                 f"I can help you with admissions, departments, placements, fees, "
                 f"and finding your way around campus. How may I assist you today?")
     if resumed:
