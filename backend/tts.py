@@ -187,7 +187,7 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
             _PREWARM = [
                 # First-visit greeting — fixed text, must match main.py's
                 # build_greeting() word-for-word or the cache silently misses.
-                (f"Welcome to {INSTITUTE_NAME}. I am Voix Nova, your digital receptionist. "
+                (f"Welcome to {INSTITUTE_NAME}. I am Nova, your digital receptionist. "
                  f"I can help you with admissions, departments, placements, fees, and "
                  f"directions around campus. How may I assist you today?"),
                 "Sure, let me check that for you.",

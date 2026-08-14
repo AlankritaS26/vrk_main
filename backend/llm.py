@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import asyncio
 import logging
 from typing import Any
@@ -8,7 +9,7 @@ from typing import Any
 import httpx
 from dotenv import load_dotenv
 
-from backend.gemini import gemini_available, gemini_chat_completion, GEMINI_MODEL
+from backend.gemini import gemini_available, gemini_chat_completion, gemini_chat_completion_stream, GEMINI_MODEL
 
 
 load_dotenv()
@@ -59,7 +60,23 @@ _rag_seeded: bool = False
 # Local copy of main.py's Q/A label stripper — used only by the Tier-3
 # RAG-only safety net below, so raw "Q: ... A: ..." scaffolding from a
 # retrieved chunk never reaches the visitor when both LLM tiers are down.
-_QA_LABEL_RE_LLM = re.compile(r"Q:\s*.+?\?\s*A:\s*", re.IGNORECASE)
+#
+# BUG FIX: this used to require a literal "?" between "Q:" and "A:"
+# (r"Q:\s*.+?\?\s*A:\s*"). Most KB entries are phrased as questions and do
+# have one, but not all — e.g. the "Q: What can you do A: ..." entry has no
+# question mark, so the old pattern silently failed to match and the raw
+# "Q: ... A:" scaffolding leaked straight into a visitor-facing reply (seen
+# in production: "I am currently unable to generate a conversational
+# response, but based on the available RNSIT information: Q: What can you
+# do A: I can help you with..."). Dropping the "?" requirement fixes every
+# case the old pattern covered plus this one.
+_QA_LABEL_RE_LLM = re.compile(r"Q:\s*.*?\s*A:\s*", re.IGNORECASE)
+
+# Same idea for the other two label shapes seen in this KB's chunks —
+# "Facility: X. Details: ..." and "Department: X. ... Head of Department: ..."
+# — so the Tier-3 safety net strips scaffolding regardless of which chunk
+# shape happens to be top-ranked, not just the Q/A one.
+_FACILITY_LABEL_RE_LLM = re.compile(r"^Facility:\s*.*?\.\s*Details:\s*", re.IGNORECASE)
 
 
 # ==========================================
@@ -326,9 +343,140 @@ async def chat_completion(
     raise ValueError(f"Invalid chat completion response format: {data}")
 
 
+async def chat_completion_stream(
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 300,
+    client: httpx.AsyncClient = None,
+):
+    """
+    Streaming sibling of chat_completion() — yields text DELTAS as the
+    local LLM generates them, using the standard OpenAI-compatible
+    `stream: true` SSE contract (vLLM, Ollama, text-generation-webui, and
+    real OpenAI/Azure all speak this the same way).
+
+    LIMITATION, ON PURPOSE: the "query"-style API (LLM_API_STYLE=query —
+    the team's own custom POST /chat {"query": ...} server) has no defined
+    streaming contract; guessing at SSE framing for a proprietary endpoint
+    we don't actually know supports it would be worse than just being
+    honest about it. For that style only, this falls back to calling the
+    regular non-streaming chat_completion() and yielding its result as one
+    whole chunk — functionally identical to what Tier 1 already did before
+    real streaming existed, so nothing regresses for that style; it simply
+    doesn't gain the new benefit.
+
+    Raises on failure, same contract as chat_completion — infra failures
+    (connection refused, timeout, 5xx) propagate to the caller so
+    chat_completion_with_fallback_stream's existing Tier-1-failed handling
+    (circuit breaker, fallback to Gemini) keeps working unchanged.
+    """
+    if _api_style() == "query":
+        text = await chat_completion(messages, temperature=temperature, max_tokens=max_tokens, client=client)
+        yield text
+        return
+
+    _require_llm_config()
+    prov = _provider()
+
+    _AZURE_API_VER = os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    if prov == "azure":
+        url = (
+            f"{LLM_BASE_URL.rstrip('/')}/openai/deployments/"
+            f"{LLM_CHAT_MODEL}/chat/completions?api-version={_AZURE_API_VER}"
+        )
+    else:
+        url = f"{LLM_BASE_URL.rstrip('/')}/chat/completions"
+
+    tok_key = _max_tokens_param()
+    payload: dict = {
+        "model":    LLM_CHAT_MODEL,
+        "messages": messages,
+        tok_key:    max_tokens,
+        "stream":   True,
+    }
+    if not _is_new_model_family():
+        payload["temperature"] = temperature
+
+    active_client = client if client is not None else get_shared_client()
+    got_any_text = False
+
+    try:
+        async with active_client.stream(
+            "POST", url, json=payload, headers=_auth_headers(),
+            timeout=httpx.Timeout(30.0, connect=5.0),
+        ) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                chunk_raw = line[len("data:"):].strip()
+                if not chunk_raw or chunk_raw == "[DONE]":
+                    continue
+                try:
+                    chunk = json.loads(chunk_raw)
+                except ValueError:
+                    continue
+                delta = get_nested_value(chunk, ["choices", 0, "delta", "content"])
+                if delta:
+                    got_any_text = True
+                    yield delta
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            "[LLM] HTTP %s from %s provider (stream) — %s",
+            exc.response.status_code, prov, exc.response.text[:400] if exc.response.text else ""
+        )
+        raise
+
+    if not got_any_text:
+        raise ValueError("Local LLM stream returned no text")
+
+
+# ==========================================
+# TIER-1 CIRCUIT BREAKER
+# ==========================================
+# Every /ask call was paying the full ~4-5s Local-Qwen connect-timeout
+# before falling back to Gemini, on EVERY turn, because the local server
+# just isn't reachable in this deployment (see the repeated
+# "LLM Attempt: Local Qwen | STATUS: FAILED | Reason: ConnectTimeout"
+# lines in the logs). That's dead, guaranteed-to-fail latency added to
+# every single kiosk response. This breaker still honours the "always try
+# local first" requirement — it tries Tier 1 normally until it sees
+# _CIRCUIT_FAILURE_THRESHOLD consecutive infra failures, then "opens" and
+# skips straight to Gemini for _CIRCUIT_COOLDOWN_SECONDS, after which it
+# automatically tries Tier 1 again once (so a local server coming back up
+# is picked up without a restart).
+_CIRCUIT_FAILURE_THRESHOLD = 2
+_CIRCUIT_COOLDOWN_SECONDS  = 60
+_circuit_consecutive_failures = 0
+_circuit_open_until            = 0.0
+
+
+def _tier1_circuit_open() -> bool:
+    return time.monotonic() < _circuit_open_until
+
+
+def _tier1_record_success() -> None:
+    global _circuit_consecutive_failures, _circuit_open_until
+    _circuit_consecutive_failures = 0
+    _circuit_open_until = 0.0
+
+
+def _tier1_record_failure() -> None:
+    global _circuit_consecutive_failures, _circuit_open_until
+    _circuit_consecutive_failures += 1
+    if _circuit_consecutive_failures >= _CIRCUIT_FAILURE_THRESHOLD:
+        _circuit_open_until = time.monotonic() + _CIRCUIT_COOLDOWN_SECONDS
+        logger.warning(
+            "[LLM CIRCUIT] Local Qwen failed %d times in a row — skipping Tier 1 "
+            "for the next %ds and going straight to Gemini.",
+            _circuit_consecutive_failures, _CIRCUIT_COOLDOWN_SECONDS,
+        )
+
+
 # ==========================================
 # 3-TIER LLM FALLBACK ORCHESTRATOR
-#   Tier 1: Local Qwen (always tried first — see project requirement)
+#   Tier 1: Local Qwen (always tried first — see project requirement —
+#           unless the circuit breaker above has it open)
 #   Tier 2: Gemini (only on genuine infra failure, not poor quality)
 #   Tier 3: caller's responsibility — see generate_rag_kiosk_response's
 #           RAG-only safety net, triggered when this raises
@@ -371,24 +519,32 @@ async def chat_completion_with_fallback(
     RAG-only safety net, since only it has the retrieved context to build
     that response from.
     """
-    # ── Tier 1: Local Qwen ──
-    try:
-        text = await chat_completion(messages, temperature=temperature, max_tokens=max_tokens)
-        logger.info("LLM Attempt: Local Qwen | STATUS: SUCCESS | MODEL USED: %s", LLM_CHAT_MODEL)
-        return text, "local", LLM_CHAT_MODEL
-    except Exception as e:
-        # %s on some httpx timeout/connect exceptions stringifies to "" with
-        # no useful text at all — logging only str(e) then produced literally
-        # blank "Reason: " lines with no way to tell what actually failed.
-        # Including the exception type name guarantees something diagnosable
-        # is always printed, even when the exception has no message body.
-        reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-        if not _is_infra_failure(e):
-            # Not an infra failure (e.g. a 4xx from our own bad request) —
-            # don't mask it by silently trying Gemini. Let it propagate.
-            logger.error("LLM Attempt: Local Qwen | STATUS: FAILED (non-infra, not falling back) | Reason: %s", reason)
-            raise
-        logger.warning("LLM Attempt: Local Qwen | STATUS: FAILED | Reason: %s", reason)
+    # ── Tier 1: Local Qwen (skipped while the circuit breaker is open) ──
+    if _tier1_circuit_open():
+        logger.info(
+            "LLM Attempt: Local Qwen | SKIPPED | Reason: circuit breaker open "
+            "(recent consecutive failures) — going straight to Gemini"
+        )
+    else:
+        try:
+            text = await chat_completion(messages, temperature=temperature, max_tokens=max_tokens)
+            logger.info("LLM Attempt: Local Qwen | STATUS: SUCCESS | MODEL USED: %s", LLM_CHAT_MODEL)
+            _tier1_record_success()
+            return text, "local", LLM_CHAT_MODEL
+        except Exception as e:
+            # %s on some httpx timeout/connect exceptions stringifies to "" with
+            # no useful text at all — logging only str(e) then produced literally
+            # blank "Reason: " lines with no way to tell what actually failed.
+            # Including the exception type name guarantees something diagnosable
+            # is always printed, even when the exception has no message body.
+            reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            if not _is_infra_failure(e):
+                # Not an infra failure (e.g. a 4xx from our own bad request) —
+                # don't mask it by silently trying Gemini. Let it propagate.
+                logger.error("LLM Attempt: Local Qwen | STATUS: FAILED (non-infra, not falling back) | Reason: %s", reason)
+                raise
+            logger.warning("LLM Attempt: Local Qwen | STATUS: FAILED | Reason: %s", reason)
+            _tier1_record_failure()
 
     # ── Tier 2: Gemini (only reached on a genuine Tier-1 infra failure) ──
     if ENABLE_GEMINI_FALLBACK and gemini_available():
@@ -406,6 +562,115 @@ async def chat_completion_with_fallback(
 
     # Both tiers exhausted — caller falls back to Tier 3 (RAG-only).
     raise RuntimeError("Local Qwen and Gemini fallback both failed or unavailable.")
+
+
+async def chat_completion_with_fallback_stream(
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    max_tokens: int = 300,
+):
+    """
+    Streaming sibling of chat_completion_with_fallback(). Yields
+    (text_delta, tier, model_used) tuples as they become available instead
+    of returning one complete string at the end.
+
+    Tier 1 (Local Qwen): now streams for real via chat_completion_stream
+    (standard OpenAI-compatible `stream: true` SSE, which vLLM/Ollama/
+    text-generation-webui/OpenAI/Azure all support) — added after
+    confirming the deployment's model (Qwen2.5-7B-Instruct via the default
+    "openai" API style, not the proprietary "query" style) supports it.
+    The one deliberate exception: LLM_API_STYLE=query (the team's own
+    custom POST /chat {"query": ...} server) has no defined streaming
+    contract, so chat_completion_stream falls back to yielding the whole
+    answer as one chunk for that style only — see its docstring.
+
+    Tier 2 (Gemini): yields real incremental deltas via
+    gemini_chat_completion_stream.
+
+    EDGE CASE, ACKNOWLEDGED NOT SOLVED: if Local Qwen streams a few
+    sentences successfully and THEN fails partway through (e.g. the
+    connection drops mid-response), those already-yielded sentences may
+    already be playing on the kiosk by the time we fall back to Gemini,
+    which starts its own answer from scratch — the visitor could hear a
+    few duplicate/inconsistent sentences in that specific scenario. In
+    every failure actually observed in this deployment's logs, Local Qwen
+    fails at connect time (ConnectTimeout) before yielding anything, so
+    this doesn't come up in practice — but it's a known gap if Local Qwen
+    becomes reliably reachable-but-flaky later.
+
+    Raises RuntimeError if every enabled tier failed, same contract as the
+    non-streaming version — caller still owns the Tier-3 RAG-only fallback.
+    """
+    if _tier1_circuit_open():
+        logger.info(
+            "LLM Attempt: Local Qwen | SKIPPED | Reason: circuit breaker open "
+            "(recent consecutive failures) — going straight to Gemini"
+        )
+    else:
+        try:
+            any_yielded = False
+            async for delta in chat_completion_stream(messages, temperature=temperature, max_tokens=max_tokens):
+                any_yielded = True
+                yield delta, "local", LLM_CHAT_MODEL
+            if any_yielded:
+                logger.info("LLM Attempt: Local Qwen (stream) | STATUS: SUCCESS | MODEL USED: %s", LLM_CHAT_MODEL)
+                _tier1_record_success()
+                return
+            raise ValueError("Local Qwen stream yielded no text")
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            if not _is_infra_failure(e):
+                logger.error("LLM Attempt: Local Qwen | STATUS: FAILED (non-infra, not falling back) | Reason: %s", reason)
+                raise
+            logger.warning("LLM Attempt: Local Qwen | STATUS: FAILED | Reason: %s", reason)
+            _tier1_record_failure()
+
+    if ENABLE_GEMINI_FALLBACK and gemini_available():
+        try:
+            any_yielded = False
+            async for delta in gemini_chat_completion_stream(messages, temperature=temperature, max_tokens=max_tokens):
+                any_yielded = True
+                yield delta, "gemini", GEMINI_MODEL
+            if any_yielded:
+                logger.info("Fallback: Gemini (stream) | STATUS: SUCCESS | MODEL USED: %s", GEMINI_MODEL)
+                return
+            raise ValueError("Gemini stream yielded no text")
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+            logger.error("Fallback: Gemini (stream) | STATUS: FAILED | Reason: %s", reason)
+    elif ENABLE_GEMINI_FALLBACK and not gemini_available():
+        logger.warning("Fallback: Gemini | SKIPPED | Reason: ENABLE_GEMINI_FALLBACK=true but GEMINI_API_KEY not set")
+    else:
+        logger.info("Fallback: Gemini | SKIPPED | Reason: ENABLE_GEMINI_FALLBACK is false")
+
+    raise RuntimeError("Local Qwen and Gemini fallback both failed or unavailable.")
+
+
+# Sentence-boundary splitter — deliberately the same rule the frontend uses
+# (WelcomeScreen.js's `raw` regex) so a sentence closed here is exactly what
+# the client would have chunked it into anyway: end on . ! or ?, optionally
+# followed by a closing quote, with any trailing whitespace consumed.
+_SENTENCE_END_RE = re.compile(r'[^.!?]*[.!?]+["\']?\s*')
+
+
+def _pop_complete_sentences(buf: str) -> tuple[list[str], str]:
+    """Given text accumulated so far, split off every COMPLETE sentence at
+    the front, returning (finished_sentences, remaining_incomplete_tail).
+    Sentences keep their trailing whitespace (the regex's trailing \\s*)
+    so that "".join()-ing them back together (generate_rag_kiosk_response's
+    non-streaming path) reproduces the original spacing exactly — stripping
+    it here would silently glue "sentence one.sentence two" together with
+    no space between them."""
+    sentences = []
+    pos = 0
+    for m in _SENTENCE_END_RE.finditer(buf):
+        if m.end() == m.start():
+            break
+        piece = buf[m.start():m.end()]
+        if piece.strip():
+            sentences.append(piece)
+        pos = m.end()
+    return sentences, buf[pos:]
 
 
 # ==========================================
@@ -805,28 +1070,34 @@ async def condense_query(question: str, history: list | None) -> str:
 # ==========================================
 # RAG RESPONSE GENERATION
 # ==========================================
-async def generate_rag_kiosk_response(question: str, history: list = None) -> str:
+async def generate_rag_kiosk_response_stream(question: str, history: list = None):
+    """
+    Streaming sibling of generate_rag_kiosk_response() — yields the answer
+    SENTENCE BY SENTENCE as it's generated, instead of the whole thing at
+    once. This is the single source of truth for the RAG/LLM pipeline;
+    generate_rag_kiosk_response() below just joins this generator's output,
+    so the streaming and non-streaming paths can never drift apart in
+    behavior — same routing, same prompt, same fallbacks, same logging.
+
+    All the deterministic pre-RAG routes (profanity guard, weather/traffic
+    live-info, off-topic) resolve to a single complete string quickly
+    anyway, so those are yielded as ONE chunk — there's nothing to gain by
+    streaming something that's already fast. Only the RNSIT_RAG / LLM-
+    generation path (the slow one: RAG search + Local Qwen/Gemini) streams
+    for real, sentence by sentence, as chat_completion_with_fallback_stream
+    produces text.
+    """
     words = question.lower().split()
     if any(bad_word in words for bad_word in PROFANITY_BLOCKLIST):
         logger.warning("[SAFETY TRIGGERED] Blocked inappropriate query words.")
-        return (
+        yield (
             "Let's keep our conversation respectful! I am the official RNSIT kiosk guide. "
             "How can I assist you politely with campus layouts, departments, or admissions today?"
         )
+        return
 
-    # Ensure RAGService collection is seeded (no-op after first call)
     await initialize_rag_knowledge_base()
 
-    # ── Live-info intent check BEFORE the RAG threshold gate ─────────────
-    # Weather/traffic questions can score misleadingly HIGH against generic
-    # chunks in a small corpus (confirmed: "how is the weather today?" hit
-    # 0.61 similarity against canteen/gym/banking facts — well above the
-    # 0.35 threshold), which routes them into RNSIT_RAG and skips
-    # _handle_offtopic() entirely — the ONLY place _try_fetch_weather() is
-    # called from. So live-info questions never reached the weather fetch,
-    # regardless of RAG score. Checking here, before RAG runs at all, means
-    # this can never be preempted by a coincidental high similarity score —
-    # same reasoning as why greetings/farewells are checked before RAG.
     weather_answer = await _try_fetch_weather(question)
     if weather_answer:
         logger.info("=" * 60)
@@ -835,7 +1106,8 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
         logger.info("LLM CALLED: NO")
         logger.info("FINAL RESPONSE: %r", weather_answer)
         logger.info("=" * 60)
-        return weather_answer
+        yield weather_answer
+        return
 
     traffic_answer = await _try_fetch_traffic(question)
     if traffic_answer:
@@ -845,14 +1117,13 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
         logger.info("LLM CALLED: NO")
         logger.info("FINAL RESPONSE: %r", traffic_answer)
         logger.info("=" * 60)
-        return traffic_answer
+        yield traffic_answer
+        return
 
     search_query = await condense_query(question, history or [])
     context_text, max_score, raw_results = await retrieve_relevant_context(search_query)
-
     max_score = safe_float(max_score)
 
-    # ── Step-15 structured debug logging ────────────────────────────────
     logger.info("=" * 60)
     logger.info("TRANSCRIPT: %r", question)
     logger.info("NORMALIZED QUERY: %r", search_query)
@@ -867,7 +1138,8 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
         logger.info("LLM CALLED: %s", "YES" if route != "RNSIT_UNKNOWN" else "NO")
         logger.info("FINAL RESPONSE: %r", answer)
         logger.info("=" * 60)
-        return answer
+        yield answer
+        return
 
     logger.info("ROUTE: RNSIT_RAG")
     logger.info("LLM CALLED: YES | MODEL: %s", LLM_CHAT_MODEL)
@@ -895,37 +1167,46 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
     )
 
     messages = [{"role": "system", "content": system_prompt}]
-
     if history:
         for msg in history[-4:]:
             speaker_val, text_val = parse_history_message(msg)
             if speaker_val and text_val:
                 role = "user" if speaker_val.lower() in ("visitor", "user") else "assistant"
                 messages.append({"role": role, "content": text_val})
-
     messages.append({"role": "user", "content": question})
 
+    buf = ""
+    full_answer_parts: list[str] = []
+    tier_seen, model_seen = "", ""
     try:
-        answer, tier, model_used = await chat_completion_with_fallback(
-            messages=messages,
-            temperature=0.2,
-            max_tokens=180,
-        )
-        answer = answer.strip() if answer else "I am having trouble formatting the response. Please try again."
-        logger.info("FINAL RESPONSE: %r (tier=%s, model=%s)", answer, tier, model_used)
+        async for delta, tier, model_used in chat_completion_with_fallback_stream(
+            messages=messages, temperature=0.2, max_tokens=180,
+        ):
+            tier_seen, model_seen = tier, model_used
+            buf += delta
+            ready, buf = _pop_complete_sentences(buf)
+            for s in ready:
+                full_answer_parts.append(s)
+                yield s
+        if buf.strip():
+            full_answer_parts.append(buf)
+            yield buf
+        full_answer = "".join(full_answer_parts).strip()
+        if not full_answer:
+            full_answer = "I am having trouble formatting the response. Please try again."
+            yield full_answer
+        logger.info("FINAL RESPONSE: %r (tier=%s, model=%s)", full_answer, tier_seen, model_seen)
         logger.info("=" * 60)
-        return answer
 
     except Exception as e:
         # ── Tier 3: both Local Qwen and Gemini failed — return the top
-        # retrieved RAG fact directly instead of an internal error. This is
-        # the "never crash, never show a stack trace" last resort — a plain,
-        # honest answer built straight from context_text rather than nothing.
+        # retrieved RAG fact directly instead of an internal error.
         logger.error("Local Qwen: FAILED")
         logger.error("Gemini: FAILED (or disabled) — %s", e)
         logger.info("Returning: Top RAG Answer")
         top_fact = raw_results[0].get("text", "") if raw_results else ""
         top_fact = _QA_LABEL_RE_LLM.sub("", top_fact).strip()
+        top_fact = _FACILITY_LABEL_RE_LLM.sub("", top_fact).strip()
         if top_fact:
             answer = (
                 "I am currently unable to generate a conversational response, "
@@ -935,7 +1216,17 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
             answer = "The kiosk AI engine is currently experiencing connectivity issues. Please visit the Admin Block."
         logger.info("FINAL RESPONSE: %r (tier=rag_only)", answer)
         logger.info("=" * 60)
-        return answer
+        yield answer
+
+
+async def generate_rag_kiosk_response(question: str, history: list = None) -> str:
+    """Non-streaming entry point — kept for callers that just want the full
+    string (e.g. anything hitting Redis cache logic before TTS). Internally
+    just joins generate_rag_kiosk_response_stream()'s output, so this can
+    never drift out of sync with the streaming path — one implementation,
+    two ways to consume it."""
+    parts = [s async for s in generate_rag_kiosk_response_stream(question, history)]
+    return "".join(parts).strip()
 
 
 # ==========================================

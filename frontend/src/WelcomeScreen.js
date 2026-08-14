@@ -10,6 +10,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
+  const awaitingAnswerRef = useRef(false);     // true from "ack started" until the real answer's speech starts/fails —
+                                               // keeps status at 'processing' (not 'ready') through that gap
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
@@ -70,7 +72,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
-  const rnsLogo = `${process.env.PUBLIC_URL}/rnslogo.png`;
 
   const visitorName = session?.user_name || 'Guest';
   const isReturning = session?.is_returning || false;
@@ -82,7 +83,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ? (visitCount > 2
       ? 'Welcome back, ' + visitorName + '! Great to see you again. How may I assist you today?'
       : 'Welcome back, ' + visitorName + '! How may I assist you today?')
-    : 'Welcome to R N S Institute of Technology. I am Voix Nova, your digital receptionist. '
+    : 'Welcome to R N S Institute of Technology. I am Nova, your digital receptionist. '
     + 'I can help you with admissions, departments, placements, fees, and directions around campus. '
     + 'How may I assist you today?');
 
@@ -93,7 +94,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   useEffect(() => {
     if (scrollRef.current)
       scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, liveText]);
+  }, [messages, liveText, processingHint]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -163,6 +164,26 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       text, speaker,
       timestamp: new Date().toLocaleTimeString()
     }]);
+  }, [setMessages]);
+
+  // Starts an EMPTY kiosk bubble and returns an appender that grows it one
+  // sentence at a time (used by sendToBackend + speakStream's onSentence so
+  // the bubble fills in exactly as fast as the voice speaks it).
+  const startProgressiveMessage = useCallback((speaker) => {
+    setMessages(prev => [...prev, {
+      text: '', speaker,
+      timestamp: new Date().toLocaleTimeString()
+    }]);
+    return (sentence) => {
+      setMessages(prev => {
+        if (!prev.length) return prev;
+        const next = prev.slice();
+        const last = next[next.length - 1];
+        const sep = last.text ? ' ' : '';
+        next[next.length - 1] = { ...last, text: cleanText(last.text + sep + sentence) };
+        return next;
+      });
+    };
   }, [setMessages]);
 
   // ── WAVEFORM ─────────────────────────────────────────────────────────────
@@ -401,6 +422,233 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [status, askingName]);
 
+  // speakStream(text, { onStart, onSentence, onDone }):
+  //   - onStart fires once, the moment the FIRST clip's audio starts playing
+  //     (kept for callers that just want a single "speech began" hook, e.g.
+  //     the ack bubble / farewell / greeting).
+  //   - onSentence(sentenceText, index) fires once PER CLIP, exactly when
+  //     that clip's audio starts playing — this is what keeps the on-screen
+  //     text in sync with what's actually being heard, instead of dumping
+  //     the whole answer the moment the first sentence starts.
+  //   - onDone fires once, when playback finishes (or is interrupted/falls
+  //     back to the browser voice).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const speakStream = useCallback(async (text, { onStart, onSentence, onDone } = {}) => {
+    // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
+    // (e.g. an acknowledgment like "let me check that" that hasn't finished
+    // yet) before starting this one. Without this, two clips play at once —
+    // this was the cause of garbled/overlapping speech after we added the
+    // instant-acknowledgment feature.
+    if (isSpeaking.current) interruptSpeaking();
+
+    window.speechSynthesis.cancel();
+    const myId = Symbol('speak');           // identifies this call so interruptSpeaking() can invalidate it
+    activeSpeakIdRef.current = myId;
+    // Mic is intentionally NOT paused here (unlike before) — it stays live
+    // through TTS so the visitor can barge in. echoCancellation on the mic
+    // stream (kioskMic.js) is what keeps it from hearing its own voice.
+    isSpeaking.current = true;
+    // NOTE: status is intentionally NOT set to 'speaking' here. Setting it
+    // this early makes the avatar (and anything else keyed off `status`)
+    // start its "speaking" animation before any audio has actually started
+    // playing — e.g. right after the network answer arrives, while TTS is
+    // still being fetched/synthesized. That reads as the avatar "speaking"
+    // before the voice/text actually show up. It's set inside fireStart()
+    // below instead, at the exact moment the first clip's audio begins.
+
+    const finish = () => {
+      if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
+      isSpeaking.current = false;
+      if (isMounted.current) startListening();   // resume mic for barge-in regardless
+      // Only settle on 'ready' if there's genuinely nothing left to do. If
+      // this was the instant-acknowledgment ("let me check that for you")
+      // finishing before the real answer has arrived, go back to
+      // 'processing' instead — otherwise the avatar sits idle/ready for a
+      // few seconds while the kiosk is still actually working, which reads
+      // as "did it hear me?" to the visitor. startListening() above may
+      // have just set 'ready' synchronously; this runs right after and wins.
+      setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
+    };
+
+    const fireStart = () => {
+      setStatus('speaking');    // avatar flips to "speaking" exactly when audio starts
+      if (onStart) { onStart(); onStart = null; }
+    };
+
+    // Fallback: robotic browser voice, only if backend TTS is unavailable.
+    // No per-sentence audio boundaries here, so the full text reveals at once
+    // (still correct: it's the moment THIS voice actually starts talking).
+    const browserSpeak = () => {
+      fireStart();
+      if (onSentence) { try { onSentence(text, 0); } catch (e) {} }
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = 'en-US';
+      utter.rate = 1.0;
+      utter.volume = 1;
+      utter.onend = finish;
+      utter.onerror = finish;
+      window.speechSynthesis.speak(utter);
+    };
+
+    // Primary: Kokoro voice, sentence-by-sentence pipeline —
+    // sentence N plays while sentence N+1 synthesizes, so first audio
+    // arrives after ONE sentence instead of the whole reply.
+    const fetchClip = (s) =>
+      fetch(BACKEND + '/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: s })
+      }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
+
+    // Web Audio: decode (~10ms) + schedule on a running cursor = gapless.
+    if (!playCtxRef.current) {
+      playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    const pctx = playCtxRef.current;
+    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
+    if (pctx.state === 'suspended') {
+      // Autoplay policy blocked us (no user gesture yet, e.g. the very
+      // first greeting). speechSynthesis is exempt — never stay silent.
+      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice. ' +
+        'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
+      browserSpeak();
+      return;
+    }
+    playCursorRef.current = pctx.currentTime;
+    if (!ttsGainRef.current) {
+      ttsGainRef.current = pctx.createGain();
+      ttsGainRef.current.connect(pctx.destination);
+    }
+    ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
+    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
+
+    // playClip resolves once the clip's audio has actually STARTED (not once
+    // it finishes) — the caller loop awaits it just long enough to fire
+    // onSentence in sync, then moves on to prefetch/schedule the next clip.
+    // Playback itself is scheduled back-to-back on playCursorRef regardless,
+    // so audio stays gapless even though we don't await full playback here.
+    const playClip = (b64, sentenceText, sentenceIndex) => new Promise(async (resolveStarted) => {
+      if (activeSpeakIdRef.current !== myId) return resolveStarted();   // interrupted before this clip started
+      try {
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const buf = await pctx.decodeAudioData(bytes.buffer);
+        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
+        const node = pctx.createBufferSource();
+        node.buffer = buf;
+        node.connect(ttsGainRef.current);
+        activeNodesRef.current.push(node);
+        node.onended = () => {
+          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+        };
+
+        const at = Math.max(pctx.currentTime, playCursorRef.current);
+        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
+        node.start(at);
+        playCursorRef.current = at + buf.duration;
+
+        // Fire onStart/onSentence exactly when THIS clip's audio begins —
+        // if it's scheduled to start later than "now" (queued behind an
+        // earlier clip that's still playing), wait for that moment instead
+        // of firing immediately, so text and voice stay in lockstep.
+        const announce = () => {
+          fireStart();                                     // status + first-clip-only hook
+          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) {} }
+          resolveStarted();
+        };
+        if (delayMs > 0) setTimeout(announce, delayMs);
+        else announce();
+      } catch (e) {
+        resolveStarted();                       // any decode failure -> skip clip
+      }
+    });
+
+    try {
+      const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
+        .map(s => s.trim()).filter(Boolean);
+
+      // Chunking for natural pacing:
+      //  - first chunk stays SHORT (fast time-to-first-audio)
+      //  - later sentences MERGE into ~2-sentence chunks so Kokoro speaks
+      //    across full stops itself with human-length pauses, instead of
+      //    one clip per sentence with a synthesis gap at every full stop
+      const sentences = [];
+      if (raw.length) {
+        let first = raw[0];
+        if (first.length > 60) {
+          const cut = first.indexOf(',');
+          if (cut > 15) {
+            sentences.push(first.slice(0, cut + 1));
+            first = first.slice(cut + 1).trim();
+          }
+        }
+        if (first) sentences.push(first);
+        let buf = '';
+        for (let i = 1; i < raw.length; i++) {
+          buf = buf ? buf + ' ' + raw[i] : raw[i];
+          if (buf.length >= 90) { sentences.push(buf); buf = ''; }
+        }
+        if (buf) sentences.push(buf);
+      }
+
+      // A tiny opener ("Hello!", "Sure.") as its own clip creates an
+      // audible seam right after it — merge it into the next chunk.
+      if (sentences.length > 1 && sentences[0].length < 25) {
+        sentences[1] = sentences[0] + ' ' + sentences[1];
+        sentences.shift();
+      }
+
+      // Prefetch two chunks ahead — playback almost never waits on synthesis.
+      // Each playClip() resolves as soon as ITS audio starts (see above), so
+      // this loop moves to fetching/queuing the next chunk immediately, while
+      // the actual audio for every chunk still plays back-to-back via the
+      // shared playCursorRef — sound stays gapless, text reveal stays synced.
+      let anyPlayed = false;
+      let lastClipPromise = Promise.resolve();
+      let p0 = fetchClip(sentences[0]);
+      let p1 = sentences.length > 1 ? fetchClip(sentences[1]) : null;
+
+      for (let i = 0; i < sentences.length; i++) {
+        if (activeSpeakIdRef.current !== myId) break;   // interrupted — stop scheduling more chunks
+        const b64 = await p0;
+        p0 = p1;
+        p1 = i + 2 < sentences.length ? fetchClip(sentences[i + 2]) : null;
+        if (b64) {
+          anyPlayed = true;
+          lastClipPromise = playClip(b64, sentences[i], i);
+          await lastClipPromise;
+        }
+      }
+
+      if (activeSpeakIdRef.current !== myId) return;    // interrupted — don't fall back to browser voice
+      if (!anyPlayed) { browserSpeak(); return; }
+
+      // Wait for the actual audio (not just the "started" signal) of the
+      // final scheduled clip before calling finish() — otherwise finish()
+      // (and startListening()) can fire while the last sentence is still
+      // being heard.
+      const lastEnd = playCursorRef.current;
+      const remainingMs = Math.max(0, (lastEnd - pctx.currentTime) * 1000);
+      await lastClipPromise;
+      if (remainingMs > 0) await new Promise(r => setTimeout(r, remainingMs));
+      if (activeSpeakIdRef.current !== myId) return;
+      finish();
+    } catch (e) {
+      if (activeSpeakIdRef.current !== myId) return;
+      console.error('[TTS] backend unavailable, using browser voice', e);
+      browserSpeak();
+    }
+  }, [startListening]);
+
+  // Thin wrapper over speakStream for callers that don't need per-sentence
+  // sync (ack bubble, farewell, greeting, error fallback) — same (onStart,
+  // onDone) signature as before.
+  const speak = useCallback((text, onStart, onDone) => (
+    speakStream(text, { onStart, onDone })
+  ), [speakStream]);
+
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
     if (!text) return;
@@ -431,6 +679,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       window.dispatchEvent(new Event('vrk-session-ended'));   // goodbye screen appears now
       return;
     }
+
+    // Set BEFORE the ack fires: from this point until the real answer's
+    // speech actually starts (or the request fails/is dropped), finish()
+    // in speakStream will treat any in-between "ready" moment (e.g. the ack
+    // finishing early) as still 'processing' — see awaitingAnswerRef above.
+    awaitingAnswerRef.current = true;
 
     // INSTANT ACKNOWLEDGMENT: a real receptionist reacts the moment you
     // finish speaking — not after a silent pause. We play a short filler
@@ -476,6 +730,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       const liveSid = sessionRef.current?.session_id || 'guest';
       if (data.dropped || liveSid !== sid) {
         console.info('[sendToBackend] dropped stale answer for', sid);
+        awaitingAnswerRef.current = false;
         isSpeaking.current = false;
         setStatus('ready');
         return;
@@ -487,9 +742,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
       });
-      speak(answer, () => { setProcessingHint(''); addMessage(answer, 'kiosk'); });
+
+      // Text and voice move together: an empty kiosk bubble opens the
+      // instant speech begins, then grows one sentence at a time — each
+      // sentence appears exactly when its audio starts playing, never
+      // before. No more "reveal the whole answer as soon as it's fetched".
+      let appendSentence = null;
+      speakStream(answer, {
+        onStart: () => {
+          awaitingAnswerRef.current = false;   // real answer is speaking now — resting state is 'ready' again
+          setProcessingHint('');
+          appendSentence = startProgressiveMessage('kiosk');
+        },
+        onSentence: (sentence) => { if (appendSentence) appendSentence(sentence); },
+      });
     } catch (e) {
       clearTimeout(askTimeout);
+      awaitingAnswerRef.current = false;
       setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
       console.error('[sendToBackend]', e);
       const fallback = e.name === 'AbortError'
@@ -497,169 +766,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         : 'Sorry, something went wrong. Please try again.';
       speak(fallback, () => addMessage(fallback, 'kiosk'));
     }
-  }, [session, addMessage]);
-
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speak = useCallback(async (text, onStart, onDone) => {
-    // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
-    // (e.g. an acknowledgment like "let me check that" that hasn't finished
-    // yet) before starting this one. Without this, two clips play at once —
-    // this was the cause of garbled/overlapping speech after we added the
-    // instant-acknowledgment feature.
-    if (isSpeaking.current) interruptSpeaking();
-
-    window.speechSynthesis.cancel();
-    const myId = Symbol('speak');           // identifies this call so interruptSpeaking() can invalidate it
-    activeSpeakIdRef.current = myId;
-    // Mic is intentionally NOT paused here (unlike before) — it stays live
-    // through TTS so the visitor can barge in. echoCancellation on the mic
-    // stream (kioskMic.js) is what keeps it from hearing its own voice.
-    isSpeaking.current = true;
-
-    const finish = () => {
-      if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
-      isSpeaking.current = false;
-      setStatus('ready');
-      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
-      if (isMounted.current) startListening();
-    };
-
-    // Visual "speaking" state (mouth animation, waves, badge) is set here —
-    // NOT above, at speak()-call-time — so Aria only *looks* like she's
-    // talking once audio has actually started (or is about to, for the
-    // scheduled Web Audio clip). This removes the visible lag between the
-    // avatar animating and sound actually being heard.
-    const fireStart = () => {
-      setStatus('speaking');
-      if (onStart) { onStart(); onStart = null; }
-    };
-
-    // Fallback: robotic browser voice, only if backend TTS is unavailable
-    const browserSpeak = () => {
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = 'en-US';
-      utter.rate = 1.0;
-      utter.volume = 1;
-      utter.onstart = fireStart;   // flip to 'speaking' exactly when the voice engine actually starts
-      utter.onend = finish;
-      utter.onerror = finish;
-      window.speechSynthesis.speak(utter);
-    };
-
-    // Primary: Kokoro voice, sentence-by-sentence pipeline —
-    // sentence N plays while sentence N+1 synthesizes, so first audio
-    // arrives after ONE sentence instead of the whole reply.
-    const fetchClip = (s) =>
-      fetch(BACKEND + '/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: s })
-      }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
-
-    // Web Audio: decode (~10ms) + schedule on a running cursor = gapless.
-    if (!playCtxRef.current) {
-      playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-    }
-    const pctx = playCtxRef.current;
-    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
-    if (pctx.state === 'suspended') {
-      // Autoplay policy blocked us (no user gesture yet, e.g. the very
-      // first greeting). speechSynthesis is exempt — never stay silent.
-      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice. ' +
-        'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
-      browserSpeak();
-      return;
-    }
-    playCursorRef.current = pctx.currentTime;
-    if (!ttsGainRef.current) {
-      ttsGainRef.current = pctx.createGain();
-      ttsGainRef.current.connect(pctx.destination);
-    }
-    ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
-    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
-
-    const playClip = (b64) => new Promise(async (resolve) => {
-      if (activeSpeakIdRef.current !== myId) return resolve();   // interrupted before this clip started
-      try {
-        const bin = atob(b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const buf = await pctx.decodeAudioData(bytes.buffer);
-        if (activeSpeakIdRef.current !== myId) return resolve();  // interrupted while decoding
-        const node = pctx.createBufferSource();
-        node.buffer = buf;
-        node.connect(ttsGainRef.current);
-        activeNodesRef.current.push(node);
-        node.onended = () => {
-          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-          resolve();
-        };
-        fireStart();                     // avatar + text flip to "speaking" right as this clip is scheduled
-        const at = Math.max(pctx.currentTime, playCursorRef.current);
-        node.start(at);
-        playCursorRef.current = at + buf.duration;
-      } catch (e) {
-        resolve();                       // any decode failure -> skip clip
-      }
-    });
-
-    try {
-      const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
-        .map(s => s.trim()).filter(Boolean);
-
-      // Chunking for natural pacing:
-      //  - first chunk stays SHORT (fast time-to-first-audio)
-      //  - later sentences MERGE into ~2-sentence chunks so Kokoro speaks
-      //    across full stops itself with human-length pauses, instead of
-      //    one clip per sentence with a synthesis gap at every full stop
-      const sentences = [];
-      if (raw.length) {
-        let first = raw[0];
-        if (first.length > 60) {
-          const cut = first.indexOf(',');
-          if (cut > 15) {
-            sentences.push(first.slice(0, cut + 1));
-            first = first.slice(cut + 1).trim();
-          }
-        }
-        if (first) sentences.push(first);
-        let buf = '';
-        for (let i = 1; i < raw.length; i++) {
-          buf = buf ? buf + ' ' + raw[i] : raw[i];
-          if (buf.length >= 90) { sentences.push(buf); buf = ''; }
-        }
-        if (buf) sentences.push(buf);
-      }
-
-      // A tiny opener ("Hello!", "Sure.") as its own clip creates an
-      // audible seam right after it — merge it into the next chunk.
-      if (sentences.length > 1 && sentences[0].length < 25) {
-        sentences[1] = sentences[0] + ' ' + sentences[1];
-        sentences.shift();
-      }
-
-      // Prefetch two chunks ahead — playback almost never waits on synthesis
-      let anyPlayed = false;
-      let p0 = fetchClip(sentences[0]);
-      let p1 = sentences.length > 1 ? fetchClip(sentences[1]) : null;
-
-      for (let i = 0; i < sentences.length; i++) {
-        if (activeSpeakIdRef.current !== myId) break;   // interrupted — stop scheduling more chunks
-        const b64 = await p0;
-        p0 = p1;
-        p1 = i + 2 < sentences.length ? fetchClip(sentences[i + 2]) : null;
-        if (b64) { anyPlayed = true; await playClip(b64); }
-      }
-
-      if (activeSpeakIdRef.current !== myId) return;    // interrupted — don't fall back to browser voice
-      if (!anyPlayed) { browserSpeak(); return; }
-      finish();
-    } catch (e) {
-      if (activeSpeakIdRef.current !== myId) return;
-      console.error('[TTS] backend unavailable, using browser voice', e);
-      browserSpeak();
-    }
-  }, [startListening]);
+  }, [session, addMessage, speakStream, startProgressiveMessage]);
 
   useEffect(() => {
     if (askingName) return;
@@ -716,6 +823,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     } catch (e) { console.error(e); }
   };
 
+
+
   const inputStyle = {
     width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
     borderRadius: '8px', fontSize: '15px', boxSizing: 'border-box',
@@ -724,9 +833,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
   const btnSecondary = { padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px', background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px' };
 
-  /* ── ANIMATED ARIA CHARACTER ─────────────────────────────────────────── */
-  const AriaCharacter = ({ st }) => (
-    <svg className={`aria-svg aria-${st}`} viewBox="0 0 320 500"
+  /* ── ANIMATED NOVA CHARACTER ─────────────────────────────────────────── */
+  const NovaCharacter = ({ st }) => (
+    <svg className={`nova-svg nova-${st}`} viewBox="0 0 320 500"
       style={{ width: '100%', maxWidth: '340px', overflow: 'visible', display: 'block' }}>
       <defs>
         <linearGradient id="skinG" x1="0" y1="0" x2="0" y2="1">
@@ -890,43 +999,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
-  const renderedMessages = messages.map((msg, i) => {
-    const isAria = msg.speaker === 'kiosk';
-    const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
-    return (
-      <div key={i} style={{
-        display: 'flex', flexDirection: 'column',
-        alignItems: isAria ? 'flex-start' : 'flex-end',
-        marginTop: prevSame ? '2px' : '8px'
-      }}>
-        {!prevSame && (
-          <span style={{
-            fontSize: '10px', color: '#bbb', marginBottom: '2px',
-            paddingLeft: isAria ? '6px' : 0, paddingRight: !isAria ? '6px' : 0, fontWeight: '600'
-          }}>
-            {isAria ? 'Aria' : visitorName}
-          </span>
-        )}
-        <div className="msg-in" style={{
-          maxWidth: '88%', padding: '8px 12px',
-          borderRadius: isAria
-            ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
-            : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-          background: isAria ? '#ffffff' : '#1a237e',
-          color: isAria ? '#1a1a1a' : '#ffffff',
-          fontSize: '13.5px', lineHeight: '1.5',
-          boxShadow: isAria ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
-          wordBreak: 'break-word'
-        }}>
-          {msg.text}
-          <span style={{ fontSize: '9px', color: isAria ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
-            {msg.timestamp}
-          </span>
-        </div>
-      </div>
-    );
-  });
-
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
@@ -942,53 +1014,53 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2">
                   <path d="M12 2 4 6v6c0 5 3.5 9 8 10 4.5-1 8-5 8-10V6l-8-4z" />
-                  <path d="M9 12l2 2 4-4" />
-                </svg>
-              </div>
-              <div>
-                <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
-                <div style={{ fontSize: '12px', color: '#999' }}>How Aria sees and remembers you</div>
-              </div>
-            </div>
-
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-              {[
-                {
-                  icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
-                  title: 'The camera is only used to greet you',
-                  body: 'The kiosk camera looks for a face so Aria knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
-                },
-                {
-                  icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
-                  title: 'Face data is saved only if you say yes',
-                  body: 'When you\u2019re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Aria can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
-                },
-                {
-                  icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
-                  title: 'Conversations are used only to help you',
-                  body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\u2019t used for advertising or shared outside the institute.'
-                },
-                {
-                  icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
-                  title: 'Your session ends automatically',
-                  body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
-                },
-              ].map((item, i) => (
-                <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
-                    {item.icon}
-                  </svg>
+                      <path d="M9 12l2 2 4-4" />
+                    </svg>
+                  </div>
                   <div>
-                    <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
-                    <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
+                    <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
+                    <div style={{ fontSize: '12px', color: '#999' }}>How Nova sees and remembers you</div>
                   </div>
                 </div>
-              ))}
-            </div>
 
-            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-              Questions about your data? Speak to a staff member at the Admin Block.
-            </p>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                  {[
+                    {
+                      icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
+                      title: 'The camera is only used to greet you',
+                      body: 'The kiosk camera looks for a face so Nova knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
+                    },
+                    {
+                      icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
+                      title: 'Face data is saved only if you say yes',
+                      body: 'When you\'re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Nova can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
+                    },
+                    {
+                      icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
+                      title: 'Conversations are used only to help you',
+                      body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\'t used for advertising or shared outside the institute.'
+                    },
+                    {
+                      icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
+                      title: 'Your session ends automatically',
+                      body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
+                    },
+                  ].map((item, i) => (
+                    <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
+                        {item.icon}
+                      </svg>
+                      <div>
+                        <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
+                        <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
+                  Questions about your data? Speak to a staff member at the Admin Block.
+                </p>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
               <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
@@ -1021,7 +1093,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   <path d="M12 72 Q12 54 40 54 Q68 54 68 72" fill="#FFCFA0" />
                 </svg>
                 <div>
-                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Aria 👋</div>
+                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Nova 👋</div>
                   <div style={{ fontSize: '13px', color: '#888' }}>I don&apos;t recognise you yet — what&apos;s your name?</div>
                 </div>
               </div>
@@ -1056,8 +1128,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <img src={rnsLogo} onError={e => { e.currentTarget.src = '/logo192.png'; e.currentTarget.style.filter = 'none'; }} alt="RNSIT Logo"
-            style={{ height: '40px', width: 'auto', objectFit: 'contain', filter: 'none', opacity: 1 }} />
+          <img src="/rnslogo.png" alt="RNSIT"
+            style={{ height: '40px', width: '40px', objectFit: 'contain' }} />
           <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
             RNS Institute of Technology
             <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
@@ -1072,7 +1144,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           </div>
           <button onClick={() => setPrivacyOpen(o => !o)}
             style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
-            ⚙ Privacy
+            🔒 Privacy
           </button>
         </div>
       </header>
@@ -1080,7 +1152,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       {/* ── MAIN BODY ── */}
       <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
 
-        {/* ══════════ LEFT: ANIMATED ARIA CHARACTER ══════════ */}
+        {/* ══════════ LEFT: ANIMATED Nova CHARACTER ══════════ */}
         <div style={{
           width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
@@ -1095,9 +1167,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
           }} />
 
-          {/* ── Aria SVG character ── */}
+          {/* ── Nova SVG character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
-            <AriaCharacter st={status} />
+            <NovaCharacter st={status} />
           </div>
 
           {/* ── Name + status badge ── */}
@@ -1105,7 +1177,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
             zIndex: 1, marginTop: '8px'
           }}>
-            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Aria</div>
+            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Nova</div>
             <div style={{ fontSize: '12px', color: '#5c6bc0', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
             <div style={{
               padding: '5px 18px', borderRadius: '20px', background: statusBg,
@@ -1157,17 +1229,52 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
 
             {messages.length === 0 && !liveText && status !== 'processing' && (
-              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '20px 12px', textAlign: 'center' }}>
+              <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '30px 12px', textAlign: 'center' }}>
                 <img src="/rnslogo.png" onError={e => { e.currentTarget.style.display = 'none'; }} alt="RNSIT Logo"
                   style={{ width: '120px', height: 'auto', objectFit: 'contain', opacity: 0.95, filter: 'drop-shadow(0 10px 20px rgba(26,35,126,0.18))' }} />
-                <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Aria will appear here</div>
+                <div style={{ fontSize: '14px', fontWeight: '700', color: '#9fa8da' }}>Your conversation with Nova will appear here</div>
                 <div style={{ fontSize: '12px', color: '#c5cae9' }}>Just speak — she&apos;s ready</div>
               </div>
             )}
 
-              {renderedMessages}
+            {messages.map((msg, i) => {
+              const isNova = msg.speaker === 'kiosk';
+              const prevSame = i > 0 && messages[i - 1].speaker === msg.speaker;
+              return (
+                <div key={i} style={{
+                  display: 'flex', flexDirection: 'column',
+                  alignItems: isNova ? 'flex-start' : 'flex-end',
+                  marginTop: prevSame ? '2px' : '8px'
+                }}>
+                  {!prevSame && (
+                    <span style={{
+                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
+                      paddingLeft: isNova ? '6px' : 0, paddingRight: !isNova ? '6px' : 0, fontWeight: '600'
+                    }}>
+                      {isNova ? 'Nova' : visitorName}
+                    </span>
+                  )}
+                  <div className="msg-in" style={{
+                    maxWidth: '88%', padding: '8px 12px',
+                    borderRadius: isNova
+                      ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
+                      : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
+                    background: isNova ? '#ffffff' : '#1a237e',
+                    color: isNova ? '#1a1a1a' : '#ffffff',
+                    fontSize: '13.5px', lineHeight: '1.5',
+                    boxShadow: isNova ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+                    wordBreak: 'break-word'
+                  }}>
+                    {msg.text}
+                    <span style={{ fontSize: '9px', color: isNova ? '#ccc' : 'rgba(255,255,255,0.5)', marginLeft: '6px', float: 'right', marginTop: '3px', whiteSpace: 'nowrap' }}>
+                      {msg.timestamp}
+                    </span>
+                  </div>
+                </div>
+              );
+            })}
 
-                {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
                   while idle (not mid-question). Turns "answer machine" into
                   something that keeps the conversation moving — tapping a
                   chip routes through the SAME sendToBackend() pipeline as a
@@ -1205,39 +1312,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   </div>
                 </div>
               )}
-
               {liveText && (
-                <>
-                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end' }}>
-                    <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                    <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                      {liveText}
-                    </div>
+                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
+                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                    {liveText}
                   </div>
-                  <div style={{
-                    background: '#fff', borderRadius: '14px 14px 14px 4px', padding: '10px 14px',
-                    boxShadow: '0 1px 3px rgba(0,0,0,0.08)', display: 'flex', gap: '4px', alignItems: 'center'
-                  }}>
-                    <span className="td" style={{ '--d': '0ms' }} />
-                    <span className="td" style={{ '--d': '160ms' }} />
-                    <span className="td" style={{ '--d': '320ms' }} />
-                  </div>
-                </>
-              )}
-
-            {/* live speech text */}
-            {liveText && (
-              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
-                <span style={{ fontSize: '10px', color: '#bbb', marginBottom: '2px', paddingRight: '6px', fontWeight: '600' }}>{visitorName}</span>
-                <div style={{
-                  maxWidth: '88%', padding: '8px 12px', borderRadius: '14px 14px 4px 14px',
-                  background: 'rgba(26,35,126,0.07)', color: '#3949ab', fontSize: '13px',
-                  fontStyle: 'italic', lineHeight: '1.5', border: '1.5px dashed #9fa8da'
-                }}>
-                  {liveText}
                 </div>
-              </div>
-            )}
+              )}
           </div>
 
           {/* voice footer */}
@@ -1279,7 +1361,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 {statusLabel}
               </span>
             )}
-            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Aria AI</span>
+            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Nova AI</span>
           </div>
         </div>
       </div>
@@ -1311,19 +1393,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         @keyframes tdBounce { 0%,60%,100%{transform:translateY(0);background:#c5cae9} 30%{transform:translateY(-6px);background:#7e57c2} }
 
         /* ══════════════════════════════
-           ARIA CHARACTER ANIMATIONS
+             Nova CHARACTER ANIMATIONS
         ══════════════════════════════ */
 
         /* BODY — gentle breathing (always on) */
-        .aria-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
+        .nova-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
         @keyframes charBreathe { 0%,100%{transform:scaleY(1)} 50%{transform:scaleY(1.016)} }
 
         /* HEAD — base: idle micro-float */
-        .aria-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
+        .nova-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
         @keyframes idleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
 
         /* ── LISTENING ── */
-        .aria-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
+        .nova-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
         @keyframes listenLean { to{transform:translateX(10px) rotate(6deg)} }
 
         /* pulse ring */
@@ -1332,11 +1414,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         @keyframes lRing { 0%{r:92;opacity:0.55} 100%{r:140;opacity:0} }
 
         /* ── PROCESSING ── */
-        .aria-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
+        .nova-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
         @keyframes thinkTilt { to{transform:translateX(-12px) rotate(-7deg)} }
 
         /* thinking arm rise */
-        .aria-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
+        .nova-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
         @keyframes armRise { from{transform:translateY(30px);opacity:0} to{transform:none;opacity:1} }
 
         /* thinking bubble float */
@@ -1348,12 +1430,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         @keyframes browFurrow { to{transform:translateY(4px)} }
 
         /* ── SPEAKING ── */
-        .aria-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
+        .nova-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
         @keyframes headBob { 0%,100%{transform:translateY(0) rotate(0)} 30%{transform:translateY(-5px) rotate(1.5deg)} 70%{transform:translateY(2px) rotate(-1deg)} }
 
         /* mouth alternates: a visible ↔ b visible */
-        .aria-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
-        .aria-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
+        .nova-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
+        .nova-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
         @keyframes mA { 0%,49%{opacity:1} 50%,100%{opacity:0} }
         @keyframes mB { 0%,49%{opacity:0} 50%,100%{opacity:1} }
 
@@ -1368,8 +1450,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 }
 
 
-// ── Aria's avatar: used in message rows and header ───────────────────────
-const AriaAvatar = ({ size = 38, speaking = false }) => (
+// ── Nova's avatar: used in message rows and header ───────────────────────
+const NovaAvatar = ({ size = 38, speaking = false }) => (
   <div style={{ position: 'relative', flexShrink: 0 }}>
     {speaking && (
       <>
@@ -1392,5 +1474,3 @@ const AriaAvatar = ({ size = 38, speaking = false }) => (
     </div>
   </div>
 );
-
-// Dynamic header status text
