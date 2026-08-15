@@ -17,6 +17,7 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [lastSession, setLastSession] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [lastFarewell, setLastFarewell] = useState('');
   const pollRef = useRef(null);
   const goodbyeTimer = useRef(null);
   const prevActiveRef = useRef(false);
@@ -31,6 +32,11 @@ export default function App() {
   const [videoDims, setVideoDims] = useState({ w: 640, h: 480 });
   const [camError, setCamError] = useState(null);
   const [camStream, setCamStream] = useState(null);
+  // Experimental: a debounced blink EVENT from detection.py (true for a
+  // single WS message per genuine blink). Used only as an optional "yes"
+  // gesture by WelcomeScreen's voice-based name/confirmation flow — it
+  // never drives detState or the session lifecycle.
+  const [blink, setBlink] = useState(false);
 
   const hiddenVideoRef = useRef(null);      // used only for frame capture
   const captureCanvasRef = useRef(null);
@@ -55,6 +61,14 @@ export default function App() {
           setDetState(data.state || 'IDLE');
           setIdentity(data.identity || '');
           setBbox(data.present && data.bbox ? data.bbox : null);
+          // `blink` is a one-shot event per message — set it true only when
+          // the server reports one, and let consumers debounce/reset it.
+          if (data.blink) {
+            setBlink(true);
+            // auto-clear shortly after so it behaves like an edge/event,
+            // not a held-down state — consumers see a brief true pulse.
+            setTimeout(() => setBlink(false), 250);
+          }
         } catch (_) { }
       };
 
@@ -140,6 +154,7 @@ export default function App() {
           setScreen('welcome');
         } else {
           if (prevActiveRef.current) {
+            setLastFarewell('');
             setSession(current => { setLastSession(current); return null; });
             setScreen('goodbye');
             goodbyeTimer.current = setTimeout(() => {
@@ -159,7 +174,9 @@ export default function App() {
     poll();
     pollRef.current = setInterval(poll, IDLE_POLL_MS);
 
-    const onEnded = () => {
+    const onEnded = (ev) => {
+      // Capture the farewell text if WelcomeScreen sent it with the event
+      if (ev.detail?.farewell) setLastFarewell(ev.detail.farewell);
       clearInterval(pollRef.current);
       pollRef.current = setInterval(poll, IDLE_POLL_MS);
       poll();
@@ -181,7 +198,7 @@ export default function App() {
       startWs.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === 'session_start') {
+          if (msg.type === 'session_start' || msg.type === 'asking_name') {
             clearInterval(pollRef.current);
             poll();                          // switch screens right now
             pollRef.current = setInterval(poll, ACTIVE_POLL_MS);
@@ -203,7 +220,7 @@ export default function App() {
 
   const askingName = session?.asking_name === true;
 
-  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream };
+  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream, blink };
 
   return (
     <>
@@ -216,7 +233,7 @@ export default function App() {
         <WelcomeScreen session={session} messages={messages} setMessages={setMessages}
           askingName={askingName} {...detectionProps} />
       )}
-      {screen === 'goodbye' && <GoodbyeScreen session={lastSession} />}
+      {screen === 'goodbye' && <GoodbyeScreen session={lastSession} farewell={lastFarewell} />}
       {screen === 'idle' && <IdleScreen {...detectionProps} />}
     </>
   );

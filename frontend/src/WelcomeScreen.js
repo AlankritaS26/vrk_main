@@ -3,9 +3,8 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
-export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
+export default function WelcomeScreen({ session, messages, setMessages, askingName, blink, detState }) {
   const scrollRef = useRef(null);
-  const inputRef = useRef(null);
   const camVideoRef = useRef(null);
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
@@ -17,12 +16,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
                                                // (explicitly non-interruptible, per spec — it
                                                // is one short message that must always finish)
+  const handlingDepartureRef = useRef(false);  // true while handling 3s face departure prompt
   const isListening = useRef(false);
   const analyserRef = useRef(null);
   const animFrameRef = useRef(null);
   const canvasRef = useRef(null);
   const audioCtxRef = useRef(null);
   const statusRef = useRef('ready');        // readable inside callbacks
+  const detStateRef = useRef(detState || 'IDLE');
+  useEffect(() => { detStateRef.current = detState || 'IDLE'; }, [detState]);
   const streamRef = useRef(null);           // persistent mic stream
   const pendingUtteranceRef = useRef(null);
   const playCtxRef = useRef(null);              // Web Audio playback context
@@ -31,6 +33,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
+  const [blinkBadge, setBlinkBadge] = useState(false);
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -52,9 +55,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);      // speech captured while busy
 
-  const [name, setName] = useState('');
-  const [saveData, setSaveData] = useState(true);
-  const [submitted, setSubmitted] = useState(false);
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
@@ -72,6 +72,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
+
+  // ── Voice-based name capture (NO TYPING) ──────────────────────────────────
+  // Replaces the old "type your name" modal entirely. Nova asks out loud,
+  // listens for the spoken answer via the same STT pipeline used for
+  // regular questions, then asks (out loud) whether to remember the
+  // visitor — answerable by voice ("yes"/"no") or, experimentally, by
+  // blinking once for "yes". A single tap fallback ("Continue as Guest")
+  // stays available for accessibility/robustness, but there is no keyboard
+  // entry anywhere in this flow.
+  const [nameStage, setNameStage] = useState('idle');
+  // idle | asking | listening_name | confirming | listening_confirm | saving | done
+  const [nameHeard, setNameHeard] = useState('');
+  const [nameFlowHint, setNameFlowHint] = useState('');
+  const nameMicRef = useRef(null);
+  const nameFlowIdRef = useRef(0);          // bumped to invalidate an in-flight run
+  const blinkRef = useRef(false);
+  useEffect(() => { blinkRef.current = blink; }, [blink]);
 
   const visitorName = session?.user_name || 'Guest';
   const isReturning = session?.is_returning || false;
@@ -101,37 +118,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     return () => { isMounted.current = false; stopWaveform(); };
   }, []);
 
-  // ── Backend event WebSocket — server-pushed session_end ─────────────────
-  // Handles inactivity timeout and detection-triggered session ends so the
-  // goodbye screen appears immediately without waiting for the poll heartbeat.
-  useEffect(() => {
-    const WS = BACKEND.replace(/^http/, 'ws');
-    let ws;
-    let dead = false;
-    function connect() {
-      if (dead) return;
-      ws = new WebSocket(WS + '/ws');
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === 'session_end') {
-            // Kill any audio + pending work from the ended session so nothing
-            // bleeds into the next visitor — EXCEPT the farewell, which is the
-            // one line meant to play as the session ends.
-            if (!farewellPlayingRef.current) {
-              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
-              pendingUtteranceRef.current = null;
-            }
-            window.dispatchEvent(new Event('vrk-session-ended'));
-          }
-        } catch (_) { }
-      };
-      ws.onclose = () => { if (!dead) setTimeout(connect, 3000); };
-    }
-    connect();
-    return () => { dead = true; ws?.close(); };
-  }, []);
-
   // ── Camera sidebar ────────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
@@ -148,13 +134,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       camStreamRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    if (askingName) {
-      setSubmitted(false); setName(''); setSaveData(true);
-      setTimeout(() => inputRef.current?.focus(), 100);
-    }
-  }, [askingName]);
 
   const cleanText = (t) => (t || '').replace(/\u2014|\u2013/g, ', ').replace(/\s+,/g, ',');
 
@@ -401,7 +380,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [askingName, startWaveform, handleUtterance]);
 
-  // pause the mic while the name modal is open; the mount effect resumes it
+  // pause the mic while the name flow is running; the mount effect resumes it
   useEffect(() => {
     if (askingName) micRef.current?.pause();
   }, [askingName]);
@@ -643,11 +622,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, [startListening]);
 
   // Thin wrapper over speakStream for callers that don't need per-sentence
-  // sync (ack bubble, farewell, greeting, error fallback) — same (onStart,
-  // onDone) signature as before.
+  // sync (ack bubble, farewell, greeting, error fallback, name flow) — same
+  // (onStart, onDone) signature as before.
   const speak = useCallback((text, onStart, onDone) => (
     speakStream(text, { onStart, onDone })
   ), [speakStream]);
+
+  // Promise-returning wrapper: resolves once THIS utterance has fully
+  // finished playing. Used by the name flow below, which needs to speak a
+  // prompt and then wait for it to end before it starts listening.
+  const speakAndWait = useCallback((text, onStart) => (
+    new Promise((resolve) => { speak(text, onStart, resolve); })
+  ), [speak]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
@@ -779,6 +765,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // the kiosk speaks the greeting first — the visitor never has to start.
   const greetedRef = useRef(null);
   const lastGreetRef = useRef({ text: '', ts: 0 });
+  // ── Interactive/happy-moment touch: a brief sparkle burst plays with the
+  // FIRST-TIME-visitor greeting only — a small, on-brand "nice to meet you"
+  // flourish. It never appears for returning visitors or mid-conversation,
+  // so it can't distract from the assistant role.
+  const [celebrate, setCelebrate] = useState(false);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     if (askingName) return;
@@ -805,6 +796,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // NEW VISITOR: this greeting is explicitly non-interruptible and
       // fires exactly once (guarded by visitKey above).
       greetingPlayingRef.current = true;
+      setCelebrate(true);
+      setTimeout(() => setCelebrate(false), 2200);
       speak(greeting, () => addMessage(greeting, 'kiosk'), () => {
         greetingPlayingRef.current = false;
       });
@@ -814,24 +807,277 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [session?.session_id, session?.resumed_at, askingName]);
 
-  const handleSubmitName = async (overrideName, overrideSave) => {
-    const finalName = (overrideName ?? name).trim() || 'Guest';
-    const finalSave = overrideSave ?? saveData;
-    setSubmitted(true);
+  // ── Voice name-capture helpers ────────────────────────────────────────────
+  const destroyNameMic = useCallback(() => {
+    try { nameMicRef.current?.destroy(); } catch (e) { }
+    nameMicRef.current = null;
+  }, []);
+
+  // Listens for ONE utterance on a short-lived, dedicated mic instance and
+  // resolves with the transcribed text ('' on timeout/misfire/error). Kept
+  // completely separate from the main conversational mic (micRef) so the
+  // Q&A pipeline's state machine is never touched by this flow.
+  const captureUtteranceText = useCallback((timeoutMs = 9000) => {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finishOnce = (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        destroyNameMic();
+        resolve(val);
+      };
+      const timer = setTimeout(() => finishOnce(''), timeoutMs);
+
+      createKioskMic({
+        onStream: () => { },
+        onSpeechStart: () => { if (isMounted.current) setNameFlowHint('Listening…'); },
+        onSpeechEnd: async (audio) => {
+          try {
+            const i16 = float32ToInt16(audio);
+            const response = await fetch(BACKEND + '/stt/pcm', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: i16.buffer
+            });
+            const result = await response.json();
+            finishOnce((result.text || '').trim());
+          } catch (e) {
+            finishOnce('');
+          }
+        },
+        onMisfire: () => { if (isMounted.current) setNameFlowHint(''); },
+      }).then((mic) => {
+        if (settled) { try { mic.destroy(); } catch (e) { } return; }
+        nameMicRef.current = mic;
+      }).catch(() => finishOnce(''));
+    });
+  }, [destroyNameMic]);
+
+  // Waits for a spoken "yes"/"no" OR a single blink (experimental "yes"
+  // gesture), whichever comes first. Resolves true/false, or null if
+  // neither a clear answer nor a blink arrived before the timeout.
+  // Waits for a spoken "yes"/"no" OR blinking ("blink 2 times for yes"), whichever comes first.
+  const captureYesNo = useCallback((timeoutMs = 9000) => {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finishOnce = (val) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        clearInterval(blinkPoll);
+        destroyNameMic();
+        resolve(val);
+      };
+      const timer = setTimeout(() => finishOnce(null), timeoutMs);
+      const blinkPoll = setInterval(() => {
+        if (blinkRef.current) {
+          if (isMounted.current) {
+            setBlinkBadge(true);
+            setTimeout(() => setBlinkBadge(false), 2200);
+          }
+          finishOnce(true);
+        }
+      }, 100);
+
+      createKioskMic({
+        onStream: () => { },
+        onSpeechStart: () => { if (isMounted.current) setNameFlowHint('Listening…'); },
+        onSpeechEnd: async (audio) => {
+          try {
+            const i16 = float32ToInt16(audio);
+            const response = await fetch(BACKEND + '/stt/pcm', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: i16.buffer
+            });
+            const result = await response.json();
+            const heard = (result.text || '').trim().toLowerCase();
+            if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me)\b/i.test(heard)) finishOnce(true);
+            else if (/\b(no|nope|nah|wrong|incorrect|not right|not that|different|change)\b/i.test(heard) || /don.?t/i.test(heard)) finishOnce(false);
+            else finishOnce(null);
+          } catch (e) {
+            finishOnce(null);
+          }
+        },
+        onMisfire: () => { if (isMounted.current) setNameFlowHint(''); },
+      }).then((mic) => {
+        if (settled) { try { mic.destroy(); } catch (e) { } return; }
+        nameMicRef.current = mic;
+      }).catch(() => finishOnce(null));
+    });
+  }, [destroyNameMic]);
+
+  const submitVoiceName = useCallback(async (finalName, save) => {
     try {
-      await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) + '&save=' + finalSave, { method: 'POST' });
-    } catch (e) { console.error(e); }
-  };
+      await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) +
+        '&save=' + save, { method: 'POST' });
+    } catch (e) { console.error('[NAME FLOW] submit failed', e); }
+    if (isMounted.current) setNameStage('done');
+  }, []);
 
+  // Full orchestration: speak suddenly -> wait until name is spoken ->
+  // ask if correct with blink 2 times -> if not, ask name again! Entirely voice/visual.
+  const runNameFlow = useCallback(async () => {
+    const myRun = ++nameFlowIdRef.current;
+    const stillCurrent = () => nameFlowIdRef.current === myRun && isMounted.current;
 
+    while (stillCurrent()) {
+      setNameHeard('');
+      setNameFlowHint('');
+      setNameStage('asking');
+      // Speaks suddenly when asking for name
+      await speakAndWait("Hi! May I know your name?");
+      if (!stillCurrent()) return;
 
-  const inputStyle = {
-    width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
-    borderRadius: '8px', fontSize: '15px', boxSizing: 'border-box',
-    outline: 'none', color: '#1a237e', background: '#f8f9ff', transition: 'border 0.2s'
-  };
+      setNameStage('listening_name');
+      let heard = await captureUtteranceText(10000);
+      if (!stillCurrent()) return;
+
+      while (!heard && stillCurrent()) {
+        setNameStage('asking');
+        await speakAndWait("Sorry, I didn't catch that. Could you please say your name?");
+        if (!stillCurrent()) return;
+        setNameStage('listening_name');
+        heard = await captureUtteranceText(10000);
+      }
+      if (!stillCurrent()) return;
+
+      const finalName = heard.replace(/[.!?]+$/, '').trim();
+      setNameHeard(finalName);
+      setNameStage('confirming');
+      await speakAndWait(
+        `I heard ${finalName}. Is that correct? Blink 2 times for yes, or say no to try again.`
+      );
+      if (!stillCurrent()) return;
+
+      setNameStage('listening_confirm');
+      const answer = await captureYesNo(9000);
+      if (!stillCurrent()) return;
+
+      if (answer === true) {
+        // Confirmed!
+        setNameStage('saving');
+        await speakAndWait(`Great to meet you, ${finalName}!`);
+        if (!stillCurrent()) return;
+        await submitVoiceName(finalName, true);
+        break;
+      } else if (answer === false) {
+        // User said no -> ask name again!
+        setNameStage('asking');
+        await speakAndWait("Sorry about that! Let's try again. What is your name?");
+        // Loops back to ask name again
+      } else {
+        // Silence/timeout -> ask if correct or say no to retry
+        setNameStage('confirming');
+        await speakAndWait(`If your name is ${finalName}, blink 2 times for yes, or say no to change it.`);
+        if (!stillCurrent()) return;
+        setNameStage('listening_confirm');
+        const retryAnswer = await captureYesNo(7000);
+        if (!stillCurrent()) return;
+        if (retryAnswer === true) {
+          setNameStage('saving');
+          await speakAndWait(`Great to meet you, ${finalName}!`);
+          if (!stillCurrent()) return;
+          await submitVoiceName(finalName, true);
+          break;
+        } else {
+          setNameStage('asking');
+          await speakAndWait("Let's try again. Could you please say your name?");
+          // Loops back to ask name again
+        }
+      }
+    }
+  }, [speakAndWait, captureUtteranceText, captureYesNo, submitVoiceName]);
+
+  useEffect(() => {
+    if (askingName) {
+      if (nameStage === 'idle') runNameFlow();
+    } else if (nameStage !== 'idle') {
+      // Visitor left / session moved on mid-flow — invalidate and reset.
+      nameFlowIdRef.current++;
+      destroyNameMic();
+      setNameStage('idle');
+      setNameFlowHint('');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [askingName]);
+
+  const nameFlowStatusLabel = {
+    asking: 'Nova is speaking…',
+    listening_name: nameFlowHint || 'Listening for your name…',
+    confirming: 'Nova is speaking…',
+    listening_confirm: nameFlowHint || 'Blink 2 times for Yes, or say "No"…',
+    saving: 'Setting up your session…',
+    done: 'All set!',
+  }[nameStage] || 'One moment…';
+
+  // ── Backend event WebSocket — server-pushed session_end & are_you_there ──
+  const handleDepartureCheck = useCallback(async (targetName) => {
+    if (handlingDepartureRef.current || farewellPlayingRef.current) return;
+    handlingDepartureRef.current = true;
+    const name = targetName || session?.user_name || 'there';
+    const promptText = (name !== 'there' && name !== 'Guest' && name !== 'Unknown' && name !== '')
+      ? `Are you there, ${name}?`
+      : 'Are you there?';
+
+    try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
+
+    // Show the prompt in the chat UI too
+    addMessage(promptText, 'kiosk');
+    await speakAndWait(promptText);
+    // Listen for response for 2 seconds as requested by user
+    const heardAnswer = await captureUtteranceText(2000);
+    const faceBack = detStateRef.current === 'ACTIVE';
+    const heardYes = /\b(yes|yeah|yep|yup|here|im here|i am here|present|hi|hello|stay|i am|im)\b/i.test(heardAnswer || '');
+
+    if (faceBack || heardYes) {
+      handlingDepartureRef.current = false;
+      const gladText = "Great! Glad you're still here.";
+      addMessage(gladText, 'kiosk');
+      speak(gladText);
+    } else {
+      const farewellText = (name !== 'there' && name !== 'Guest' && name !== 'Unknown' && name !== '')
+        ? `Goodbye, ${name}! Have a wonderful day.`
+        : 'Goodbye! Have a wonderful day.';
+      // Show farewell in chat before the screen transitions
+      addMessage(farewellText, 'kiosk');
+      farewellPlayingRef.current = true;
+      speak(farewellText, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + (session?.session_id || ''), { method: 'POST' }).catch(() => {});
+      window.dispatchEvent(new Event('vrk-session-ended'));
+      handlingDepartureRef.current = false;
+    }
+  }, [session, speak, speakAndWait, captureUtteranceText, addMessage]);
+
+  useEffect(() => {
+    const WS = BACKEND.replace(/^http/, 'ws');
+    let ws;
+    let dead = false;
+    function connect() {
+      if (dead) return;
+      ws = new WebSocket(WS + '/ws');
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'session_end') {
+            if (!farewellPlayingRef.current) {
+              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
+              pendingUtteranceRef.current = null;
+            }
+            window.dispatchEvent(new Event('vrk-session-ended'));
+          } else if (msg.type === 'are_you_there') {
+            handleDepartureCheck(msg.user_name);
+          }
+        } catch (_) { }
+      };
+      ws.onclose = () => { if (!dead) setTimeout(connect, 3000); };
+    }
+    connect();
+    return () => { dead = true; ws?.close(); };
+  }, [handleDepartureCheck]);
+
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
-  const btnSecondary = { padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px', background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px' };
 
   /* ── ANIMATED NOVA CHARACTER ─────────────────────────────────────────── */
   const NovaCharacter = ({ st }) => (
@@ -999,6 +1245,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
+  // The name flow drives its own tiny status pill on top of Nova (ready/
+  // listening/speaking all map onto the same avatar states it already has).
+  const nameFlowAvatarStatus = (nameStage === 'asking' || nameStage === 'confirming')
+    ? 'speaking'
+    : (nameStage === 'listening_name' || nameStage === 'listening_confirm')
+      ? 'listening'
+      : 'processing';
+
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
@@ -1033,7 +1287,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                     {
                       icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
                       title: 'Face data is saved only if you say yes',
-                      body: 'When you\'re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Nova can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
+                      body: 'When Nova asks for your name, she also asks — out loud — whether you\'d like to be remembered for next time. Say yes (or blink) and your name and face are stored so Nova can greet you by name next time. Say no, or continue as a guest, and nothing is saved.'
                     },
                     {
                       icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
@@ -1069,54 +1323,131 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
+      {/* ── VOICE-BASED NAME CAPTURE (no typing) ──────────────────────────
+          Replaces the old text-input modal. Nova speaks the prompts; the
+          visitor answers out loud (or blinks "yes" at the remember-me
+          step). A single tap fallback keeps the flow accessible without
+          ever requiring a keyboard. */}
       {askingName && !privacyOpen && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '440px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
-            {submitted ? (
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(13, 24, 96, 0.55)', backdropFilter: 'blur(12px)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{
+            background: 'linear-gradient(145deg, rgba(255, 255, 255, 0.96) 0%, rgba(240, 244, 255, 0.96) 100%)',
+            borderRadius: '24px', padding: '36px 42px', width: '460px',
+            boxShadow: '0 24px 72px rgba(26, 35, 126, 0.35)', textAlign: 'center',
+            border: '1.5px solid rgba(255, 255, 255, 0.9)', position: 'relative', overflow: 'hidden'
+          }}>
+            {/* Top gradient glow bar */}
+            <div style={{ position: 'absolute', top: 0, left: 0, right: 0, height: '6px', background: 'linear-gradient(90deg, #1e2e96, #7c4dff, #43a047)' }} />
+
+            {/* Double blink toast notification */}
+            {blinkBadge && (
+              <div style={{
+                position: 'absolute', top: '16px', left: '50%', transform: 'translateX(-50%)',
+                background: 'linear-gradient(90deg, #2e7d32, #43a047)', color: '#fff',
+                padding: '6px 16px', borderRadius: '20px', fontSize: '12.5px', fontWeight: '700',
+                boxShadow: '0 4px 14px rgba(46,125,50,0.4)', zIndex: 10, animation: 'msgIn 0.25s ease'
+              }}>
+                👁️👁️ Double Blink Detected (Yes!)
+              </div>
+            )}
+
+            {nameStage === 'done' ? (
+              <>
+                <div style={{ width: '68px', height: '68px', borderRadius: '50%', background: 'linear-gradient(135deg, #e8f5e9, #c8e6c9)', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px', boxShadow: '0 8px 24px rgba(67,160,71,0.25)' }}>
+                  <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#2e7d32" strokeWidth="2.8"><polyline points="20 6 9 17 4 12" /></svg>
                 </div>
-                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>
-                  {saveData ? 'Welcome, ' + (name || 'Guest') + '!' : 'Welcome, Guest!'}
+                <div style={{ fontSize: '22px', fontWeight: '800', color: '#1a237e' }}>
+                  Welcome, {nameHeard || 'Guest'}!
                 </div>
-                <p style={{ color: '#666', marginTop: '10px', fontSize: '14px', lineHeight: '1.6' }}>
-                  {saveData ? "Your face is registered. We'll recognise you next time." : 'Visiting as a guest — no data saved.'}
+                <p style={{ color: '#555', marginTop: '10px', fontSize: '14px', lineHeight: '1.6' }}>
+                  Getting everything ready for you…
                 </p>
-              </div>
-            ) : (<>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: '20px' }}>
-                <svg viewBox="0 0 80 80" width="56" height="56" style={{ flexShrink: 0 }}>
-                  <circle cx="40" cy="40" r="40" fill="url(#suitG2)" />
-                  <defs><linearGradient id="suitG2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" /></linearGradient></defs>
-                  <circle cx="40" cy="30" r="14" fill="#FFCFA0" />
-                  <path d="M12 72 Q12 54 40 54 Q68 54 68 72" fill="#FFCFA0" />
-                </svg>
-                <div>
-                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Nova 👋</div>
-                  <div style={{ fontSize: '13px', color: '#888' }}>I don&apos;t recognise you yet — what&apos;s your name?</div>
+              </>
+            ) : (
+              <>
+                {/* Visual Step Indicator */}
+                <div style={{ display: 'flex', justifyContent: 'center', gap: '8px', marginBottom: '20px' }}>
+                  <span style={{ height: '5px', width: nameStage === 'asking' || nameStage === 'listening_name' ? '32px' : '14px', borderRadius: '3px', background: '#1a237e', transition: 'all 0.3s' }} />
+                  <span style={{ height: '5px', width: nameStage === 'confirming' || nameStage === 'listening_confirm' ? '32px' : '14px', borderRadius: '3px', background: nameStage === 'confirming' || nameStage === 'listening_confirm' ? '#7c4dff' : '#c5cae9', transition: 'all 0.3s' }} />
                 </div>
-              </div>
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{ fontSize: '13px', fontWeight: '600', color: '#444', display: 'block', marginBottom: '6px' }}>Your Full Name</label>
-                <input ref={inputRef} style={inputStyle} placeholder="e.g. Akshatha A" value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
-              </div>
-              <div style={{ background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '14px 16px', marginBottom: '20px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <div>
-                    <div style={{ fontSize: '13px', fontWeight: '600', color: '#333' }}>Remember me for next visit</div>
-                    <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>{saveData ? 'Face saved securely' : 'No data stored'}</div>
-                  </div>
-                  <div onClick={() => setSaveData(s => !s)} style={{ width: '48px', height: '26px', borderRadius: '13px', background: saveData ? '#1a237e' : '#ddd', cursor: 'pointer', position: 'relative', transition: 'background 0.25s', flexShrink: 0 }}>
-                    <div style={{ position: 'absolute', top: '3px', left: saveData ? '25px' : '3px', width: '20px', height: '20px', borderRadius: '50%', background: '#fff', transition: 'left 0.25s', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
-                  </div>
+
+                <div style={{ position: 'relative', width: '72px', height: '72px', margin: '0 auto 16px' }}>
+                  <svg viewBox="0 0 80 80" width="72" height="72" style={{ display: 'block' }}>
+                    <circle cx="40" cy="40" r="40" fill="url(#suitG2)" />
+                    <defs><linearGradient id="suitG2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" /></linearGradient></defs>
+                    <circle cx="40" cy="30" r="14" fill="#FFCFA0" />
+                    <path d="M12 72 Q12 54 40 54 Q68 54 68 72" fill="#FFCFA0" />
+                  </svg>
+                  {nameFlowAvatarStatus === 'listening' && (
+                    <div style={{
+                      position: 'absolute', inset: '-6px', borderRadius: '50%',
+                      border: '2.5px solid #43a047', animation: 'nfPulse 1.2s ease-in-out infinite'
+                    }} />
+                  )}
                 </div>
-              </div>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <button onClick={() => handleSubmitName('Guest', false)} style={{ ...btnSecondary, flex: 1 }}>Continue as Guest</button>
-                <button onClick={() => handleSubmitName()} style={{ ...btnPrimary, flex: 1 }}>{saveData ? 'Register & Continue' : 'Continue'}</button>
-              </div>
-            </>)}
+
+                <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', marginBottom: '6px' }}>
+                  {nameStage === 'confirming' || nameStage === 'listening_confirm'
+                    ? `Nice to meet you${nameHeard ? ', ' + nameHeard : ''}!`
+                    : "Hi! May I know your name?"}
+                </div>
+                <div style={{ fontSize: '13.5px', color: '#555', marginBottom: '20px', fontWeight: '500' }}>
+                  {nameStage === 'confirming' || nameStage === 'listening_confirm'
+                    ? 'Should I remember you for next time?'
+                    : "Speak your name out loud to Nova."}
+                </div>
+
+                {/* Status indicator with animated waves */}
+                <div style={{
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px',
+                  padding: '13px 18px', borderRadius: '14px',
+                  background: nameFlowAvatarStatus === 'listening' ? '#e8f5e9'
+                    : nameFlowAvatarStatus === 'speaking' ? '#fff3e0' : '#f3e5f5',
+                  marginBottom: '16px', border: '1px solid rgba(0,0,0,0.05)',
+                }}>
+                  <span className={nameFlowAvatarStatus === 'listening' ? 'name-flow-pulse' : ''} style={{
+                    width: '10px', height: '10px', borderRadius: '50%',
+                    background: nameFlowAvatarStatus === 'listening' ? '#43a047'
+                      : nameFlowAvatarStatus === 'speaking' ? '#e65100' : '#7e57c2',
+                    flexShrink: 0,
+                  }} />
+                  <span style={{
+                    fontSize: '13.5px', fontWeight: '700',
+                    color: nameFlowAvatarStatus === 'listening' ? '#2e7d32'
+                      : nameFlowAvatarStatus === 'speaking' ? '#bf360c' : '#6a1b9a',
+                  }}>
+                    {nameFlowStatusLabel}
+                  </span>
+                </div>
+
+                {/* Voice & Double Blink Instruction Badges */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '8px', marginBottom: '16px' }}>
+                  <div style={{
+                    fontSize: '12.5px', color: '#334155', background: 'rgba(255,255,255,0.7)',
+                    padding: '8px 14px', borderRadius: '10px', border: '1px solid #e2e8f0',
+                    display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', fontWeight: '600'
+                  }}>
+                    <span>🎤</span>
+                    <span>Speak out loud — Nova is listening</span>
+                  </div>
+                  {(nameStage === 'confirming' || nameStage === 'listening_confirm') && (
+                    <div style={{
+                      fontSize: '12.5px', color: '#2563eb', background: '#eff6ff',
+                      padding: '8px 14px', borderRadius: '10px', border: '1px solid #bfdbfe',
+                      display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '6px', fontWeight: '700'
+                    }}>
+                      <span>👁️👁️</span>
+                      <span>Or blink 2 times for Yes</span>
+                    </div>
+                  )}
+                </div>
+
+                {/* 100% Hands-free notice (0% clicking required) */}
+                <div style={{ fontSize: '11px', color: '#94a3b8', fontStyle: 'italic', marginTop: '6px' }}>
+                  ⚡ 100% Hands-Free Kiosk · No clicking required
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
@@ -1142,10 +1473,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
             </div>
           </div>
-          <button onClick={() => setPrivacyOpen(o => !o)}
-            style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
-            🔒 Privacy
-          </button>
+          <div style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.9)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', fontWeight: '600' }}>
+            🎤 Hands-Free Voice Kiosk
+          </div>
         </div>
       </header>
 
@@ -1166,6 +1496,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             width: '320px', height: '320px', borderRadius: '50%',
             background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
           }} />
+
+          {/* ── happy-moment sparkle burst: first-time-visitor greeting only ── */}
+          {celebrate && (
+            <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 2 }}>
+              {['10%', '25%', '75%', '88%', '45%', '60%'].map((left, i) => (
+                <span key={i} className="sparkle-burst" style={{
+                  position: 'absolute', left, top: `${30 + (i % 3) * 12}%`,
+                  fontSize: `${14 + (i % 3) * 6}px`, animationDelay: `${i * 0.12}s`,
+                }}>✨</span>
+              ))}
+            </div>
+          )}
 
           {/* ── Nova SVG character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
@@ -1280,23 +1622,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   chip routes through the SAME sendToBackend() pipeline as a
                   spoken question, so it inherits every existing guard
                   (barge-in, stale-answer checks, goodbye handling) for free. */}
+              {/* Hands-free voice prompt hints (0% clicking required) */}
               {status === 'ready' && !processingHint && !liveText &&
                 messages.length > 0 && messages[messages.length - 1].speaker === 'kiosk' && (
-                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', paddingLeft: '4px', marginTop: '2px' }}>
-                  <button
-                    onClick={() => sendToBackend('Anything else you can help with?')}
-                    style={{ padding: '9px 18px', background: '#fff', border: '1.5px solid #c7cbe8',
-                             borderRadius: '20px', fontSize: '14px', fontWeight: '600', color: '#3c4370',
-                             cursor: 'pointer', boxShadow: '0 2px 6px rgba(26,35,126,0.05)' }}>
-                    Ask something else
-                  </button>
-                  <button
-                    onClick={() => sendToBackend('That is all, thank you')}
-                    style={{ padding: '9px 18px', background: '#fff', border: '1.5px solid #c7cbe8',
-                             borderRadius: '20px', fontSize: '14px', fontWeight: '600', color: '#3c4370',
-                             cursor: 'pointer', boxShadow: '0 2px 6px rgba(26,35,126,0.05)' }}>
-                    That's all, thanks
-                  </button>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', paddingLeft: '4px', marginTop: '4px' }}>
+                  <div style={{ padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
+                               borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370' }}>
+                    💬 Try saying: "Ask something else"
+                  </div>
+                  <div style={{ padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
+                               borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370' }}>
+                    💬 Or say: "That's all, thanks"
+                  </div>
                 </div>
               )}
 
@@ -1391,6 +1728,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         .td { display:inline-block; width:7px; height:7px; border-radius:50%; background:#c5cae9;
               animation:tdBounce 1.1s ease-in-out infinite; animation-delay:var(--d); }
         @keyframes tdBounce { 0%,60%,100%{transform:translateY(0);background:#c5cae9} 30%{transform:translateY(-6px);background:#7e57c2} }
+
+        /* ── name-flow listening pulse (small dot in the voice-name card) ── */
+        .name-flow-pulse { animation: nfPulse 1.3s ease-in-out infinite; }
+        @keyframes nfPulse { 0%,100%{box-shadow:0 0 0 0 rgba(67,160,71,0.45)} 50%{box-shadow:0 0 0 6px rgba(67,160,71,0)} }
+
+        /* ── happy-moment sparkle burst (first-visit greeting only) ── */
+        .sparkle-burst { animation: sparkleBurst 1.8s ease-out both; }
+        @keyframes sparkleBurst {
+          0% { opacity:0; transform: translateY(10px) scale(0.5) rotate(0deg); }
+          25% { opacity:1; }
+          100% { opacity:0; transform: translateY(-60px) scale(1.15) rotate(25deg); }
+        }
 
         /* ══════════════════════════════
              Nova CHARACTER ANIMATIONS

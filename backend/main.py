@@ -1,4 +1,4 @@
-﻿"""
+"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
@@ -77,7 +77,7 @@ def run_pipeline(frame_data):
         class _NoOp:
             present = False; state = "IDLE"; identity = ""
             verified = False; bbox = None; bystanders = 0
-            error = "detection_unavailable"
+            error = "detection_unavailable"; blink = False
         return _NoOp()
     return _run_pipeline(frame_data)
 
@@ -300,6 +300,36 @@ EASTER_EGGS = {
     ],
     "do you sleep": [
         "Never! I'm here whenever a visitor needs help, day or night.",
+    ],
+    # ── Interactive/happy-moment additions ────────────────────────────────
+    # Small talk that makes Nova feel like a person at the desk rather than
+    # a search box, without drifting away from the college-assistant role —
+    # deliberately short, warm, and quick to hand the conversation back to
+    # campus topics.
+    "how are you": [
+        "I'm doing great, thanks for asking! Ready to help you explore RNSIT — what can I do for you?",
+        "Feeling good and fully charged! What would you like to know about RNSIT?",
+    ],
+    "what is the weather today": [
+        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
+    ],
+    "how is the weather": [
+        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
+    ],
+    "good job": [
+        "Aw, thank you! That made my day. Anything else I can help you with?",
+    ],
+    "you are smart": [
+        "That's very kind of you to say! I try my best. What else can I help you with?",
+    ],
+    "you are awesome": [
+        "You're pretty awesome yourself for saying that! What can I help you with next?",
+    ],
+    "nice to meet you": [
+        "Nice to meet you too! I'm Nova, RNSIT's digital receptionist. How can I help you today?",
+    ],
+    "good night": [
+        "Good night! It was lovely chatting with you — take care.",
     ],
 }
 
@@ -1236,6 +1266,24 @@ async def end_session_endpoint(session_id: str = None):
     return {"status": "success"}
 
 
+@app.post("/session/are_you_there")
+async def are_you_there_endpoint():
+    global active_session
+    if active_session:
+        user_name = active_session.get("user_name") or "there"
+        sid = active_session.get("session_id") or ""
+        logger.info(f"[SESSION] Triggering 3s departure prompt for '{user_name}'")
+        tts_prompt = f"Are you there, {user_name}?" if user_name not in ("Guest", "there", "Unknown", "") else "Are you there?"
+        await manager.broadcast({
+            "type": "are_you_there",
+            "user_name": user_name,
+            "session_id": sid,
+            "tts_text": tts_prompt,
+        })
+        return {"status": "ok", "user_name": user_name}
+    return {"status": "no_active_session"}
+
+
 @app.get("/session/current")
 def get_current_session():
     if active_session:
@@ -1696,9 +1744,13 @@ async def detect_websocket(ws: WebSocket):
     Browser-camera detection pipeline (cross-platform, no native window needed).
 
     Browser → backend : JSON  {"frame": "<base64 JPEG>"}
-    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders}
+    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders, blink}
 
     bbox format when present: {x, y, w, h}  — pixel coords in the captured frame
+    `blink` is an experimental, debounced one-frame blink EVENT (true for
+    exactly the frame the blink completed on) — the frontend can use it as
+    an optional "yes" gesture. It never affects detection.py's own state
+    machine.
     """
     await ws.accept()
     logger.info("[WS/DETECT] Browser camera connected")
@@ -1730,6 +1782,7 @@ async def detect_websocket(ws: WebSocket):
                     "verified":   result.verified,
                     "bbox":       bbox,
                     "bystanders": result.bystanders,
+                    "blink":      bool(getattr(result, "blink", False)),
                 })
             except Exception as frame_err:
                 logger.warning(f"[WS/DETECT] Frame processing error: {frame_err}")
@@ -1795,7 +1848,7 @@ async def greet_visitor(payload: GreetVisitorPayload):
         await manager.broadcast({
             "type": "asking_name", 
             "session": active_session,
-            "tts_text": "Hello! Welcome to RNSIT Kiosk. Please say your name, or say Guest to continue."
+            "tts_text": "Hi! May I know your name?"
         })
         return {"status": "asking", "session_id": active_session["session_id"]}
 
@@ -1845,7 +1898,11 @@ async def visitor_unknown():
     else:
         active_session["asking_name"] = True
 
-    await manager.broadcast({"type": "asking_name", "session": active_session})
+    await manager.broadcast({
+        "type": "asking_name",
+        "session": active_session,
+        "tts_text": "Hi! May I know your name?",
+    })
     return {"status": "asking", "session_id": active_session["session_id"]}
 
 
