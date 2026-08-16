@@ -1,26 +1,7 @@
-import React, { useEffect } from 'react';
+import React from 'react';
 
-export default function GoodbyeScreen({ session, farewell }) {
+export default function GoodbyeScreen({ session }) {
   const name = session?.user_name && session.user_name !== 'Unknown' ? session.user_name : '';
-
-  // Speak the goodbye line as soon as this screen appears.
-  // We use browser speechSynthesis here because the Web Audio context
-  // (used by WelcomeScreen) may have already been torn down.
-  useEffect(() => {
-    const text = farewell
-      || (name ? `Goodbye, ${name}! Have a wonderful day.` : 'Goodbye! Have a wonderful day.');
-    const utter = new SpeechSynthesisUtterance(text);
-    utter.rate = 1.0;
-    utter.pitch = 1.1;
-    // Pick a pleasant voice if available
-    const voices = window.speechSynthesis.getVoices();
-    const preferred = voices.find(v => /en.*female|samantha|google uk english female/i.test(v.name))
-      || voices.find(v => /en/i.test(v.lang));
-    if (preferred) utter.voice = preferred;
-    window.speechSynthesis.cancel();           // stop any leftover speech
-    window.speechSynthesis.speak(utter);
-    return () => window.speechSynthesis.cancel();
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div style={{

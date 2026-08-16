@@ -2,7 +2,7 @@
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (always from VRK_MVP/ folder):
-    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 """
 
 import os
@@ -46,7 +46,7 @@ from backend.database import (
     get_kiosk_data,
     save_session, save_interaction, get_last_interaction, get_recent_interactions,
     update_face_seen, save_face_encoding, get_all_face_encodings,
-    delete_face_by_name,
+    delete_face_by_name, update_face_name_with_alias,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
 from backend.llm import (
@@ -90,7 +90,7 @@ logging.basicConfig(
 logger = logging.getLogger("RNSIT_Kiosk")
 
 MAX_QUERY_LENGTH: int = 300 
-SESSION_TIMEOUT_SECONDS: int = 120
+SESSION_TIMEOUT_SECONDS: int = 180
 
 # ── RAG MICROSERVICE CONFIG ────────────────────────────────────────────────
 # Read once, here, near the top of the file — everything else in this module
@@ -827,11 +827,20 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         face_id = item.get('face_id', 'N/A')
         current_name = item.get('name', 'Unknown Visitor')
+        name_history = item.get('name_history', [])
+        name_updated_at = item.get('name_updated_at', '')
+        # Show alias badge if the visitor ever changed their name
+        alias_html = ""
+        if name_history:
+            original_names = ', '.join(name_history)
+            alias_html = f'<br><span style="font-size:11px;color:#888;font-weight:400;">Originally: <em>{original_names}</em></span>'
+            if name_updated_at:
+                alias_html += f'<br><span style="font-size:10px;color:#bbb;">Renamed at: {name_updated_at[:19]}</span>'
         face_rows += f"""
         <tr id="face-{face_id}">
             <td>{idx + 1}</td>
             <td><code>{face_id}</code></td>
-            <td><strong id="face-name-text-{face_id}">{current_name}</strong></td>
+            <td><strong id="face-name-text-{face_id}">{current_name}</strong>{alias_html}</td>
             <td>{item.get('visit_count', 1)}</td>
             <td><span class="badge">{time_str}</span></td>
             <td>
@@ -1286,7 +1295,9 @@ async def are_you_there_endpoint():
 
 @app.get("/session/current")
 def get_current_session():
+    global _last_activity_ts
     if active_session:
+        _last_activity_ts = datetime.now().timestamp()
         return {"active": True, **active_session}
     return {"active": False}
 
@@ -1375,6 +1386,34 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             answer = responses[hash(sid + phrase) % len(responses)]
             logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
             return answer, "easter_egg", "CONTINUE"
+
+    # ─── Change Name Request ────────────────────────────────────────────────
+    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul"
+    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s]+)", q_normalized) or \
+                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is)\s+([a-zA-Z\s]+)", q_normalized) or \
+                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s]+)", q_normalized)
+    if name_change_match:
+        new_name_raw = name_change_match.group(1).strip()
+        new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
+        if new_name_words:
+            new_name = " ".join(new_name_words)
+            if active_session:
+                active_session["user_name"] = new_name
+                # Persist the new name and old-name alias to MongoDB so the
+                # admin dashboard always reflects the visitor's latest identity.
+                face_id_for_rename = active_session.get("face_id") or ""
+                if face_id_for_rename:
+                    await update_face_name_with_alias(face_id_for_rename, new_name)
+                    logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
+                                face_id_for_rename[:8], new_name)
+            answer = f"Done! Your name has been changed to {new_name}. How may I help you?"
+            logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
+            return answer, "name_change", "CONTINUE"
+
+    if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
+       re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
+        answer = "Sure! You can say \"change my name to [Your Name]\" anytime, and I'll update it for you."
+        return answer, "name_change_help", "CONTINUE"
 
     # ─── Thank you / bye / natural sign-off → end session immediately ───────
     if _is_farewell(q_normalized):
@@ -1915,6 +1954,23 @@ async def submit_name(name: str = "Guest", save: bool = True):
         active_session["user_name"]   = name
     logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
     return {"status": "ok"}
+
+
+@app.post("/visitor/rename")
+async def rename_visitor(name: str, face_id: str = ""):
+    """Mid-session name change: updates the active_session, the DB face record
+    (with old-name archival), and broadcasts the change so any listening
+    component can refresh.
+    """
+    global active_session
+    fid = face_id or (active_session.get("face_id") if active_session else "") or ""
+    if active_session:
+        active_session["user_name"] = name
+    updated_db = False
+    if fid:
+        updated_db = await update_face_name_with_alias(fid, name)
+    logger.info("[VISITOR] rename: '%s' face_id=%s db_updated=%s", name, fid[:8] if fid else '-', updated_db)
+    return {"status": "ok", "db_updated": updated_db}
 
 
 @app.get("/visitor/name_response")

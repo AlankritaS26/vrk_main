@@ -118,6 +118,38 @@ async def save_face_encoding(face_id: str, name: str, encoding: list,
     except Exception as e:
         logger.error(f"Error updating biometric vector signature: {e}")
 
+
+async def update_face_name_with_alias(face_id: str, new_name: str) -> bool:
+    """Update the face record's display name and preserve the old name in
+    `name_history` so the admin dashboard can show both the original and
+    any visitor-changed names.
+
+    Returns True when the record was found and updated, False otherwise.
+    """
+    try:
+        # First fetch the current name so we can archive it
+        doc = await faces_collection.find_one({"face_id": face_id}, {"name": 1})
+        if not doc:
+            logger.warning(f"[MongoDB] update_face_name_with_alias: face_id {face_id} not found")
+            return False
+        old_name = doc.get("name", "")
+        result = await faces_collection.update_one(
+            {"face_id": face_id},
+            {
+                "$set": {
+                    "name": new_name,
+                    "name_updated_at": datetime.now().isoformat(),
+                },
+                # Push the old name into name_history (deduplicating with $addToSet)
+                "$addToSet": {"name_history": old_name} if old_name and old_name != new_name else {},
+            }
+        )
+        logger.info(f"[MongoDB] Face name updated: '{old_name}' -> '{new_name}' ({face_id[:8]})")
+        return result.matched_count > 0
+    except Exception as e:
+        logger.error(f"Error updating face name with alias: {e}")
+        return False
+
 async def get_all_face_encodings():
     """Retrieves all registered biometric keys for local processing frames."""
     try:

@@ -127,8 +127,8 @@ _lm_opts = mp_vision.FaceLandmarkerOptions(
     base_options=mp_tasks.BaseOptions(model_asset_path=_MODEL_PATH),
     running_mode=mp_vision.RunningMode.IMAGE,
     num_faces=5,                      # see bystanders so we can IGNORE them and select nearest face
-    min_face_detection_confidence=0.6,
-    min_face_presence_confidence=0.6,
+    min_face_detection_confidence=0.5,
+    min_face_presence_confidence=0.5,
     min_tracking_confidence=0.5,
 )
 try:
@@ -150,10 +150,7 @@ if _ENGINE == "arcface" and not RECOG.is_available():
 print(f"[DETECT] recognition engine = {_ENGINE}", flush=True)
 
 # ─── Tunables (all env-overridable; calibrate on-site) ────────────────────────
-MIN_FACE_FRAC   = float(os.getenv("MIN_FACE_FRAC", "0.020"))   # ~2% of frame ≈ 1 m.
-                                                               # NOT 15% — that is
-                                                               # nose-on-glass and
-                                                               # detects nobody.
+MIN_FACE_FRAC   = float(os.getenv("MIN_FACE_FRAC", "0.015"))   # 1.5% of frame for fast pickup at distance
 # ArcFace similarities run lower than Facenet512's: same-person pairs land
 # ~0.45-0.75, different-person ~0.0-0.25. Default 0.55 => verified at sim>=0.45.
 _DEFAULT_MATCH = "0.55" if _ENGINE == "arcface" else "0.30"
@@ -162,41 +159,15 @@ MATCH_MARGIN    = float(os.getenv("FACE_MATCH_MARGIN", "0.06"))     # best must 
 _DEFAULT_CONT = "0.60" if _ENGINE == "arcface" else "0.28"
 CONTINUITY_DIST = float(os.getenv("SESSION_CONTINUITY_DISTANCE", _DEFAULT_CONT))
 DWELL_REQUIRED  = float(os.getenv("DWELL_REQUIRED", "0.7"))
-DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "3.0"))      # bag/phone/companion tolerance
-COOLDOWN        = float(os.getenv("DETECT_COOLDOWN", "2.0"))   # was 6.0 — same person should
-                                                               # re-engage within ~2-3s, not 6+
+DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "10.0"))     # 10s face absence tolerance before prompt
+COOLDOWN        = float(os.getenv("DETECT_COOLDOWN", "2.0"))   # 2s cooldown between sessions
 RECHECK_EVERY   = float(os.getenv("SESSION_RECHECK_INTERVAL", "2.0"))
-RECOG_ABSENCE_GRACE = float(os.getenv("RECOG_ABSENCE_GRACE", "2.5"))  # tolerate a
-                                                               # single blinked/blurred
-                                                               # frame during DWELLING/
-                                                               # RECOGNIZING/ENROLLING —
-                                                               # only invalidate the
-                                                               # worker after this many
-                                                               # seconds of REAL absence
+RECOG_ABSENCE_GRACE = float(os.getenv("RECOG_ABSENCE_GRACE", "2.5"))
 SWAP_STREAK     = int(os.getenv("SWAP_STREAK", "3"))           # frames before believing a swap
 ENROLL_TEMPLATES = int(os.getenv("ENROLL_TEMPLATES", "3"))     # multi-template enrolment
 NAME_WAIT_SECS  = float(os.getenv("NAME_WAIT_SECS", "30"))
-KNOWN_FACES_TTL = float(os.getenv("KNOWN_FACES_TTL", "5.0"))   # cache /faces/all instead of
-                                                               # re-fetching on every single
-                                                               # recognition attempt
-WORKER_STUCK_TIMEOUT = float(os.getenv("WORKER_STUCK_TIMEOUT", "6.0"))  # watchdog: max time
-                                                               # allowed in RECOGNIZING/
-                                                               # ENROLLING with no worker
-                                                               # actually running
-
-# ─── Blink detection tunables (experimental "yes" gesture) ───────────────────
-EAR_BLINK_THRESHOLD = float(os.getenv("EAR_BLINK_THRESHOLD", "0.19"))  # below this = eyes closed
-EAR_OPEN_THRESHOLD  = float(os.getenv("EAR_OPEN_THRESHOLD", "0.23"))   # above this = eyes open
-                                                               # (hysteresis avoids flicker
-                                                               # right at one threshold)
-BLINK_MIN_CLOSED_FRAMES = int(os.getenv("BLINK_MIN_CLOSED_FRAMES", "1"))  # frames closed
-                                                               # before we trust it's a
-                                                               # real blink, not a blend
-                                                               # artifact from one bad frame
-BLINK_REFRACTORY_SECS = float(os.getenv("BLINK_REFRACTORY_SECS", "0.6"))  # min gap between
-                                                               # two reported blinks, so a
-                                                               # single natural blink can't
-                                                               # be double-counted
+KNOWN_FACES_TTL = float(os.getenv("KNOWN_FACES_TTL", "5.0"))
+WORKER_STUCK_TIMEOUT = float(os.getenv("WORKER_STUCK_TIMEOUT", "6.0"))
 
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
@@ -222,7 +193,6 @@ class DetectionResult:
     bystanders: int = 0
     state: str = "IDLE"
     error: Optional[str] = None
-    blink: bool = False               # experimental: a debounced blink event this frame
 
 
 @dataclass
@@ -290,19 +260,6 @@ class KioskState:
 
 
 ST = KioskState()
-
-# ─── Blink tracker state (independent of KioskState — runs regardless of
-# session state so it's available the instant a face is in frame) ────────────
-@dataclass
-class _BlinkTracker:
-    lock: threading.Lock = field(default_factory=threading.Lock)
-    closed_frames: int = 0
-    eyes_closed: bool = False
-    last_blink_at: float = 0.0
-    blink_times: list = field(default_factory=list)
-
-
-_BLINK = _BlinkTracker()
 
 # ─── Known-faces cache ────────────────────────────────────────────────────────
 # Previously `_load_known_faces()` hit the backend on EVERY recognition
@@ -373,60 +330,6 @@ def _cos(a, b) -> float:
     return float(np.dot(a, b) / d) if d else 0.0
 
 
-# Eye landmark indices from MediaPipe's 478-point face mesh topology, used
-# only for the EAR blink heuristic — completely separate from the 5-point
-# kps used for ArcFace alignment above.
-_LEFT_EYE_EAR_IDX  = (33, 160, 158, 133, 153, 144)   # (L corner, top1, top2, R corner, bot2, bot1)
-_RIGHT_EYE_EAR_IDX = (263, 387, 385, 362, 380, 373)
-
-
-def _eye_aspect_ratio(lm, idx, w, h) -> Optional[float]:
-    """Standard EAR: vertical eye openness over horizontal eye width.
-    Falls back to None if any required landmark is missing."""
-    try:
-        pts = [(lm[i].x * w, lm[i].y * h) for i in idx]
-    except (IndexError, TypeError):
-        return None
-    p1, p2, p3, p4, p5, p6 = [np.array(p, dtype=np.float32) for p in pts]
-    vert = (np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5))
-    horiz = 2.0 * np.linalg.norm(p1 - p4)
-    if horiz <= 1e-6:
-        return None
-    return float(vert / horiz)
-
-
-def _update_blink_tracker(lm, w, h) -> bool:
-    """Debounced EAR blink detector. Returns True for genuine blinks (single or double blink),
-    maintaining timestamps so double-blinks ("blink 2 times") are properly recognized as Yes gestures."""
-    ear_l = _eye_aspect_ratio(lm, _LEFT_EYE_EAR_IDX, w, h)
-    ear_r = _eye_aspect_ratio(lm, _RIGHT_EYE_EAR_IDX, w, h)
-    if ear_l is None or ear_r is None:
-        return False
-    ear = (ear_l + ear_r) / 2.0
-
-    now = time.time()
-    with _BLINK.lock:
-        if not _BLINK.eyes_closed:
-            if ear < EAR_BLINK_THRESHOLD:
-                _BLINK.closed_frames += 1
-                if _BLINK.closed_frames >= BLINK_MIN_CLOSED_FRAMES:
-                    _BLINK.eyes_closed = True
-            else:
-                _BLINK.closed_frames = 0
-            return False
-        else:
-            # eyes currently marked closed — watch for the reopen edge
-            if ear > EAR_OPEN_THRESHOLD:
-                _BLINK.eyes_closed = False
-                _BLINK.closed_frames = 0
-                if (now - _BLINK.last_blink_at) >= BLINK_REFRACTORY_SECS:
-                    _BLINK.last_blink_at = now
-                    _BLINK.blink_times = [t for t in _BLINK.blink_times if (now - t) <= 1.4]
-                    _BLINK.blink_times.append(now)
-                    return True
-            return False
-
-
 def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResult:
     """PRIMARY-VISITOR LOCK: largest face above MIN_FACE_FRAC wins (this is
     also, in effect, the NEAREST face — see module docstring); the rest
@@ -474,18 +377,9 @@ def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResu
         except Exception:
             kps = None
 
-    # Experimental blink detection on the primary (nearest/largest) face only.
-    blink = False
-    if best_lm is not None:
-        try:
-            blink = _update_blink_tracker(best_lm, w, h)
-        except Exception:
-            blink = False
-
     return DetectionResult(present=True, bbox=best, face_crop=crop, kps=kps,
                            frame_ref=frame,
-                           landmarks_img=mesh, bystanders=max(0, qualifying - 1),
-                           blink=blink)
+                           landmarks_img=mesh, bystanders=max(0, qualifying - 1))
 
 
 def extract_embedding(face_crop: np.ndarray,
@@ -928,9 +822,9 @@ def run_pipeline(frame_data, known_faces=None, draw_mesh: bool = False) -> Detec
             if gone_for >= DEPART_GRACE:
                 if not already_prompted:
                     ST.set(prompted_departure=True)
-                    logger.info("[DETECT] Face absent for 3s during ACTIVE session — prompting 'Are you there?'")
+                    logger.info("[DETECT] Face absent for %.1fs during ACTIVE session — prompting 'Are you there?'", gone_for)
                     _post("/session/are_you_there")
-                elif gone_for >= (DEPART_GRACE + 7.0):
+                elif gone_for >= (DEPART_GRACE + 15.0):  # 15s after the prompt — was 7s
                     _end_session("visitor left after 'are you there' prompt")
         elif st in ("DWELLING", "RECOGNIZING", "ENROLLING"):
             # Debounced: a single blinked/blurred frame during recognition

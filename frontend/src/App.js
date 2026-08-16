@@ -32,11 +32,6 @@ export default function App() {
   const [videoDims, setVideoDims] = useState({ w: 640, h: 480 });
   const [camError, setCamError] = useState(null);
   const [camStream, setCamStream] = useState(null);
-  // Experimental: a debounced blink EVENT from detection.py (true for a
-  // single WS message per genuine blink). Used only as an optional "yes"
-  // gesture by WelcomeScreen's voice-based name/confirmation flow — it
-  // never drives detState or the session lifecycle.
-  const [blink, setBlink] = useState(false);
 
   const hiddenVideoRef = useRef(null);      // used only for frame capture
   const captureCanvasRef = useRef(null);
@@ -61,14 +56,6 @@ export default function App() {
           setDetState(data.state || 'IDLE');
           setIdentity(data.identity || '');
           setBbox(data.present && data.bbox ? data.bbox : null);
-          // `blink` is a one-shot event per message — set it true only when
-          // the server reports one, and let consumers debounce/reset it.
-          if (data.blink) {
-            setBlink(true);
-            // auto-clear shortly after so it behaves like an edge/event,
-            // not a held-down state — consumers see a brief true pulse.
-            setTimeout(() => setBlink(false), 250);
-          }
         } catch (_) { }
       };
 
@@ -104,8 +91,6 @@ export default function App() {
       }
     }
 
-    // 3 fps — runs continuously regardless of screen or conversation state,
-    // so departure/face-swap detection always works.
     function startSending() {
       sendIntervalRef.current = setInterval(() => {
         const ws = wsRef.current;
@@ -115,12 +100,16 @@ export default function App() {
         if (!video || video.videoWidth === 0) return;
 
         const ctx = cvs.getContext('2d');
-        cvs.width = video.videoWidth;
-        cvs.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0);
-        const b64 = cvs.toDataURL('image/jpeg', 0.7).split(',')[1];
+        const w = video.videoWidth || 640;
+        const h = video.videoHeight || 480;
+        if (cvs.width !== w || cvs.height !== h) {
+          cvs.width = w;
+          cvs.height = h;
+        }
+        ctx.drawImage(video, 0, 0, w, h);
+        const b64 = cvs.toDataURL('image/jpeg', 0.65).split(',')[1];
         try { ws.send(JSON.stringify({ frame: b64 })); } catch (_) { }
-      }, 333);
+      }, 250);
     }
 
     startCamera();
@@ -220,7 +209,7 @@ export default function App() {
 
   const askingName = session?.asking_name === true;
 
-  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream, blink };
+  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream };
 
   return (
     <>
