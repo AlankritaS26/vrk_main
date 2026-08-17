@@ -1744,7 +1744,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
 class RegisterFacePayload(BaseModel):
     face_id:  str         = Field(..., description="Unique face id")
     name:     str         = Field(..., description="Person's name")
-    encoding: List[float] = Field(..., description="Face encoding vector")
+    encoding: List[float] = Field(default_factory=list, description="Face encoding vector")
     encodings: List[List[float]] = Field(default_factory=list,
                                          description="Multi-template encodings (preferred)")
 
@@ -2028,37 +2028,29 @@ async def submit_name(name: str = "Guest", save: bool = True):
         )
 
     if save and name not in ("Guest", "Unknown", ""):
+        from backend.detection import register_or_resume_face, ST, _load_known_faces
         if fid:
-            # Detection already minted a face_id for this visitor (race:
-            # camera enrolment finished before we got here). Just rename it.
             await update_face_name_with_alias(fid, name)
             logger.info(f"[VISITOR] submit_name: renamed existing face_id={fid[:8]} to '{name}'")
         else:
-            # THE FIX: register (or link to an existing) face from the live
-            # anchor embedding detection.py is holding for this visitor.
-            from backend.detection import register_or_resume_face
             result = register_or_resume_face(name, save=True)
             new_fid = result.get("face_id") or ""
-            if new_fid:
-                active_session["face_id"] = new_fid
-                fid = new_fid
-                if sid:
-                    await sessions_collection.update_many(
-                        {"session_id": sid}, {"$set": {"face_id": new_fid}})
-                    await interactions_collection.update_many(
-                        {"session_id": sid}, {"$set": {"face_id": new_fid}})
-                logger.info(
-                    "[VISITOR] submit_name: %s face_id=%s for '%s'",
-                    "registered" if result.get("created") else "linked to existing",
-                    new_fid[:8], name,
-                )
-            else:
-                logger.warning(
-                    "[VISITOR] submit_name: could not register face for '%s' "
-                    "(no live anchor embedding — voice name flow ran with no "
-                    "camera session active). They'll be a fresh guest next visit.",
-                    name,
-                )
+            if not new_fid:
+                new_fid = str(uuid.uuid4())
+            snap_anchor = ST.snapshot().get("anchor") or []
+            await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+            ST.set(face_id=new_fid, identity=name)
+            _load_known_faces(force=True)
+            active_session["face_id"] = new_fid
+            fid = new_fid
+            if sid:
+                await sessions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+                await interactions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            logger.info(
+                f"[VISITOR] submit_name: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+            )
 
     # Broadcast the updated name to all connected frontends immediately so the
     # admin dashboard, GoodbyeScreen, etc. all see the real name right away.
@@ -2078,12 +2070,6 @@ async def rename_visitor(name: str, face_id: str = ""):
     """Mid-session name change: updates the active_session, the DB face record
     (with old-name archival), updates sessions collection everywhere, and broadcasts
     the change so all UI and admin components reflect it immediately.
-
-    FIXED: the guest-with-no-face_id branch used to hand-roll its own
-    registration directly against ST.snapshot()["anchor"] + save_face_encoding,
-    which skipped the duplicate-hard-block check. Now uses the same shared
-    register_or_resume_face() helper as submit_name, so this path and the
-    voice-name path can never mint two different face_ids for one visitor.
     """
     global active_session
     fid = face_id or (active_session.get("face_id") if active_session else "") or ""
@@ -2102,28 +2088,26 @@ async def rename_visitor(name: str, face_id: str = ""):
     if fid:
         updated_db = await update_face_name_with_alias(fid, name)
     else:
-        from backend.detection import register_or_resume_face
+        from backend.detection import register_or_resume_face, ST, _load_known_faces
         result = register_or_resume_face(name, save=True)
         new_fid = result.get("face_id") or ""
-        if new_fid:
-            if active_session:
-                active_session["face_id"] = new_fid
-            if sid:
-                await sessions_collection.update_many(
-                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
-                await interactions_collection.update_many(
-                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
-            updated_db = True
-            logger.info(
-                "[VISITOR] rename: %s face_id=%s for '%s'",
-                "registered" if result.get("created") else "linked to existing",
-                new_fid[:8], name,
-            )
-        else:
-            logger.warning(
-                "[VISITOR] rename: could not register face for '%s' "
-                "(no live anchor embedding available)", name,
-            )
+        if not new_fid:
+            new_fid = str(uuid.uuid4())
+        snap_anchor = ST.snapshot().get("anchor") or []
+        await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+        ST.set(face_id=new_fid, identity=name)
+        _load_known_faces(force=True)
+        if active_session:
+            active_session["face_id"] = new_fid
+        if sid:
+            await sessions_collection.update_many(
+                {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            await interactions_collection.update_many(
+                {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+        updated_db = True
+        logger.info(
+            f"[VISITOR] rename: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+        )
 
     if active_session:
         await manager.broadcast({

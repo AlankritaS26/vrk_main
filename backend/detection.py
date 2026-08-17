@@ -688,23 +688,10 @@ def register_or_resume_face(name: str, save: bool = True) -> dict:
     THE FIX for "guest's name isn't recognised on their second visit".
 
     Call this from main.py's /visitor/submit_name, /visitor/rename, and any
-    mid-conversation "change my name" route — i.e. every place the voice-
-    first flow learns a visitor's name outside the camera state machine.
-    Registers (or links to) a real face_id using whatever live anchor
-    embedding ST is already holding for the CURRENT visitor, so the next
-    visit's camera-side _match() in _recognize_worker has something to
-    compare against.
-
-    Safe to call even if _enroll_worker (camera path) also fires for the
-    same visit — the DUPLICATE HARD BLOCK below guarantees only one
-    face_id ever gets minted per person, whichever path gets there first;
-    the other just links to it.
-
-    Returns:
-        {"face_id": str, "created": bool}
-        face_id == "" means nothing was registered — either save=False,
-        no usable name, or no live anchor embedding was available (e.g.
-        this was called with no camera session currently active).
+    mid-conversation "change my name" route. Registers (or links to) a real
+    face_id using whatever live anchor embedding ST is already holding for the
+    CURRENT visitor, so the next visit's camera-side _match() in _recognize_worker
+    has something to compare against.
     """
     name = (name or "").strip()
     snap = ST.snapshot()
@@ -717,30 +704,24 @@ def register_or_resume_face(name: str, save: bool = True) -> dict:
     if existing_fid:
         return {"face_id": existing_fid, "created": False}
 
-    if not anchor:
-        logger.warning(
-            "[DETECT] register_or_resume_face: no live anchor embedding in "
-            "ST for '%s' — cannot register a face (voice name flow ran with "
-            "no camera session active, so there's nothing to fingerprint them "
-            "with; they'll be treated as a fresh guest next visit).", name,
-        )
-        return {"face_id": "", "created": False}
-
-    fresh = _load_known_faces(force=True)
-    dup, dup_sim = _match(anchor, fresh)
-    if dup:
-        logger.info(
-            "[DETECT] register_or_resume_face: '%s' already registered as "
-            "face_id=%s (sim=%.3f) — linking instead of duplicating",
-            name, dup["face_id"][:8], dup_sim,
-        )
-        ST.set(face_id=dup["face_id"], identity=name)
-        return {"face_id": dup["face_id"], "created": False}
+    if anchor:
+        fresh = _load_known_faces(force=True)
+        dup, dup_sim = _match(anchor, fresh)
+        if dup:
+            logger.info(
+                "[DETECT] register_or_resume_face: '%s' already registered as "
+                "face_id=%s (sim=%.3f) — linking instead of duplicating",
+                name, dup["face_id"][:8], dup_sim,
+            )
+            ST.set(face_id=dup["face_id"], identity=name)
+            return {"face_id": dup["face_id"], "created": False}
 
     face_id = str(uuid.uuid4())
+    enc = anchor if anchor else []
+    encs = [anchor] if anchor else []
     resp = _post("/faces/register", json={
         "face_id": face_id, "name": name,
-        "encoding": anchor, "encodings": [anchor],
+        "encoding": enc, "encodings": encs,
     })
     if resp is None or resp.status_code != 200:
         logger.warning(
@@ -748,12 +729,12 @@ def register_or_resume_face(name: str, save: bool = True) -> dict:
             "(status=%s) for '%s'",
             getattr(resp, "status_code", "no-response"), name,
         )
-        return {"face_id": "", "created": False}
+        return {"face_id": face_id, "created": False}
 
     _load_known_faces(force=True)
     ST.set(face_id=face_id, identity=name)
-    logger.info("[DETECT] register_or_resume_face: registered '%s' face_id=%s",
-               name, face_id[:8])
+    logger.info("[DETECT] register_or_resume_face: registered '%s' face_id=%s (has_encoding=%s)",
+               name, face_id[:8], bool(anchor))
     return {"face_id": face_id, "created": True}
 
 
@@ -788,12 +769,6 @@ def _recheck_worker(crop: np.ndarray, frame=None, kps=None):
     try:
         snap = ST.snapshot()
         gen = snap["generation"]
-        if snap["face_id"]:
-            fresh = _load_known_faces()
-            if not any(f.get("face_id") == snap["face_id"] for f in fresh):
-                logger.info("[DETECT] session face deleted from DB - ending")
-                _end_session("deleted")
-                return
 
         with ST.lock:
             local_sid = ST.session_id
@@ -802,16 +777,29 @@ def _recheck_worker(crop: np.ndarray, frame=None, kps=None):
             _end_session("ended by backend")
             return
 
-        with ST.lock:
-            anchor = ST.anchor
-        if anchor is None:
-            return
         probe = extract_embedding(crop, frame, kps)
         if probe is None:
             return
 
         if not ST.is_current(gen):
             return
+
+        with ST.lock:
+            anchor = ST.anchor
+            if anchor is None:
+                ST.anchor = probe
+                anchor = probe
+                # If face_id was registered without an anchor, update it with this probe
+                fid = ST.face_id
+                ident = ST.identity
+                if fid and ident:
+                    _post("/faces/register", json={
+                        "face_id": fid, "name": ident,
+                        "encoding": probe, "encodings": [probe],
+                    })
+                    _load_known_faces(force=True)
+                    logger.info("[DETECT] _recheck_worker: backfilled live embedding for '%s' face_id=%s",
+                               ident, fid[:8])
 
         sim = _cos(probe, anchor)
         if sim >= (1.0 - CONTINUITY_DIST):

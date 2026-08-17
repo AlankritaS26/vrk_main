@@ -10,12 +10,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
   const awaitingAnswerRef = useRef(false);     // true from "ack started" until the real answer's speech starts/fails —
-                                               // keeps status at 'processing' (not 'ready') through that gap
+  // keeps status at 'processing' (not 'ready') through that gap
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
-                                               // (explicitly non-interruptible, per spec — it
-                                               // is one short message that must always finish)
+  // (explicitly non-interruptible, per spec — it
+  // is one short message that must always finish)
   const handlingDepartureRef = useRef(false);  // true while handling 3s face departure prompt
   const isListening = useRef(false);
   const analyserRef = useRef(null);
@@ -473,7 +473,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // as "did it hear me?" to the visitor. startListening() above may
       // have just set 'ready' synchronously; this runs right after and wins.
       setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
-      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
+      if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
     };
 
     const fireStart = () => {
@@ -486,7 +486,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // (still correct: it's the moment THIS voice actually starts talking).
     const browserSpeak = () => {
       fireStart();
-      if (onSentence) { try { onSentence(text, 0); } catch (e) {} }
+      if (onSentence) { try { onSentence(text, 0); } catch (e) { } }
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = 'en-US';
       utter.rate = 1.0;
@@ -560,7 +560,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // of firing immediately, so text and voice stay in lockstep.
         const announce = () => {
           fireStart();                                     // status + first-clip-only hook
-          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) {} }
+          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
           resolveStarted();
         };
         if (delayMs > 0) setTimeout(announce, delayMs);
@@ -676,20 +676,37 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
 
-    // Dynamic Name Change support during normal conversation
+    // Dynamic Name Change support & Direct Name Introduction
     const explicitNameChange = text.match(/\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s]+)/i)
       || text.match(/\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is)\s+([a-zA-Z\s]+)/i)
       || text.match(/\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s]+)/i);
 
+    const nameIntroMatch = text.match(/\b(?:i am|i'm|im|this is|myself|it is|it's|its)\s+([a-zA-Z\s]+)/i);
+
+    const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
+
+    let extractedNameFromStatement = null;
     if (explicitNameChange && explicitNameChange[1]) {
-      let newName = explicitNameChange[1].replace(/[.!?]+$/, '').trim();
-      const validWords = newName.split(/\s+/).filter(w => !/\b(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)\b/i.test(w));
+      extractedNameFromStatement = explicitNameChange[1];
+    } else if (nameIntroMatch && nameIntroMatch[1] && !isQuestionText) {
+      extractedNameFromStatement = nameIntroMatch[1];
+    } else if ((visitorName === 'Guest' || visitorName === 'Unknown' || !visitorName) && !isQuestionText) {
+      const words = text.replace(/[.!?]+$/, '').trim().split(/\s+/);
+      if (words.length >= 1 && words.length <= 3) {
+        extractedNameFromStatement = words.join(' ');
+      }
+    }
+
+    if (extractedNameFromStatement) {
+      let newName = extractedNameFromStatement.replace(/[.!?]+$/, '').trim();
+      const validWords = newName.split(/\s+/).filter(w => !/\b(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the|i|am|im|this|it)\b/i.test(w));
       if (validWords.length > 0) {
         newName = validWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
         setLocalName(newName);
-        // /visitor/rename persists to MongoDB (with old-name alias) + updates session
-        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(newName), { method: 'POST' }).catch(() => {});
-        const ackName = `Done! Your name has been changed to ${newName}. How may I help you?`;
+        // Persist to MongoDB faces collection + sessions collection immediately
+        fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(newName) + '&save=true', { method: 'POST' }).catch(() => { });
+        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(newName), { method: 'POST' }).catch(() => { });
+        const ackName = `Done! Great to meet you, ${newName}. I have saved your name and face. How may I help you today?`;
         addMessage(ackName, 'kiosk');
         speak(ackName);
         return;
@@ -712,7 +729,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (validWords.length > 0) {
           extracted = validWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
           setLocalName(extracted);
-          fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(extracted), { method: 'POST' }).catch(() => {});
+          fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(extracted), { method: 'POST' }).catch(() => { });
           const doneMsg = `Done! Your name has been changed to ${extracted}. How may I help you?`;
           addMessage(doneMsg, 'kiosk');
           speak(doneMsg);
@@ -743,7 +760,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // keeps the session_end handler from stopping it. We clear the flag
       // when the voice actually finishes.
       speak(farewell, null, () => { farewellPlayingRef.current = false; });
-      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => { });
       window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell, userName: localName || session?.user_name } }));   // goodbye screen appears now
       return;
     }
@@ -1156,7 +1173,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ? `Are you there, ${name}?`
       : 'Are you there?';
 
-    try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
+    try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) { }
 
     // Show the prompt in the chat UI too
     addMessage(promptText, 'kiosk');
@@ -1196,7 +1213,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       addMessage(farewellText, 'kiosk');
       farewellPlayingRef.current = true;
       speak(farewellText, null, () => { farewellPlayingRef.current = false; });
-      fetch(BACKEND + '/session/end?session_id=' + (session?.session_id || ''), { method: 'POST' }).catch(() => {});
+      fetch(BACKEND + '/session/end?session_id=' + (session?.session_id || ''), { method: 'POST' }).catch(() => { });
       window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: farewellText, userName: localName || session?.user_name } }));
       handlingDepartureRef.current = false;
     }
@@ -1215,7 +1232,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           const msg = JSON.parse(e.data);
           if (msg.type === 'session_end') {
             if (!farewellPlayingRef.current) {
-              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
+              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) { }
               pendingUtteranceRef.current = null;
             }
             window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: '', userName: localName || session?.user_name } }));
@@ -1413,53 +1430,53 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2">
                   <path d="M12 2 4 6v6c0 5 3.5 9 8 10 4.5-1 8-5 8-10V6l-8-4z" />
-                      <path d="M9 12l2 2 4-4" />
-                    </svg>
-                  </div>
+                  <path d="M9 12l2 2 4-4" />
+                </svg>
+              </div>
+              <div>
+                <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
+                <div style={{ fontSize: '12px', color: '#999' }}>How Nova sees and remembers you</div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              {[
+                {
+                  icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
+                  title: 'The camera is only used to greet you',
+                  body: 'The kiosk camera looks for a face so Nova knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
+                },
+                {
+                  icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
+                  title: 'Face data is saved only if you say yes',
+                  body: 'When Nova asks for your name, she also asks — out loud — whether you\'d like to be remembered for next time. Say yes and your name and face are stored so Nova can greet you by name next time. Say no, or continue as a guest, and nothing is saved.'
+                },
+                {
+                  icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
+                  title: 'Conversations are used only to help you',
+                  body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\'t used for advertising or shared outside the institute.'
+                },
+                {
+                  icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
+                  title: 'Your session ends automatically',
+                  body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
+                },
+              ].map((item, i) => (
+                <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
+                    {item.icon}
+                  </svg>
                   <div>
-                    <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
-                    <div style={{ fontSize: '12px', color: '#999' }}>How Nova sees and remembers you</div>
+                    <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
+                    <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
                   </div>
                 </div>
+              ))}
+            </div>
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                  {[
-                    {
-                      icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
-                      title: 'The camera is only used to greet you',
-                      body: 'The kiosk camera looks for a face so Nova knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
-                    },
-                    {
-                      icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
-                      title: 'Face data is saved only if you say yes',
-                      body: 'When Nova asks for your name, she also asks — out loud — whether you\'d like to be remembered for next time. Say yes and your name and face are stored so Nova can greet you by name next time. Say no, or continue as a guest, and nothing is saved.'
-                    },
-                    {
-                      icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
-                      title: 'Conversations are used only to help you',
-                      body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\'t used for advertising or shared outside the institute.'
-                    },
-                    {
-                      icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
-                      title: 'Your session ends automatically',
-                      body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
-                    },
-                  ].map((item, i) => (
-                    <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
-                        {item.icon}
-                      </svg>
-                      <div>
-                        <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
-                        <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-                  Questions about your data? Speak to a staff member at the Admin Block.
-                </p>
+            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
+              Questions about your data? Speak to a staff member at the Admin Block.
+            </p>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
               <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
@@ -1631,47 +1648,53 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               );
             })}
 
-              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+            {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
                   while idle (not mid-question). Turns "answer machine" into
                   something that keeps the conversation moving — tapping a
                   chip routes through the SAME sendToBackend() pipeline as a
                   spoken question, so it inherits every existing guard
                   (barge-in, stale-answer checks, goodbye handling) for free. */}
-              {/* Hands-free voice prompt hints (0% clicking required) */}
-              {status === 'ready' && !processingHint && !liveText &&
-                messages.length > 0 && messages[messages.length - 1].speaker === 'kiosk' && (
+            {/* Hands-free voice prompt hints (0% clicking required) */}
+            {status === 'ready' && !processingHint && !liveText &&
+              messages.length > 0 && messages[messages.length - 1].speaker === 'kiosk' && (
                 <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', paddingLeft: '4px', marginTop: '4px' }}>
-                  <div style={{ padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
-                               borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370' }}>
+                  <div style={{
+                    padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
+                    borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370'
+                  }}>
                     💬 Try saying: "Ask something else"
                   </div>
-                  <div style={{ padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
-                               borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370' }}>
+                  <div style={{
+                    padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
+                    borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370'
+                  }}>
                     💬 Or say: "That's all, thanks"
                   </div>
                 </div>
               )}
 
-              {processingHint && !liveText && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: '4px', fontWeight: '500' }}>
-                    RNSIT Kiosk &nbsp;·&nbsp; thinking
-                  </div>
-                  <div style={{ maxWidth: '60%', padding: '13px 18px', borderRadius: '4px 18px 18px 18px',
-                                background: '#f3f2fb', color: '#6a6f8c', fontSize: '15.5px', fontStyle: 'italic',
-                                lineHeight: '1.6', border: '1.5px dashed #d8d6ea' }}>
-                    {processingHint}
-                  </div>
+            {processingHint && !liveText && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: '4px', fontWeight: '500' }}>
+                  RNSIT Kiosk &nbsp;·&nbsp; thinking
                 </div>
-              )}
-              {liveText && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                    {liveText}
-                  </div>
+                <div style={{
+                  maxWidth: '60%', padding: '13px 18px', borderRadius: '4px 18px 18px 18px',
+                  background: '#f3f2fb', color: '#6a6f8c', fontSize: '15.5px', fontStyle: 'italic',
+                  lineHeight: '1.6', border: '1.5px dashed #d8d6ea'
+                }}>
+                  {processingHint}
                 </div>
-              )}
+              </div>
+            )}
+            {liveText && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
+                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                  {liveText}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* voice footer */}
