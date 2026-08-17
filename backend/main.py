@@ -46,7 +46,8 @@ from backend.database import (
     get_kiosk_data,
     save_session, save_interaction, get_last_interaction, get_recent_interactions,
     update_face_seen, save_face_encoding, get_all_face_encodings,
-    delete_face_by_name, update_face_name_with_alias,
+    delete_face_by_name, update_face_name_with_alias, update_session_user_name,
+    sessions_collection, faces_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
 from backend.llm import (
@@ -708,7 +709,8 @@ async def proxy_to_rag(payload: QueryRequest):
     answer = await query_rag_service(payload.query)
 
     try:
-        await save_interaction(sid, payload.query, answer, face_id=fid)
+        user_n = (active_session.get("user_name") or "Guest") if active_session else "Guest"
+        await save_interaction(sid, payload.query, answer, face_id=fid, user_name=user_n)
     except Exception as exc:
         logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
 
@@ -748,13 +750,12 @@ async def delete_face(face_id: str, username: str = Depends(authenticate_admin))
 async def update_face_name(face_id: str, payload: FaceUpdateRequest, username: str = Depends(authenticate_admin)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection is inactive.")
-    result = await db.faces.update_one(
-        {"face_id": face_id},
-        {"$set": {"name": payload.name}}
-    )
-    if result.matched_count == 0:
+    updated = await update_face_name_with_alias(face_id, payload.name)
+    if not updated:
         raise HTTPException(status_code=404, detail="Face record not found.")
-    return {"message": f"Renamed profile to {payload.name}"}
+    if active_session and active_session.get("face_id") == face_id:
+        active_session["user_name"] = payload.name
+    return {"message": f"Renamed profile to '{payload.name}' and updated all associated sessions."}
 
 @app.delete("/api/admin/sessions/{session_id}")
 async def delete_session(session_id: str, username: str = Depends(authenticate_admin)):
@@ -796,9 +797,9 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         )
 
     # 1. Pull data concurrently from all four MongoDB collections
-    interactions_list = await db.interactions.find().sort("timestamp", -1).limit(50).to_list(length=50)
-    faces_list = await db.faces.find().sort("detected_at", -1).limit(50).to_list(length=50)
-    sessions_list = await db.sessions.find().sort("start_time", -1).limit(50).to_list(length=50)
+    interactions_list = await db.interactions.find().sort("timestamp", -1).limit(200).to_list(length=200)
+    faces_list = await db.faces.find().sort([("last_seen", -1), ("detected_at", -1)]).limit(100).to_list(length=100)
+    sessions_list = await db.sessions.find().sort([("started_at", -1), ("last_activity", -1)]).limit(100).to_list(length=100)
     profile_list = await db.college_profile.find().limit(100).to_list(length=100)
 
     # --- Tab 1: Build Interactions rows ---
@@ -807,13 +808,15 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         ts = item.get("timestamp")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
+        u_name = item.get('user_name') or 'Guest'
         interaction_rows += f"""
         <tr id="interaction-{sess_id}">
             <td>{idx + 1}</td>
-            <td><code>{sess_id}</code></td>
+            <td><strong style="color: #0066cc;">{u_name}</strong></td>
+            <td><code>{sess_id[:8] if sess_id != 'N/A' else 'N/A'}</code></td>
             <td><strong>{item.get('input_text', 'N/A')}</strong></td>
             <td>{item.get('response_text', 'N/A')}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-danger" onclick="deleteInteraction('{sess_id}')">Delete Log</button>
             </td>
@@ -823,7 +826,7 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     # --- Tab 2: Build Faces rows ---
     face_rows = ""
     for idx, item in enumerate(faces_list):
-        ts = item.get("detected_at") or item.get("last_seen")
+        ts = item.get("last_seen") or item.get("detected_at")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         face_id = item.get('face_id', 'N/A')
         current_name = item.get('name', 'Unknown Visitor')
@@ -836,13 +839,15 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
             alias_html = f'<br><span style="font-size:11px;color:#888;font-weight:400;">Originally: <em>{original_names}</em></span>'
             if name_updated_at:
                 alias_html += f'<br><span style="font-size:10px;color:#bbb;">Renamed at: {name_updated_at[:19]}</span>'
+        has_encoding = item.get('has_encoding', True)  # legacy records default to True
+        encoding_badge = '' if has_encoding else '<br><span style="font-size:10px;color:#e67e22;background:#fff3e0;padding:1px 5px;border-radius:3px;font-weight:600;">Name only · no face scan</span>'
         face_rows += f"""
         <tr id="face-{face_id}">
             <td>{idx + 1}</td>
             <td><code>{face_id}</code></td>
-            <td><strong id="face-name-text-{face_id}">{current_name}</strong>{alias_html}</td>
+            <td><strong id="face-name-text-{face_id}">{current_name}</strong>{alias_html}{encoding_badge}</td>
             <td>{item.get('visit_count', 1)}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-edit" onclick="editFaceName('{face_id}', '{current_name}')">Rename</button>
                 <button class="btn btn-danger" onclick="deleteFace('{face_id}')">Delete</button>
@@ -853,15 +858,16 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     # --- Tab 3: Build Sessions rows ---
     session_rows = ""
     for idx, item in enumerate(sessions_list):
-        ts = item.get("start_time")
+        ts = item.get("started_at") or item.get("start_time") or item.get("last_activity")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
+        u_name = item.get('user_name', 'Guest')
         session_rows += f"""
         <tr id="session-{sess_id}">
             <td><code>{sess_id}</code></td>
-            <td>{item.get('user_name', 'Guest')}</td>
+            <td><strong style="color: #0066cc;">{u_name}</strong></td>
             <td>{item.get('visit_count', 1)}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End & Delete</button>
             </td>
@@ -940,16 +946,17 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
                     <table>
                         <thead>
                             <tr>
-                                <th style="width: 5%">#</th>
-                                <th style="width: 15%">Session ID</th>
+                                <th style="width: 4%">#</th>
+                                <th style="width: 14%">Visitor</th>
+                                <th style="width: 12%">Session ID</th>
                                 <th style="width: 25%">User Query</th>
-                                <th style="width: 35%">Kiosk Response</th>
-                                <th style="width: 12%">Timestamp</th>
-                                <th style="width: 8%">Action</th>
+                                <th style="width: 32%">Kiosk Response</th>
+                                <th style="width: 7%">Time</th>
+                                <th style="width: 6%">Action</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {interaction_rows if interaction_rows else "<tr><td colspan='6' style='text-align:center;'>No interactions recorded yet.</td></tr>"}
+                            {interaction_rows if interaction_rows else "<tr><td colspan='7' style='text-align:center;'>No interactions recorded yet.</td></tr>"}
                         </tbody>
                     </table>
                 </div>
@@ -1399,13 +1406,43 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             new_name = " ".join(new_name_words)
             if active_session:
                 active_session["user_name"] = new_name
-                # Persist the new name and old-name alias to MongoDB so the
-                # admin dashboard always reflects the visitor's latest identity.
                 face_id_for_rename = active_session.get("face_id") or ""
+                sid_for_rename = active_session.get("session_id") or ""
+                if sid_for_rename:
+                    await update_session_user_name(sid_for_rename, new_name)
+                    await interactions_collection.update_many(
+                        {"session_id": sid_for_rename},
+                        {"$set": {"user_name": new_name}}
+                    )
                 if face_id_for_rename:
                     await update_face_name_with_alias(face_id_for_rename, new_name)
                     logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
                                 face_id_for_rename[:8], new_name)
+                else:
+                    # Register face for guest who provided a name so they appear in face tracks
+                    try:
+                        from backend.detection import ST, _load_known_faces
+                        anchor = ST.snapshot().get("anchor")
+                        new_fid = str(uuid.uuid4())
+                        if anchor:
+                            await save_face_encoding(new_fid, new_name, anchor, [anchor])
+                            ST.set(face_id=new_fid, identity=new_name)
+                        else:
+                            await save_face_encoding(new_fid, new_name, [], [])
+                        active_session["face_id"] = new_fid
+                        if sid_for_rename:
+                            await sessions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                            await interactions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                        _load_known_faces(force=True)
+                        logger.info(f"[ROUTE] Registered face for former guest '{new_name}' face_id={new_fid[:8]}")
+                    except Exception as ex:
+                        logger.warning(f"[ROUTE] Could not register face anchor: {ex}")
+                await manager.broadcast({
+                    "type": "session_update",
+                    "session": active_session,
+                    "user_name": new_name,
+                    "face_id": active_session.get("face_id", ""),
+                })
             answer = f"Done! Your name has been changed to {new_name}. How may I help you?"
             logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
             return answer, "name_change", "CONTINUE"
@@ -1517,7 +1554,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 
     async def _respond(answer: str, source: str = "", session_action: str = "CONTINUE") -> dict:
         try:
-            await save_interaction(sid, question, answer, face_id=fid)
+            await save_interaction(sid, question, answer, face_id=fid, user_name=visitor_name)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
@@ -1633,7 +1670,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
 
     async def _finish(answer: str, session_action: str = "CONTINUE"):
         try:
-            await save_interaction(sid, question, answer, face_id=fid)
+            await save_interaction(sid, question, answer, face_id=fid, user_name=visitor_name)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
@@ -1947,28 +1984,155 @@ async def visitor_unknown():
 
 @app.post("/visitor/submit_name")
 async def submit_name(name: str = "Guest", save: bool = True):
+    """
+    Called by the frontend when the visitor speaks their name (or chooses Guest).
+
+    FIXED: previously this only renamed a face if `fid` was already set on
+    the session — for a fresh guest (the normal case) fid is empty, so no
+    embedding was ever registered and the visitor was 'unknown' again on
+    their next visit. Now it calls register_or_resume_face(), which uses
+    the live camera anchor embedding detection.py already captured for the
+    current visitor, registers-or-links a real face_id, and includes the
+    same duplicate-hard-block _enroll_worker uses (so if detection's own
+    camera-driven ENROLLING path also fires for this visit, they converge
+    on the same face_id instead of minting two).
+    """
     global visitor_name_response, active_session
+    # Signal to _enroll_worker (camera path) that the name is ready, in case
+    # it's still waiting on /visitor/name_response.
     visitor_name_response = {"ready": True, "name": name, "save": save}
-    if active_session:
-        active_session["asking_name"] = False
-        active_session["user_name"]   = name
-    logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
+    logger.info(f"[VISITOR] submit_name called: name='{name}' save={save}")
+
+    if not active_session:
+        active_session = {
+            "session_id": str(uuid.uuid4()),
+            "user_name": name,
+            "is_returning": False,
+            "visit_count": 1,
+            "face_id": "",
+            "trigger": "camera",
+            "asking_name": False,
+        }
+        logger.info(f"[VISITOR] submit_name: created minimal session for '{name}'")
+
+    active_session["asking_name"] = False
+    active_session["user_name"] = name
+    sid = active_session.get("session_id")
+    fid = active_session.get("face_id") or ""
+
+    if sid:
+        await update_session_user_name(sid, name)
+        await interactions_collection.update_many(
+            {"session_id": sid},
+            {"$set": {"user_name": name}}
+        )
+
+    if save and name not in ("Guest", "Unknown", ""):
+        if fid:
+            # Detection already minted a face_id for this visitor (race:
+            # camera enrolment finished before we got here). Just rename it.
+            await update_face_name_with_alias(fid, name)
+            logger.info(f"[VISITOR] submit_name: renamed existing face_id={fid[:8]} to '{name}'")
+        else:
+            # THE FIX: register (or link to an existing) face from the live
+            # anchor embedding detection.py is holding for this visitor.
+            from backend.detection import register_or_resume_face
+            result = register_or_resume_face(name, save=True)
+            new_fid = result.get("face_id") or ""
+            if new_fid:
+                active_session["face_id"] = new_fid
+                fid = new_fid
+                if sid:
+                    await sessions_collection.update_many(
+                        {"session_id": sid}, {"$set": {"face_id": new_fid}})
+                    await interactions_collection.update_many(
+                        {"session_id": sid}, {"$set": {"face_id": new_fid}})
+                logger.info(
+                    "[VISITOR] submit_name: %s face_id=%s for '%s'",
+                    "registered" if result.get("created") else "linked to existing",
+                    new_fid[:8], name,
+                )
+            else:
+                logger.warning(
+                    "[VISITOR] submit_name: could not register face for '%s' "
+                    "(no live anchor embedding — voice name flow ran with no "
+                    "camera session active). They'll be a fresh guest next visit.",
+                    name,
+                )
+
+    # Broadcast the updated name to all connected frontends immediately so the
+    # admin dashboard, GoodbyeScreen, etc. all see the real name right away.
+    await manager.broadcast({
+        "type":     "session_update",
+        "session":  active_session,
+        "user_name": name,
+        "face_id":  fid,
+    })
+    logger.info(f"[VISITOR] submit_name: broadcasted session_update name='{name}'")
     return {"status": "ok"}
+
 
 
 @app.post("/visitor/rename")
 async def rename_visitor(name: str, face_id: str = ""):
     """Mid-session name change: updates the active_session, the DB face record
-    (with old-name archival), and broadcasts the change so any listening
-    component can refresh.
+    (with old-name archival), updates sessions collection everywhere, and broadcasts
+    the change so all UI and admin components reflect it immediately.
+
+    FIXED: the guest-with-no-face_id branch used to hand-roll its own
+    registration directly against ST.snapshot()["anchor"] + save_face_encoding,
+    which skipped the duplicate-hard-block check. Now uses the same shared
+    register_or_resume_face() helper as submit_name, so this path and the
+    voice-name path can never mint two different face_ids for one visitor.
     """
     global active_session
     fid = face_id or (active_session.get("face_id") if active_session else "") or ""
+    sid = active_session.get("session_id") if active_session else ""
     if active_session:
         active_session["user_name"] = name
+
+    if sid:
+        await update_session_user_name(sid, name)
+        await interactions_collection.update_many(
+            {"session_id": sid},
+            {"$set": {"user_name": name}}
+        )
+
     updated_db = False
     if fid:
         updated_db = await update_face_name_with_alias(fid, name)
+    else:
+        from backend.detection import register_or_resume_face
+        result = register_or_resume_face(name, save=True)
+        new_fid = result.get("face_id") or ""
+        if new_fid:
+            if active_session:
+                active_session["face_id"] = new_fid
+            if sid:
+                await sessions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+                await interactions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            updated_db = True
+            logger.info(
+                "[VISITOR] rename: %s face_id=%s for '%s'",
+                "registered" if result.get("created") else "linked to existing",
+                new_fid[:8], name,
+            )
+        else:
+            logger.warning(
+                "[VISITOR] rename: could not register face for '%s' "
+                "(no live anchor embedding available)", name,
+            )
+
+    if active_session:
+        await manager.broadcast({
+            "type": "session_update",
+            "session": active_session,
+            "user_name": name,
+            "face_id": active_session.get("face_id", ""),
+        })
+
     logger.info("[VISITOR] rename: '%s' face_id=%s db_updated=%s", name, fid[:8] if fid else '-', updated_db)
     return {"status": "ok", "db_updated": updated_db}
 

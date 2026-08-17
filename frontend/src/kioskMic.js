@@ -51,8 +51,8 @@ export async function createKioskMic({ onSpeechStart, onSpeechEnd, onMisfire, on
     onnxWASMBasePath: '/',
 
     // Conversational VAD tuning — natural voice pickup with quick ~600ms end-of-speech
-    positiveSpeechThreshold: 0.50,   // standard Silero threshold: catches normal speaking volume easily
-    negativeSpeechThreshold: 0.35,
+    positiveSpeechThreshold: 0.65,   // rejects background noise and speaker playback
+    negativeSpeechThreshold: 0.40,
     minSpeechFrames: 3,         // ~96 ms to confirm speech onset
     redemptionFrames: 6,        // ~600 ms pause = end of utterance
 

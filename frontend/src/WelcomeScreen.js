@@ -233,11 +233,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     if (isSpeaking.current) {
       interruptSpeaking();
-    } else if (statusRef.current === 'processing') {
+    } else if (!activePromptResolverRef.current && statusRef.current === 'processing') {
       return;
     }
     isListening.current = false;
     setListening(false);
+    statusRef.current = 'processing';
     setStatus('processing');
 
     try {
@@ -258,11 +259,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           const resolver = activePromptResolverRef.current;
           activePromptResolverRef.current = null;
           if (isMounted.current) setLiveText(heard);
+          statusRef.current = 'ready';
           setStatus('ready');
           resolver(heard);
           return;
         } else {
           console.log('[STT] Empty transcript during prompt wait, continuing to wait for speech');
+          statusRef.current = 'ready';
           setStatus('ready');
           return;
         }
@@ -371,17 +374,28 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         onStream: (stream) => { streamRef.current = stream; },
         onSpeechStart: () => {
           if (!isMounted.current) return;
-          if (isSpeaking.current && !greetingPlayingRef.current) interruptSpeaking();
+          if (isSpeaking.current) {
+            if (greetingPlayingRef.current) return;
+            interruptSpeaking();
+          }
           isListening.current = true;
           setListening(true);
           setLiveText('');
           setStatus('listening');
           if (streamRef.current) startWaveform(streamRef.current);
         },
-        onSpeechEnd: (audio) => handleUtterance(audio),
+        onSpeechEnd: (audio) => {
+          handleUtterance(audio);
+        },
         onMisfire: () => {
-          isListening.current = false;
-          if (isMounted.current) { setListening(false); setStatus('ready'); }
+          if (!isMounted.current) return;
+          if (isSpeaking.current) {
+            restoreSpeaking();
+          } else {
+            isListening.current = false;
+            setListening(false);
+            setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+          }
         },
       });
       micRef.current = mic;
@@ -390,7 +404,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       console.error('[MIC] Error:', err);
       if (!isSpeaking.current) setStatus('ready');
     }
-  }, [startWaveform, handleUtterance]);
+  }, [startWaveform, handleUtterance, duckSpeaking, restoreSpeaking]);
 
   // release mic + VAD on unmount (session end)
   useEffect(() => () => {
@@ -641,10 +655,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   ), [speakStream]);
 
   // Promise-returning wrapper: resolves once THIS utterance has fully
-  // finished playing. Used by the name flow below, which needs to speak a
-  // prompt and then wait for it to end before it starts listening.
+  // finished playing. Pauses the mic during prompts to prevent speaker echo.
   const speakAndWait = useCallback((text, onStart) => (
-    new Promise((resolve) => { speak(text, onStart, resolve); })
+    new Promise((resolve) => {
+      micRef.current?.pause();
+      speak(text, onStart, () => {
+        if (isMounted.current && micRef.current) {
+          micRef.current.resume();
+        }
+        resolve();
+      });
+    })
   ), [speak]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -723,7 +744,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // when the voice actually finishes.
       speak(farewell, null, () => { farewellPlayingRef.current = false; });
       fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
-      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell } }));   // goodbye screen appears now
+      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell, userName: localName || session?.user_name } }));   // goodbye screen appears now
       return;
     }
 
@@ -828,12 +849,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const wantsToGiveName = useCallback((text) => {
     if (!text) return false;
-    return /\b(yes|yeah|yep|yup|give name|give my name|my name|tell name|tell my name|provide name|i would like to give my name|like to give my name|want to give my name|i want to give my name|enter name|share name)\b/i.test(text);
+    return /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will)\b/i.test(text);
   }, []);
 
   const isGuestOption = useCallback((text) => {
     if (!text) return false;
-    return /\b(guest|guest mode|continue as guest|as guest|no name|anonymous)\b/i.test(text);
+    return /\b(guest|guest mode|continue as guest|as guest|no name|anonymous|just guest)\b/i.test(text);
   }, []);
 
   const isContinueOption = useCallback((text) => {
@@ -842,19 +863,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, []);
 
   // ── Voice prompt capture helpers (uses single persistent mic) ──────────
-  const captureUtteranceText = useCallback((timeoutMs = 12000) => {
+  const captureUtteranceText = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
       let timer = null;
       const resolver = (text) => {
         if (timer) clearTimeout(timer);
         resolve((text || '').trim());
       };
-      timer = setTimeout(() => {
+      const checkTimeout = () => {
+        // If user is currently speaking or audio is being transcribed (Whisper STT), keep waiting!
+        if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
+          timer = setTimeout(checkTimeout, 3000);
+          return;
+        }
         if (activePromptResolverRef.current === resolver) {
           activePromptResolverRef.current = null;
         }
         resolve('');
-      }, timeoutMs);
+      };
+      timer = setTimeout(checkTimeout, timeoutMs);
 
       activePromptResolverRef.current = resolver;
       if (micRef.current) {
@@ -865,13 +892,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, []);
 
   // Waits for a spoken "yes"/"no" response or direct correction
-  const captureYesNo = useCallback((timeoutMs = 12000) => {
+  const captureYesNo = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
       let timer = null;
       const resolver = (rawText) => {
         if (timer) clearTimeout(timer);
         const heard = (rawText || '').trim().toLowerCase();
-        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me)\b/i.test(heard)) {
+        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is)\b/i.test(heard)) {
           resolve(true);
         } else if (/\b(no|nope|nah|wrong|incorrect|not right|not that|different|change)\b/i.test(heard) || /don.?t/i.test(heard)) {
           resolve(false);
@@ -881,12 +908,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           resolve(null);
         }
       };
-      timer = setTimeout(() => {
+      const checkTimeout = () => {
+        // If user is currently speaking or audio is being transcribed, keep waiting!
+        if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
+          timer = setTimeout(checkTimeout, 3000);
+          return;
+        }
         if (activePromptResolverRef.current === resolver) {
           activePromptResolverRef.current = null;
         }
         resolve(null);
-      }, timeoutMs);
+      };
+      timer = setTimeout(checkTimeout, timeoutMs);
 
       activePromptResolverRef.current = resolver;
       if (micRef.current) {
@@ -919,35 +952,29 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const stillCurrent = () => nameFlowIdRef.current === myRun && isMounted.current;
 
     try {
-      if (isReturning) {
-        // Returning visitor: greet immediately and start listening for questions
+      const isKnownNamedVisitor = isReturning && visitorName && visitorName !== 'Guest' && visitorName !== 'Unknown';
+      if (isKnownNamedVisitor) {
+        // Returning visitor with known real name: greet immediately and start listening for questions
         addMessage(greeting, 'kiosk');
         await speakAndWait(greeting);
         if (stillCurrent()) startListening();
         return;
       }
 
-      // First time visitor:
-      // 1. Welcome speech ONLY first
-      const welcomeSpeech = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. '
-        + 'I can help you with admissions, departments, placements, fees, and directions around campus.';
+      // First time or guest visitor: celebrate burst + single unified welcome & name prompt
       setCelebrate(true);
       setTimeout(() => setCelebrate(false), 2400);
-      addMessage(welcomeSpeech, 'kiosk');
-      await speakAndWait(welcomeSpeech);
-      if (!stillCurrent()) return;
 
-      // 2. Ask for name or guest in the normal chat flow (Say "Yes" for name, Say "Guest" for guest)
       while (stillCurrent()) {
         setNameStage('asking');
-        const askChatMsg = 'Would you like to give your name or continue as guest?\n\n• 🗣️ Say "Yes" to give your name\n• 🗣️ Say "Guest" to continue as Guest';
-        const askSpokenMsg = 'Would you like to give your name or continue as guest? You can say yes to give your name, or say guest to continue as guest.';
+        const askChatMsg = 'Welcome to RNS Institute of Technology! I am Nova, your digital receptionist.\n\nWould you like to give your name or continue as guest?\n\n• 🗣️ Say "Yes" to give your name\n• 🗣️ Say "Guest" to continue as Guest';
+        const askSpokenMsg = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. Would you like to give your name, or continue as guest? You can say yes to give your name, or say guest to continue as guest.';
         addMessage(askChatMsg, 'kiosk');
         await speakAndWait(askSpokenMsg);
         if (!stillCurrent()) return;
 
         setNameStage('listening_name');
-        const heard = await captureUtteranceText(12000);
+        const heard = await captureUtteranceText(25000);
         if (!stillCurrent()) return;
 
         let choseGiveName = false;
@@ -994,7 +1021,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             directNameProvided = cleanNameCandidate || heard.trim();
           }
         } else {
-          // Timeout: default to Guest
+          // Timeout — check if anyone is still in front of the camera before
+          // defaulting to Guest. If the person walked away while we were
+          // waiting, silently abort rather than creating a phantom session.
+          const stateNow = detStateRef.current;
+          if (stateNow === 'IDLE' || stateNow === 'COOLDOWN') {
+            // Nobody there — abort the flow entirely
+            break;
+          }
           const noAnsMsg = 'Continuing as Guest! How may I assist you today?';
           addMessage(noAnsMsg, 'kiosk');
           setLocalName('Guest');
@@ -1014,10 +1048,27 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (!stillCurrent()) return;
 
           setNameStage('listening_name');
-          const heardSpokenName = await captureUtteranceText(10000);
+          const heardSpokenName = await captureUtteranceText(25000);
           if (!stillCurrent()) return;
 
-          finalName = extractVisitorName(heardSpokenName) || heardSpokenName || 'Friend';
+          if (heardSpokenName) {
+            addMessage(heardSpokenName, 'user');
+            finalName = extractVisitorName(heardSpokenName) || heardSpokenName.trim();
+          } else {
+            // Ask once more if missed
+            const askRetry = "Could you please say your name?";
+            addMessage(askRetry, 'kiosk');
+            await speakAndWait(askRetry);
+            if (!stillCurrent()) return;
+
+            const retrySpoken = await captureUtteranceText(25000);
+            if (retrySpoken) {
+              addMessage(retrySpoken, 'user');
+              finalName = extractVisitorName(retrySpoken) || retrySpoken.trim();
+            } else {
+              finalName = 'Friend';
+            }
+          }
         }
 
         if (!finalName) finalName = 'Friend';
@@ -1031,7 +1082,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!stillCurrent()) return;
 
         setNameStage('listening_confirm');
-        const confirmed = await captureYesNo(10000);
+        const confirmed = await captureYesNo(25000);
         if (!stillCurrent()) return;
 
         if (confirmed === true) {
@@ -1055,7 +1106,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             if (!stillCurrent()) return;
 
             setNameStage('listening_name');
-            const retrySpokenName = await captureUtteranceText(10000);
+            const retrySpokenName = await captureUtteranceText(25000);
             if (!stillCurrent()) return;
 
             correctedName = extractVisitorName(retrySpokenName) || retrySpokenName || finalName;
@@ -1071,9 +1122,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           break;
         }
 
-        // If captureYesNo timed out:
+        // If captureYesNo timed out — check face presence before assuming name is confirmed
+        const stateAtTimeout = detStateRef.current;
+        if (stateAtTimeout === 'IDLE' || stateAtTimeout === 'COOLDOWN') {
+          // Nobody in front anymore — abort silently
+          break;
+        }
         setNameStage('saving');
-        const greetNamed = `Nice to meet you, ${finalName}! How may I assist you today?`;
+        const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
         addMessage(greetNamed, 'kiosk');
         setLocalName(finalName);
         await submitVoiceName(finalName, true);
@@ -1105,19 +1161,35 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // Show the prompt in the chat UI too
     addMessage(promptText, 'kiosk');
     await speakAndWait(promptText);
-    // Listen for response for 5 seconds
-    const heardAnswer = await captureUtteranceText(5000);
-    const faceBack = detStateRef.current === 'ACTIVE' || detStateRef.current === 'DWELLING' || detStateRef.current === 'RECOGNIZING';
-    const heardYes = /\b(yes|yeah|yep|yup|here|im here|i am here|present|hi|hello|stay|i am|im|nova|what)\b/i.test(heardAnswer || '') || (heardAnswer && heardAnswer.trim().length > 1);
+
+    // Listen for up to 9 seconds for a response
+    const heardAnswer = await captureUtteranceText(9000);
+
+    // Face is genuinely BACK only if detection says ACTIVE — DEPARTING means
+    // they are STILL gone (camera hasn't seen them yet). DWELLING/RECOGNIZING
+    // means someone stepped in front but we don't yet know who — also count that.
+    const faceBack = detStateRef.current === 'ACTIVE'
+      || detStateRef.current === 'DWELLING'
+      || detStateRef.current === 'RECOGNIZING';
+
+    // Require an EXPLICIT confirmation word — do NOT treat random noise / empty
+    // transcription as "yes". Background noise often produces short garbage text
+    // (1-2 chars) which was incorrectly triggering "Glad you're still here"
+    // even when the visitor had already left.
+    const heardYes = /\b(yes|yeah|yep|yup|here|i'm here|im here|i am here|present|hi|hello|hey|stay|i am|nova|what)\b/i.test(heardAnswer || '');
 
     if (faceBack || heardYes) {
       handlingDepartureRef.current = false;
-      const gladText = "Great! Glad you're still here.";
-      addMessage(gladText, 'kiosk');
-      speak(gladText);
+      // Only say "glad you're still here" if the face is ACTUALLY back, not
+      // just because we heard something ambiguous.
+      if (faceBack) {
+        const gladText = "Great! Glad you're still here.";
+        addMessage(gladText, 'kiosk');
+        speak(gladText);
+      }
       startListening();
     } else {
-      // If face is definitely gone and no response heard after 5 seconds:
+      // Face is still gone AND no clear verbal response — say goodbye
       const farewellText = (name !== 'there' && name !== 'Guest' && name !== 'Unknown' && name !== '')
         ? `Goodbye, ${name}! Have a wonderful day.`
         : 'Goodbye! Have a wonderful day.';
@@ -1125,10 +1197,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       farewellPlayingRef.current = true;
       speak(farewellText, null, () => { farewellPlayingRef.current = false; });
       fetch(BACKEND + '/session/end?session_id=' + (session?.session_id || ''), { method: 'POST' }).catch(() => {});
-      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: farewellText } }));
+      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: farewellText, userName: localName || session?.user_name } }));
       handlingDepartureRef.current = false;
     }
   }, [session, localName, speak, speakAndWait, captureUtteranceText, addMessage, startListening]);
+
 
   useEffect(() => {
     const WS = BACKEND.replace(/^http/, 'ws');
@@ -1145,7 +1218,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
               pendingUtteranceRef.current = null;
             }
-            window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: '' } }));
+            window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: '', userName: localName || session?.user_name } }));
           } else if (msg.type === 'are_you_there') {
             handleDepartureCheck(msg.user_name);
           }

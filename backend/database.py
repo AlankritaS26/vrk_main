@@ -67,21 +67,17 @@ async def save_session(session_id: str, face_id: str | None, user_name: str,
     except Exception as e:
         logger.error(f"Error tracking session: {e}")
 
-async def save_interaction(session_id: str, question: str, answer: str, face_id: str | None = None):
+async def save_interaction(session_id: str, question: str, answer: str, face_id: str | None = None, user_name: str | None = None):
     """
     Logs individual conversational components directly into cloud transactions.
-
-    Also stamps `face_id` (the PERSON, not the visit-thread) when available,
-    so history can be recovered by face_id even if session_id ever gets
-    fragmented (e.g. a question landing before a session was fully
-    established, previously silently logged under session_id="unknown"
-    and orphaned forever). face_id is the durable identity to key off.
+    Records session_id, user_name, input_text, response_text, timestamp, and face_id.
     """
     try:
         doc = {
             "session_id": session_id,
             "input_text": question,
             "response_text": answer,
+            "user_name": user_name or "Guest",
             "timestamp": datetime.now().isoformat(),
         }
         if face_id:
@@ -96,25 +92,36 @@ async def save_interaction(session_id: str, question: str, answer: str, face_id:
 
 async def save_face_encoding(face_id: str, name: str, encoding: list,
                              encodings: list | None = None):
-    """Saves or updates a biometric profile mapping vector representations directly."""
+    """Saves or updates a biometric profile mapping vector representations directly.
+    
+    When `encoding` is an empty list, saves a name-only placeholder record
+    (has_encoding=False) so the visitor appears in the admin Face Tracks tab
+    without affecting the face recognition matching pipeline.
+    """
     try:
+        now_str = datetime.now().isoformat()
+        has_enc = bool(encoding and len(encoding) > 0)
+        set_doc = {
+            "name": name,
+            "encoding": encoding,
+            "encodings": (encodings or ([encoding] if has_enc else [])),
+            "last_seen": now_str,
+            "detected_at": now_str,
+            "has_encoding": has_enc,
+        }
         await faces_collection.update_one(
             {"face_id": face_id},
             {
-                "$set": {
-                    "name": name,
-                    "encoding": encoding,
-                    "encodings": (encodings or [encoding]),
-                    "last_seen": datetime.now().isoformat()
-                },
+                "$set": set_doc,
                 "$setOnInsert": {
-                    "registered_at": datetime.now().isoformat(),
+                    "registered_at": now_str,
                     "visit_count": 1
                 }
             },
             upsert=True
         )
-        logger.info(f"[MongoDB] Face Registered: {name}")
+        tag = "with encoding" if has_enc else "(name-only placeholder)"
+        logger.info(f"[MongoDB] Face Registered into Face Tracks {tag}: {name} (face_id={face_id[:8]})")
     except Exception as e:
         logger.error(f"Error updating biometric vector signature: {e}")
 
@@ -122,9 +129,7 @@ async def save_face_encoding(face_id: str, name: str, encoding: list,
 async def update_face_name_with_alias(face_id: str, new_name: str) -> bool:
     """Update the face record's display name and preserve the old name in
     `name_history` so the admin dashboard can show both the original and
-    any visitor-changed names.
-
-    Returns True when the record was found and updated, False otherwise.
+    any visitor-changed names. Also syncs user_name across sessions with this face_id.
     """
     try:
         # First fetch the current name so we can archive it
@@ -144,23 +149,71 @@ async def update_face_name_with_alias(face_id: str, new_name: str) -> bool:
                 "$addToSet": {"name_history": old_name} if old_name and old_name != new_name else {},
             }
         )
-        logger.info(f"[MongoDB] Face name updated: '{old_name}' -> '{new_name}' ({face_id[:8]})")
+        # Also sync user_name across sessions collection for this face_id
+        await sessions_collection.update_many(
+            {"face_id": face_id},
+            {"$set": {"user_name": new_name}}
+        )
+        logger.info(f"[MongoDB] Face name updated across DB: '{old_name}' -> '{new_name}' ({face_id[:8]})")
         return result.matched_count > 0
     except Exception as e:
         logger.error(f"Error updating face name with alias: {e}")
         return False
 
-async def get_all_face_encodings():
-    """Retrieves all registered biometric keys for local processing frames."""
+async def update_session_user_name(session_id: str, new_name: str) -> bool:
+    """Updates user_name in sessions collection by session_id."""
     try:
-        cursor = faces_collection.find({"encoding": {"$ne": None}})
+        res = await sessions_collection.update_one(
+            {"session_id": session_id},
+            {"$set": {"user_name": new_name}}
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error(f"Error updating session user_name: {e}")
+        return False
+
+async def get_all_face_encodings():
+    """Retrieves all registered biometric keys for local processing frames.
+    
+    Only returns records that have a real encoding vector (has_encoding=True or
+    legacy records without the flag but with a non-empty encoding list). 
+    Name-only placeholder records (has_encoding=False, empty encoding) are 
+    intentionally excluded — passing a zero-length vector to _match() in
+    detection.py would give garbage cosine similarities.
+
+    Returns 'encoding' AND 'encodings' (plural) so detection._match() can
+    use multi-template matching (best-of-N similarity) for better accuracy.
+    """
+    try:
+        # Use $type: 4 (array) + $not $size 0 to correctly filter non-empty arrays.
+        # NOTE: chaining two $ne on the same field is invalid MongoDB — the second
+        # silently overrides the first, so "$ne": None, "$ne": [] would only keep
+        # the $ne: [] check, allowing null values through.
+        cursor = faces_collection.find({
+            "has_encoding": {"$ne": False},
+            "encoding": {
+                "$type": 4,           # must be an array
+                "$not": {"$size": 0}  # must be non-empty
+            },
+        })
         results = []
         async for doc in cursor:
+            enc = doc.get("encoding")
+            if not enc or len(enc) == 0:
+                continue   # extra guard — skip truly empty lists
+            encs = doc.get("encodings") or [enc]
+            # filter any empty sub-vectors that might have crept in
+            encs = [e for e in encs if e and len(e) > 0]
+            if not encs:
+                encs = [enc]
             results.append({
                 "face_id": doc["face_id"],
                 "name": doc["name"],
-                "encoding": doc["encoding"]
+                "encoding": enc,
+                "encodings": encs,
+                "visit_count": doc.get("visit_count", 1),
             })
+        logger.info(f"[DB] get_all_face_encodings: returning {len(results)} biometric profile(s)")
         return results
     except Exception as e:
         logger.error(f"Error querying biometric records: {e}")

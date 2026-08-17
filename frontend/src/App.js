@@ -166,6 +166,14 @@ export default function App() {
     const onEnded = (ev) => {
       // Capture the farewell text if WelcomeScreen sent it with the event
       if (ev.detail?.farewell) setLastFarewell(ev.detail.farewell);
+      // Capture the visitor's real name from the event so the Goodbye screen
+      // always shows the correct name even if session state was stale.
+      if (ev.detail?.userName && ev.detail.userName !== 'Unknown') {
+        setLastSession(current => current
+          ? { ...current, user_name: ev.detail.userName }
+          : { user_name: ev.detail.userName }
+        );
+      }
       clearInterval(pollRef.current);
       pollRef.current = setInterval(poll, IDLE_POLL_MS);
       poll();
@@ -191,6 +199,17 @@ export default function App() {
             clearInterval(pollRef.current);
             poll();                          // switch screens right now
             pollRef.current = setInterval(poll, ACTIVE_POLL_MS);
+          } else if (msg.type === 'session_update') {
+            // Guest gave their name — update session state IMMEDIATELY so the
+            // Goodbye screen and header always show the real name. Don't wait
+            // for the slow 12-second poll tick.
+            if (msg.session) {
+              setSession(prev => prev ? { ...prev, ...msg.session } : msg.session);
+            } else if (msg.user_name) {
+              setSession(prev => prev ? { ...prev, user_name: msg.user_name, face_id: msg.face_id || prev.face_id } : prev);
+            }
+            // Also re-sync with backend to confirm
+            poll();
           }
         } catch (_) { }
       };
