@@ -1,8 +1,8 @@
 """
 RNSIT Digital Receptionist - Backend Server
 
-HOW TO RUN (always from VRK_MVP/ folder):
-    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
+HOW TO RUN (from repository root):
+    venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 """
 
 import os
@@ -2131,27 +2131,6 @@ def clear_response():
     global visitor_name_response
     visitor_name_response = {"ready": False, "name": "", "save": True}
     return {"status": "cleared"}
-
-
-@app.post("/visitor/delete_my_data")
-async def delete_my_data(name: str):
-    """Erase a visitor's face data (GDPR-style right to be forgotten)."""
-    try:
-        face_ids = await delete_face_by_name(name)
-        if not face_ids:
-            return {"success": False, "message": f"No data found for '{name}'."}
-
-        for face_id in face_ids:
-            face_dir = PROJECT_ROOT / "faces" / face_id
-            if face_dir.exists():
-                shutil.rmtree(face_dir)
-                logger.info(f"[DELETE] Removed face dir: {face_dir}")
-
-        await manager.broadcast({"type": "cache_reload"})
-        return {"success": True, "message": f"All data for '{name}' has been permanently deleted."}
-    except Exception as e:
-        logger.error(f"[DELETE] Error: {e}")
-        return {"success": False, "message": "Deletion failed. Please contact staff."}
 
 
 # ==========================================

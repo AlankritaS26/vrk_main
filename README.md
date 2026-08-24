@@ -1,715 +1,226 @@
-# VRK — Voice Receptionist Kiosk
+# VRK — Voice Receptionist Kiosk (Nova)
 
-An AI-powered digital receptionist kiosk for RNS Institute of Technology.
-Visitors walk up, are recognized (or greeted and registered) by camera, and
-hold a natural voice conversation — self-hosted, zero-cost stack
-(free-tier APIs only). **Fully hands-free: voice-based, no clicking required.**
+An AI-powered digital receptionist kiosk for **RNS Institute of Technology**. Visitors walk up, are recognized (or greeted and registered) by camera, and engage in natural, synchronized voice conversations — built on a self-hosted, high-performance, cost-effective stack.
 
-## Quick start — one command
+**Fully hands-free: 100% voice-driven, zero clicking or touchscreen interaction required.**
+
+---
+
+## ⚡ Quick Start — One Command
+
+To start all microservices, backend engines, and the kiosk browser:
 
 ```powershell
 venv\Scripts\python.exe run.py
 ```
 
-That single command, in one terminal:
-1. Frees ports 8000/3000 if a stale kiosk process is squatting on them
-2. Starts the **backend** (FastAPI) and waits for `/health` to pass
-3. Starts **camera detection** (only after the backend is ready)
-4. Starts the **frontend** (npm) and opens the kiosk browser window with
-   autoplay enabled — required for the greeting to speak unprompted
-5. Prefixes all logs by service: `[BACKEND]` `[DETECT]` `[FRONTEND]`
-6. `Ctrl+C` stops everything, including npm's child processes
-
-Do **not** open localhost:3000 in your own tab for kiosk testing — use the
-window `run.py` opens; it carries the `--autoplay-policy` flag that lets the
-kiosk speak before any user gesture.
-
-First-time setup (fresh machine): see **docs/SETUP.md**. Summary: Python
-3.12 venv → `pip install -r backend/requirements.txt` → `.env` from
-`.env.example` (Mongo URI, API key) → `cd frontend && npm install`.
-
-## What it does
-
-- **Kiosk-initiated conversation** — detection spots a visitor and the kiosk
-  greets them by voice first (greeting audio is pre-cached per visitor for a
-  sub-second start). Returning visitors are greeted by name.
-- **Voice-based new visitor flow** — no text input or clicking. When a new
-  visitor is detected, the kiosk says "What's your name?" and listens via VAD.
-  Name is transcribed, confirmed, and registration proceeds automatically.
-- **Blink detection** — Eye Aspect Ratio (EAR) from face landmarks enables
-  blink-based confirmation: "Would you like more info? [User blinks → Yes]"
-- **Proximity detection** — estimates distance from camera in meters; shows
-  encouragement when visitor approaches ("Come closer! I see you!")
-- **Personality-driven responses** — detects question intent (curious, happy,
-  grateful, etc.) and responds with contextual reactions and prefixes.
-- **Speech-to-text** — Silero VAD in the browser segments speech;
-  raw 16 kHz PCM streams to faster-whisper (`small.en` int8 on CPU dev,
-  `large-v3-turbo` CUDA in production) with a bandpass + energy-gate DSP
-  chain for lobby noise.
-- **Answer engine** — guardrails → RAG over the college knowledge base
-  (Gemini embeddings + generation, MongoDB source, Redis hot cache). The
-  query-condense step is skipped on early turns to save a network round-trip.
-- **Text-to-speech** — Kokoro-82M (`af_bella`, 1.05× pace) with:
-  silence-trimmed clips, ~2-sentence chunking, two-chunk prefetch, gapless
-  Web Audio playback, per-sentence response cache, punctuation
-  normalization (curly quotes/dashes), and browser-voice fallback so the
-  kiosk never goes mute.
-- **Face recognition** — MediaPipe + DeepFace with consent flow, guest mode,
-  and a GDPR-style **Delete My Data** flow (see Known Issues).
-- **UI** — idle attract screen (live clock, capability carousel, watching
-  radar), conversation screen with a persistent voice dock (waveform while
-  listening, breathing status dot otherwise, thinking dots while the LLM
-  works), synced text+voice bubbles, instant goodbye transition with the
-  farewell voice playing over the goodbye screen.
+### What `run.py` does automatically:
+1. **Port Self-Healing**: Checks ports `8001` (Backend), `8600` (RAG Service), and `3000` (Frontend). Safely frees stale kiosk processes if lingering.
+2. **Parallel Boot Orchestration**:
+   - Launches **RAGService** on port `8600` (loads sentence-transformer embedding model).
+   - Launches **FastAPI Backend** on port `8001` (loads faster-whisper STT + Kokoro TTS models).
+   - Launches **React Frontend** on port `3000` concurrently with Webpack dev server.
+3. **Health Validation**: Asynchronously awaits health checks (`/health`) on ports `8001` and `8600`.
+4. **Autoplay-Enabled Browser Launch**: Opens Google Chrome or Microsoft Edge in app mode with `--autoplay-policy=no-user-gesture-required` so Nova can speak greetings without requiring a prior mouse click.
+5. **Unified Logging**: Prefixes logs clearly by service: `[BACKEND]`, `[RAG]`, `[FRONTEND]`, `[RUN]`.
+6. **Graceful Shutdown**: Pressing `Ctrl+C` cleans up all child processes, sockets, and subprocess trees.
 
 ---
 
-## Voice-First Interaction Features
+## 🌟 Core System Capabilities
 
-### 1. Voice-Based Name Input (Fully Hands-Free)
+### 1. 🎙️ Voice-First Hands-Free Experience
+- **Voice-Based Visitor Onboarding**: When a new face appears, Nova welcomes them: *"Hi! I'm Nova. What's your name?"* Silero Voice Activity Detection (VAD) activates automatically.
+- **Natural Spoken Name Recognition**: Visitors can say *"Akshatha"*, *"I am Sneha"*, or *"My name is Alankrita"*. The system transcribes the name, displays a confirmation badge, and **auto-advances after 3 seconds** without touching the screen.
+- **Zero-Touch Interaction**: From arrival to departure, all operations—including inquiries, topic selection, re-engagement, and farewells—are handled entirely by voice.
 
-When a new visitor is detected:
-1. Modal appears: "Hi! I'm Nova. What's your name?"
-2. Kiosk **automatically** starts listening via browser VAD
-3. User speaks their name clearly (e.g., "Akshatha Sharma")
-4. STT transcribes in real-time with waveform visualization
-5. Name confirmation shown: "✓ Got it! Akshatha"
-6. **Auto-proceeds after 3 seconds** (zero clicks needed)
-7. Face is registered and session begins with personalized greeting
+### 2. 👁️ Vision Intelligence & ArcFace Recognition
+- **ArcFace + SCRFD Face Recognition**: Uses InsightFace ArcFace (`w600k_r50.onnx`) with canonical 5-point alignment to extract 512-d L2-normalized embeddings for fast cosine similarity matching against MongoDB face records.
+- **MediaPipe Landmark Tracking**: Real-time facial mesh processing for presence tracking and eye aspect ratio.
+- **Blink Detection (Eye Aspect Ratio - EAR)**: Real-time geometry calculation ($EAR < 0.15$ closed, $EAR \ge 0.20$ open) for natural blink detection.
+- **Nearest-Person / Largest-Face Selection**: Bounding box geometry prioritizes the closest person standing in front of the kiosk.
+- **State Machine**: Clean progression from `IDLE` ("Walk up — I'll recognise you") $\to$ `DWELLING` ("I see you — hold still…") $\to$ `RECOGNIZING` ("Identifying…") $\to$ `ACTIVE` ("Welcome, {Name}!").
 
-**Implementation:**
-- No text input field
-- No button clicks required
-- Listening starts immediately when modal appears
-- Waveform shows audio activity in real-time
-- Auto-confirmation speeds up new visitor onboarding
+### 3. 🧠 Hybrid RAG Answer Engine & Multi-Tier LLM Architecture
+- **Primary LLM (Qwen)**: Uses Qwen (`Qwen/Qwen2.5-7B-Instruct` or local OpenAI-compatible inference) as the primary generation engine.
+- **Google Gemini Fallback**: Seamless fallback to Gemini Flash if the primary local LLM is unreachable.
+- **RAGService Microservice (Port 8600)**: Standalone ChromaDB vector store with `sentence-transformers` embeddings delivering high-precision semantic retrieval over campus data.
+- **Grounded Campus Knowledge**: College syllabus, courses, departments, fee structures, faculty contacts, placement statistics, and FAQs.
+- **Redis / Memurai Caching**: Low-latency caching layer for recurring queries and pre-computed embeddings.
 
-### 2. Blink Detection for Yes/No Confirmation
+### 4. 🎭 Conversational Personality & Easter Eggs
+- **Intent Analysis**: Classifies questions into intents (`curious`, `happy`, `thanks`, `greeting`, `confused`) to trigger contextual avatar expressions and prefixes.
+- **Interactive Small Talk**: Built-in deterministic responses for conversational moments (*"Are you a robot?"*, *"Tell me a joke"*, *"How are you?"*, *"You are smart"*).
+- **Time-Aware Salutations**: Contextual greetings dynamically adapted to the time of day.
 
-Eye Aspect Ratio (EAR) calculated from 468-point MediaPipe face landmarks:
-- **Open eyes**: EAR ≥ 0.20
-- **Closed eyes**: EAR < 0.15
-- **Blink detected**: Open → Closed → Open transition
-
-**Use case example:**
-```
-Kiosk: "Would you like to hear more about placements?"
-User: [blinks naturally]
-Kiosk: [detects blink, responds affirmatively]
-```
-
-**WebSocket data includes:**
-- `blink_detected`: bool (true if blink occurred this frame)
-- `eyes_closed`: bool (true if eyes currently closed)
-- `ear_left`: float (left eye aspect ratio)
-- `ear_right`: float (right eye aspect ratio)
-
-**To implement blink-based Yes/No:**
-```javascript
-// In WelcomeScreen.js
-const handleYesNoQuestion = (question) => {
-  addMessage(question, 'kiosk');
-  setWaitingForBlink(true);
-  setBlinkCallback(() => handleYes());
-};
-```
-
-### 3. Nearest Person Detection & Prioritization
-
-Estimates visitor distance from camera using face bounding box:
-- **Formula**: `distance_m = (200px @ 1m) / bbox_width_pixels`
-- **Range**: 0.1m - 10m
-- **Accuracy**: ±10% typical
-- **Calibration**: Assumes face width ≈ 200px at 1m for standard webcam
-
-**Use cases:**
-- Show encouragement when visitor approaches: "I see you! Come closer! 👋"
-- Multi-person kiosk: prioritize the closest person
-- Distance-based UX: adjust greeting volume based on proximity
-- Analytics: track how close visitors stand
-
-**WebSocket includes:**
-```json
-{
-  "distance_m": 1.05,
-  "bbox": {"x": 150, "y": 100, "w": 200, "h": 250}
-}
-```
-
-**Example integration:**
-```javascript
-if (distanceM !== null && distanceM < 1.5) {
-  showEncouragement("Come closer! I can see you better.");
-}
-```
-
-### 4. Personality & Emotion System (Framework Ready)
-
-Detects question intent and provides contextual responses:
-
-**Intent Types:**
-| Intent | Trigger Words | Avatar Reaction |
-|--------|---------------|-----------------|
-| `curious` | How, Why, What, Tell me about | Head tilt, thoughtful |
-| `happy` | Placements, great, excellent, wonderful | Smile, enthusiastic |
-| `thanks` | Thanks, thank you, appreciated | Bow, grateful gesture |
-| `greeting` | Hello, Hi, Hey, Good morning | Arms up, big smile |
-| `confused` | Unclear/too short/too long | Shrug, questioning |
-| `standard` | Regular questions | Neutral, processing |
-
-**Time-Based Greetings:**
-```
-6 AM - 12 PM  →  "Good morning! ☀️"
-12 PM - 6 PM  →  "Good afternoon! 🌤️"
-6 PM - 9 PM   →  "Good evening! 🌙"
-9 PM - 6 AM   →  "It's late! Still here? 🌙"
-```
-
-**Personality Prefixes (auto-generated per intent):**
-- Curious: "Great question! Let me look into that for you."
-- Happy: "Your enthusiasm is amazing! Here's the great news..."
-- Thanks: "You're welcome! Anything else I can help with?"
-- Greeting: "Hello there! What brings you here today?"
-
-**Helper Functions Ready in `frontend/src/avatarReactions.js`:**
-
-```javascript
-import {
-  detectQuestionIntent,          // string → intent
-  getPersonalityPrefix,          // intent → prefix string
-  getPersonalitySuffix,          // intent → suffix string
-  getAvatarStateForIntent,       // intent → animation state
-  getTimeBasedGreeting,          // none → {greeting, emoji}
-  getIdleScreenMessage,          // distanceM → encouraging message
-  getReactionDuration            // intent → ms to hold reaction
-} from './avatarReactions';
-
-// Example usage
-const userMsg = "How are the placements?";
-const intent = detectQuestionIntent(userMsg);
-// Returns: "happy"
-
-const reaction = getAvatarStateForIntent(intent);
-setStatus(reaction); // Avatar tilts head happily
-
-const prefix = getPersonalityPrefix(intent);
-// Returns: "Your enthusiasm is awesome! Here's..."
-
-const fullResponse = `${prefix} ${answer}`;
-```
-
-**To integrate personality into message flow:**
-1. Detect intent when user speaks
-2. Set avatar reaction state for 0.8-1.2s
-3. Prepend personality prefix to response
-4. Append contextual suffix
-5. Avatar smoothly transitions to speaking state
+### 5. 🔊 Neural Text-To-Speech & Audio Sync
+- **Kokoro-82M Neural Synthesis**: High-quality `af_bella` voice at natural conversational pacing.
+- **Sentence Chunking & Gapless Playback**: Pre-fetches upcoming sentence chunks and streams them through the Web Audio API without pauses.
+- **Synchronized Text Bubbles & Auto-Scroll**: Spoken speech is synchronized with animated message bubbles, automatically scrolling conversation threads into focus.
+- **Browser Speech Synthesis Fallback**: Ensures the kiosk remains vocal even during network disruptions.
 
 ---
 
-## Testing Voice-First Features
+## 🏗️ System Architecture
 
-### Test 1: Voice Name Input
 ```
-1. Start kiosk:  python run.py
-2. Approach camera as NEW visitor (face not in system)
-3. Listen for: "Hi! I'm Nova. What's your name?"
-4. Speak clearly: "Akshatha Sharma"
-5. Watch waveform animate in real-time
-6. Modal shows: "✓ Got it! Akshatha"
-7. Auto-proceeds in 3 seconds (no clicking!)
-8. Session starts with: "Welcome back!" (if registered before)
-   OR "Welcome to RNSIT!" (if new registration)
+                                  ┌───────────────────────────────┐
+                                  │      Client Web Browser       │
+                                  │  React 18 Kiosk App (Port 3000)│
+                                  └───────────────┬───────────────┘
+                                  WebSocket /ws   │ HTTP API Requests
+                                 & /ws/detect     │ (/ask, /tts, /stt/pcm)
+                                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                   FastAPI Backend (Port 8001)                                   │
+│                                                                                                 │
+│  ┌───────────────────────┐  ┌─────────────────────────┐  ┌───────────────────────────────────┐  │
+│  │   Camera Detection    │  │   Speech-To-Text (STT)  │  │      Text-To-Speech (TTS)         │  │
+│  │ • ArcFace + SCRFD     │  │ • faster-whisper        │  │ • Kokoro-82M ('af_bella')         │  │
+│  │ • MediaPipe Mesh      │  │ • Bandpass DSP Filters  │  │ • Silence Trimmer                 │  │
+│  │ • Blink Detection     │  │ • Silero VAD Processor  │  │ • Sentence Chunk Prefetch Cache   │  │
+│  └───────────┬───────────┘  └────────────┬────────────┘  └─────────────────▲─────────────────┘  │
+│              │                           │                                 │                    │
+│  ┌───────────▼───────────────────────────▼─────────────────────────────────┴─────────────────┐  │
+│  │                                     main.py Router                                        │  │
+│  │       Session State Machine • Safety Guardrails • Intent Router • Easter Eggs Intercept   │  │
+│  └───────────┬───────────────────────────┬─────────────────────────────────┬─────────────────┘  │
+│              │                           │                                 │                    │
+│  ┌───────────▼───────────┐  ┌────────────▼────────────┐  ┌─────────────────▼─────────────────┐  │
+│  │     LLM Router        │  │   MongoDB (Motor Async) │  │      Redis / Memurai Caching      │  │
+│  │ • Primary: Qwen LLM   │  │ • Visitor Face Vectors  │  │ • Query Cache                     │  │
+│  │ • Fallback: Gemini    │  │ • Session Logs          │  │ • Hot Chunk Retrieval             │  │
+│  └───────────┬───────────┘  └─────────────────────────┘  └───────────────────────────────────┘  │
+└──────────────┼──────────────────────────────────────────────────────────────────────────────────┘
+               │ Semantic Search Query
+               ▼
+┌─────────────────────────────────────────────────────────────────────────────────────────────────┐
+│                                RAGService Microservice (Port 8600)                              │
+│         ChromaDB Vector Database • Sentence-Transformers • RNSIT College Knowledge Base         │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Test 2: Blink Detection
+---
+
+## 📡 API & WebSocket Endpoint Reference
+
+| Endpoint | Method / Protocol | Functionality |
+|---|---|---|
+| `/health` | `GET` | System health check (used by `run.py` during boot). |
+| `/ws` | `WebSocket` | Central kiosk event channel (session transitions, audio cues). |
+| `/ws/detect` | `WebSocket` | Live vision stream: presence, identity, bounding box, blink flags, distance. |
+| `/ws/stt` | `WebSocket` | Live streaming transcription socket. |
+| `/stt/pcm` | `POST` | Ingests 16 kHz mono PCM audio and returns transcribed text. |
+| `/tts` | `POST` | Generates base64 WAV speech audio from text using Kokoro-82M. |
+| `/ask` | `GET` | Primary question answering: safety $\to$ RAG retrieval $\to$ Qwen/Gemini synthesis. |
+| `/ask/stream` | `GET` (SSE) | Server-Sent Events stream for streaming LLM tokens. |
+| `/session/start` | `POST` | Starts a session, records visitor metadata, and returns custom greeting. |
+| `/session/end` | `POST` | Closes active session and computes interaction statistics. |
+| `/session/are_you_there`| `POST` | Re-engagement heartbeat checking if the visitor is still present. |
+| `/visitor/unknown` | `POST` | Triggers voice onboarding modal for newly detected visitors. |
+| `/visitor/submit_name` | `POST` | Confirms visitor name and registers face encoding to MongoDB. |
+| `/visitor/rename` | `POST` | Renames an existing visitor identity. |
+| `/faces/all` | `GET` | Fetches registered face vectors for detection caching. |
+| `/api/rag/upload` | `POST` | Uploads and indexes campus documents into the RAG vector store. |
+| `/api/rag/files` | `GET` | Lists all indexed documents in the active RAG knowledge base. |
+| `/logs-dashboard` | `GET` | Protected administrative visual dashboard for kiosk interactions. |
+
+---
+
+## 📁 Repository Structure
+
 ```
-1. Start kiosk normally
-2. Open DevTools (F12) → Network → ws/detect
-3. During conversation, blink naturally
-4. Watch WebSocket messages for:
+vrk_main/
+├── run.py                 # Master one-command multi-service orchestrator
+├── .env                   # Configuration & API keys (Mongo, Qwen/Gemini, Ports)
+├── README.md              # Project documentation (this file)
+│
+├── backend/               # FastAPI Backend Application (Port 8001)
+│   ├── main.py            # API routes, WebSockets, session management
+│   ├── detection.py       # Camera pipeline, MediaPipe mesh, presence states
+│   ├── recognition.py     # ArcFace + SCRFD face embedding extraction
+│   ├── stt.py             # faster-whisper speech-to-text pipeline
+│   ├── tts.py             # Kokoro-82M neural TTS synthesizer
+│   ├── llm.py & gemini.py # Qwen LLM engine, Gemini fallback & prompt safety
+│   ├── database.py        # Motor async MongoDB connector & schemas
+│   ├── audio_processing.py# Bandpass DSP filters and noise gates
+│   ├── face_landmarker.task# MediaPipe landmark model binary
+│   ├── requirements.txt   # Python backend dependencies
+│   └── README.md          # Backend-specific architecture guide
+│
+├── RAGService/            # Standalone Vector RAG Microservice (Port 8600)
+│   ├── app.py             # FastAPI RAG search API
+│   ├── rag_store.py       # ChromaDB vector collection manager
+│   ├── embeddings.py      # Sentence-transformers embedding engine
+│   ├── file_parser.py     # Document ingest (PDF, DOCX, TXT)
+│   ├── ui.py              # Streamlit management interface
+│   └── requirements.txt   # RAG service dependencies
+│
+├── frontend/              # React 18 Kiosk Single Page Application (Port 3000)
+│   ├── package.json       # Node.js dependencies and scripts
+│   ├── public/            # Static assets (rnslogo.png, favicons)
+│   ├── scripts/
+│   │   └── copyVadAssets.js# Script bundling Silero VAD WASM/ONNX assets
+│   ├── src/
+│   │   ├── App.js         # Top-level state coordinator & detection listener
+│   │   ├── WelcomeScreen.js# Active voice screen, name capture, audio sync
+│   │   ├── IdleScreen.js  # Attract mode, vision state indicators, carousel
+│   │   ├── GoodbyeScreen.js# Farewell transition card with RNSIT branding
+│   │   ├── AriaAvatar.js  # Animated vector avatar character engine (Nova)
+│   │   ├── avatarReactions.js# Intent recognition & personality prefixes
+│   │   ├── kioskMic.js    # Browser VAD 16kHz audio capture
+│   │   ├── index.css      # Glassmorphic kiosk design system
+│   │   └── index.js       # React root mount
+│   └── README.md          # Frontend-specific architecture guide
+│
+├── data/
+│   └── college_info.json  # Initial structured campus reference corpus
+└── docs/
+    ├── SETUP.md           # First-time machine installation manual
+    ├── ARCHITECTURE.md    # Detailed system dataflow & diagrams
+    └── OPERATIONS.md      # Production kiosk maintenance guide
+```
+
+---
+
+## 🧪 Testing & Verification Guide
+
+### 1. Hands-Free Voice Onboarding
+1. Run `python run.py`.
+2. Stand in front of the camera as a new visitor.
+3. Listen for Nova: *"Hi! I'm Nova. What's your name?"*
+4. Speak naturally: *"Akshatha"* or *"I am Sneha"*.
+5. Observe the live audio waveform. The screen updates to: `"✓ Got it! Akshatha"`.
+6. Without touching anything, the system auto-proceeds after 3 seconds and welcomes you.
+
+### 2. Vision State & Recognition
+1. Stand away: Attract screen shows `Walk up — I'll recognise you`.
+2. Approach the camera: State changes to `I see you — hold still…` $\to$ `Identifying…`.
+3. If registered: Greeted with personalized greeting (*"Welcome back, {Name}!"*).
+
+### 3. Blink Detection (Yes/No Confirmation)
+1. Open Developer Tools (`F12`) $\to$ **Network** $\to$ `ws/detect`.
+2. Blink naturally in front of the camera.
+3. Observe WebSocket payload stream:
+   ```json
    {
      "blink_detected": true,
      "eyes_closed": true,
-     "ear_left": 0.08,
-     "ear_right": 0.09
+     "ear_left": 0.09,
+     "ear_right": 0.08
    }
-5. Blink again - should detect another blink event
-```
-
-### Test 3: Distance Detection
-```
-1. Start kiosk
-2. Open console (F12 → Console)
-3. Add logging: window.distanceM = distanceM (from props)
-4. Move 2 meters away from camera
-5. Check console: distance_m ≈ 2.0
-6. Move 1 meter away
-7. Check console: distance_m ≈ 1.0
-8. Move 0.5 meters away
-9. Check console: distance_m ≈ 0.5
-
-Calibration:
-- Stand exactly 1m from camera
-- Measure face bbox width (should be ~200px)
-- If off, adjust FACE_WIDTH_AT_1M_PX in detection.py
-```
-
-### Test 4: Personality Features
-```javascript
-// In browser console
-import { detectQuestionIntent } from './avatarReactions';
-
-// Test intent detection
-const userMsgs = [
-  "How do I apply?",              // curious
-  "What about placements?",       // happy
-  "Thank you so much!",           // thanks
-  "Hello everyone",               // greeting
-  "xyz abc 123",                  // confused
-  "Tell me about campus"          // standard
-];
-
-userMsgs.forEach(msg => {
-  const intent = detectQuestionIntent(msg);
-  console.log(`"${msg}" → ${intent}`);
-});
-
-// Test time-based greeting
-const { greeting, emoji } = getTimeBasedGreeting();
-console.log(`${emoji} ${greeting}`);
-// Output: ☀️ Good morning! (if before noon)
-```
-
----
-
-## Architecture Overview
-
-### Backend Detection Pipeline
-
-```
-Frame (640x480) via WebSocket
-    ↓ (3 fps continuous)
-MediaPipe FaceLandmarker (468-point mesh)
-    ├─ Blink Detection: Eye Aspect Ratio (EAR)
-    │   └─ Detect open→closed→open transition
-    ├─ Distance Estimation: bbox width analysis
-    │   └─ distance_m = (200px @ 1m) / bbox_width
-    ├─ Face Recognition: identity + verification
-    │   └─ SCRFD + ArcFace or DeepFace
-    └─ State Machine: IDLE→DWELLING→RECOGNIZING→ACTIVE
-    ↓
-WebSocket /ws/detect Broadcast
-    ↓
-Frontend: React State Update
-    ↓
-UI Reaction: Avatar animation, message display
-```
-
-### Frontend Data Flow
-
-```
-WebSocket /ws/detect Message {
-  "present": bool,
-  "state": "IDLE" | "DWELLING" | "RECOGNIZING" | "ACTIVE" | ...,
-  "identity": "Akshatha A",
-  "verified": bool,
-  "bbox": {
-    "x": 150,
-    "y": 100,
-    "w": 200,
-    "h": 250,
-    "distance_m": 1.05      ← NEW
-  },
-  "bystanders": 0,
-  "blink_detected": false,  ← NEW
-  "eyes_closed": false,     ← NEW
-  "ear_left": 0.35,         ← NEW
-  "ear_right": 0.34         ← NEW
-}
-    ↓
-App.js (Global State)
-    ├─ detState
-    ├─ identity
-    ├─ bbox
-    ├─ blinkDetected      ← NEW
-    ├─ eyesClosed         ← NEW
-    └─ distanceM          ← NEW
-    ↓
-WelcomeScreen / IdleScreen
-    ├─ Show encouragement if distanceM < 1.5
-    ├─ Trigger blink callbacks
-    ├─ Display avatar reactions
-    └─ Handle personality responses
-```
-
----
-
-## Files Modified for Voice-First Features
-
-### Backend
-
-**`backend/detection.py`**
-- Added: `_distance()` - Euclidean distance helper
-- Added: `_calculate_ear()` - Eye Aspect Ratio from landmarks
-- Added: `_get_blink_state()` - Blink detection logic
-- Added: `_estimate_distance()` - Distance from face bbox
-- Modified: `DetectionResult` dataclass
-  - Added: `blink_detected: bool`
-  - Added: `eyes_closed: bool`
-  - Added: `ear_left: Optional[float]`
-  - Added: `ear_right: Optional[float]`
-  - Added: `full_landmarks: Optional[list]`
-- Modified: `KioskState` dataclass
-  - Added: `prev_ear_left`, `prev_ear_right` (blink tracking)
-  - Added: `last_blink_time` (timestamp)
-- Modified: `BoundingBox` dataclass
-  - Added: `distance_m: Optional[float]`
-- Modified: `detect_presence()` function
-  - Calculate EAR and blink detection
-  - Estimate distance for primary visitor
-  - Store full landmarks for EAR calc
-
-**`backend/main.py`**
-- Modified: `/ws/detect` WebSocket endpoint
-  - Added to response: `blink_detected`, `eyes_closed`, `ear_left`, `ear_right`, `distance_m`
-
-### Frontend
-
-**`frontend/src/App.js`**
-- Added: `blinkDetected` state (bool)
-- Added: `eyesClosed` state (bool)
-- Added: `distanceM` state (float | null)
-- Modified: WebSocket handler
-  - Capture: `data.blink_detected`, `data.eyes_closed`, `data.ear_left/right`, `data.distance_m`
-- Modified: `detectionProps` object
-  - Pass new state to child screens
-
-**`frontend/src/WelcomeScreen.js`**
-- Replaced: Text input modal → Voice-only name capture
-- Added: `voiceNameState` state (idle | listening | processing | confirming)
-- Added: `startVoiceNameCapture()` function
-  - Auto-starts listening when askingName becomes true
-  - Captures audio via VAD
-  - Sends PCM to `/stt/pcm` backend
-  - Extracts name from transcription
-- Added: Auto-confirmation timeout
-  - Shows confirmed name for 3 seconds
-  - Auto-submits (zero clicks)
-- Added: Blink detection state variables
-  - `waitingForBlink`, `blinkCallback`
-  - Ready for blink-based Yes/No
-- Imported: `avatarReactions.js` helpers
-
-**`frontend/src/avatarReactions.js`** (NEW)
-- Exported: `detectQuestionIntent(text)` → intent type
-- Exported: `getPersonalityPrefix(intent)` → response prefix
-- Exported: `getPersonalitySuffix(visitCount, isReturning)` → response suffix
-- Exported: `getTimeBasedGreeting()` → {greeting, emoji}
-- Exported: `getAvatarStateForIntent(intent)` → animation state
-- Exported: `getReactionDuration(intent)` → milliseconds to hold reaction
-- Exported: `getIdleScreenMessage(distanceM)` → encouraging message
-
----
-
-## Configuration (.env)
-
-Standard configuration:
-```
-MONGO_URI=<your-mongodb-uri>
-LLM_API_KEY=<gemini-free-tier-key>
-ALLOWED_ORIGINS=http://localhost:3000
-STT_DEVICE=auto
-TTS_VOICE=af_bella
-TTS_SPEED=1.05
-```
-
-**Blink Detection Thresholds** (hardcoded in `backend/detection.py`):
-```python
-EAR_CLOSED_THRESHOLD = 0.15  # Eyes closed
-EAR_OPEN_THRESHOLD = 0.20    # Eyes open
-```
-
-**Distance Calibration** (hardcoded in `backend/detection.py`):
-```python
-FACE_WIDTH_AT_1M_PX = 200    # Pixels at 1m distance
-ASSUMED_FRAME_WIDTH = 640    # Standard frame width
-```
-
-To adjust: measure face at known distance and adjust these values.
-
----
-
-## Repository Layout
-
-```
-run.py                 ← Start everything (one command)
-backend/
-  ├─ main.py          FastAPI server + WebSocket endpoints
-  ├─ detection.py     Face detection + blink + distance
-  ├─ stt.py           Speech-to-text (Whisper)
-  ├─ tts.py           Text-to-speech (Kokoro)
-  ├─ llm.py / gemini.py   LLM answer generation
-  ├─ recognition.py   Face recognition engine
-  └─ requirements.txt
-frontend/
-  ├─ src/
-  │  ├─ App.js         Main app + detection WebSocket
-  │  ├─ WelcomeScreen.js   Voice name input + personality
-  │  ├─ IdleScreen.js      Attract mode + distance
-  │  ├─ avatarReactions.js ← NEW: Personality system
-  │  ├─ kioskMic.js    Browser VAD + audio capture
-  │  ├─ AriaAvatar.js  Avatar animations
-  │  └─ index.js
-  ├─ package.json
-  └─ public/
-data/
-  └─ college_info.json
-docs/
-  ├─ SETUP.md
-  ├─ ARCHITECTURE.md
-  └─ OPERATIONS.md
-README.md              ← This file (all features here)
-```
-
-## Key Endpoints
-
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/health` | GET | Liveness check (used by run.py) |
-| `/stt/pcm` | POST | Raw PCM → transcript (speech-to-text) |
-| `/tts` | POST | Text → base64 WAV (text-to-speech, cached) |
-| `/ask` | GET | Question → grounded answer |
-| `/session/start` | POST | Begin new session |
-| `/session/end` | POST | End session |
-| `/session/current` | GET | Get active session info |
-| `/visitor/unknown` | POST | Detect new visitor |
-| `/visitor/submit_name` | POST | Submit visitor name (voice or typed) |
-| `/visitor/delete_my_data` | POST | Privacy: delete face + history |
-| `/ws/detect` | WebSocket | Real-time detection stream (face, blink, distance) |
-
----
-
-## Known Issues (Tracked)
-
-- **[HIGH — privacy] detection.py stale face cache**: after Delete My Data,
-  the visitor is still recognized until detection restarts. Cause: encodings
-  load once at startup. Fix: re-fetch `/faces/all` on cache reload event.
-
-- **Detection-to-greeting latency (~2–3 s)**: browser polling (750ms) + detection
-  recognition cadence. Next: WebSocket early-exit signals.
-
-- **Conversation latency floor (~2–4 s/turn)**: bounded by Gemini API
-  round-trips. Next: model tier upgrade, embedding cache optimization.
-
-- **Blink detection accuracy**: depends on lighting and face angle. Best results
-  1-2m away in well-lit environments. May need EAR threshold calibration for
-  different lighting conditions. Threshold: `EAR < 0.15` for closed, `>= 0.20` for open.
-
-- **Distance calibration**: assumes standard webcam focal length. If using
-  different camera (e.g., wide-angle, fish-eye), recalibrate `FACE_WIDTH_AT_1M_PX`.
-
----
-
-## Next Steps (Optional Enhancements)
-
-### 1. Complete Personality Integration
-```javascript
-// In WelcomeScreen.js message handler
-const intent = detectQuestionIntent(userMessage);
-setStatus(getAvatarStateForIntent(intent)); // Show reaction
-setTimeout(() => {
-  setStatus('speaking'); // Transition to speaking
-  const prefix = getPersonalityPrefix(intent);
-  fullAnswer = `${prefix} ${answer}`;
-  speak(fullAnswer);
-}, getReactionDuration(intent));
-```
-
-### 2. Enable Blink-Based Yes/No
-```javascript
-// In WelcomeScreen.js
-const askYesNo = (question, onYes) => {
-  addMessage(question, 'kiosk');
-  setWaitingForBlink(true);
-  setBlinkCallback(onYes);
-  // Timeout fallback after 5s
-  setTimeout(() => {
-    if (waitingForBlink) {
-      // User didn't blink, fallback to voice: "yes" / "no"
-      startListening();
-    }
-  }, 5000);
-};
-```
-
-### 3. Distance-Based UX
-```javascript
-// In IdleScreen.js
-if (distanceM !== null) {
-  if (distanceM > 3) {
-    showMessage("You look far away. Walk closer, please! 👋");
-  } else if (distanceM < 1.5) {
-    showMessage("I see you! Ready to help. 😊");
-  }
-}
-```
-
-### 4. Weather Integration
-```javascript
-// Fetch local weather
-const weather = await fetch('https://api.open-meteo.com/v1/forecast?...');
-const greeting = `Good morning! Weather is ${weather.description}.`;
-```
-
-### 5. Multi-Language Support
-```javascript
-// Detect language from STT
-const language = result.language; // e.g., "hi", "es"
-// Switch LLM + TTS language
-setLanguage(language);
-```
-
----
-
-## Troubleshooting
-
-### Voice Name Input Issues
-
-**Problem:** Voice name input not capturing audio
-- Check microphone permissions in browser settings
-- Chrome: Settings → Privacy → Site Settings → Microphone → Allow localhost
-- Try in Incognito mode (rules out extensions blocking mic)
-- Check console for errors in `kioskMic.js` initialization
-
-**Problem:** STT shows "Processing..." forever
-- Verify backend is running: `http://127.0.0.1:8001/docs`
-- Check `/stt/pcm` endpoint responds
-- Look at backend terminal for STT errors
-- Try with a simple greeting first: "Hello"
-
-**Problem:** Name extracted incorrectly
-- Speak more slowly and clearly
-- STT may need campus vocabulary training (edit backend/stt.py)
-- Try shorter name: "Sharma" works better than "Akshatha Sharma"
-
-### Blink Detection Issues
-
-**Problem:** Blinks not detected
-- Ensure good lighting on visitor's face
-- Avoid strong backlighting (sun in face)
-- Get closer to camera (best at <1.5m)
-- Check WebSocket shows changing EAR values
-
-**Problem:** Too many false blink detections
-- Environment too dark (eyes appear closed)
-- Lower lighting for better detection
-- Increase EAR thresholds in `detection.py`
-  - `EAR_OPEN_THRESHOLD = 0.25` (stricter)
-
-**Problem:** Blinks detected but inconsistent
-- Face angle affects EAR calculation
-- Visitor looking down won't blink-detect
-- Ensure visitor faces camera directly
-
-### Distance Detection Issues
-
-**Problem:** Distance values seem wrong
-- Calibrate at exactly 1m from camera
-- Measure face bbox width (should be ~200px)
-- If different, adjust in `detection.py`:
-  ```python
-  FACE_WIDTH_AT_1M_PX = <measured_width>
-  ```
-
-**Problem:** Distance jumps around too much
-- Frame-to-frame variance is normal at 3fps
-- Add low-pass filter in frontend:
-  ```javascript
-  const smoothDistance = 0.7 * prevDistance + 0.3 * newDistance;
-  ```
-
-**Problem:** Multiple faces, wrong one prioritized
-- Currently prioritizes largest face
-- To prioritize closest: use `distance_m`, not face area
-- Backend mod: compare `distance_m` instead of `bbox_area`
-
-### Personality System Issues
-
-**Problem:** Intent detection not working as expected
-- Intent matching is substring-based and case-insensitive
-- Test with exact keywords: "placements", "thank", "how", etc.
-- Add console logging to `detectQuestionIntent()`
-
-**Problem:** Avatar reactions not showing
-- Check avatar animation CSS classes exist
-- Verify `status` state is being set correctly
-- Ensure CSS transitions are not disabled
-
----
-
-## Performance Metrics
-
-### Voice Name Input Latency
-- VAD speech-end detection: ~100ms after user stops
-- STT processing: ~300-400ms (GPU), ~1-2s (CPU)
-- Name extraction: ~50ms
-- **Total end-to-end:** 450-2500ms
-
-### Blink Detection
-- EAR calculation: real-time, zero latency
-- Runs at 3 fps (detection rate)
-- CPU overhead: < 1% (no ML inference)
-
-### Distance Estimation
-- Calculation: per frame at 3 fps
-- Model accuracy: ±10% typical
-- CPU overhead: < 0.1% (simple math)
-
-### Overall System
-- WebSocket latency: ~50-100ms
-- Detection pipeline: ~100-300ms per frame (3fps)
-- STT round-trip: ~500-2500ms (GPU/CPU)
-- LLM answer generation: ~2-4s (Gemini API)
-- TTS generation: ~300-1000ms (Kokoro cached)
-
----
-
-## Performance Optimization Tips
-
-1. **Faster STT:** Use GPU
-   ```bash
-   # In .env
-   STT_DEVICE=cuda
-   # Use faster model
-   # STT_MODEL=large-v3-turbo
    ```
 
-2. **Reduce blink false positives:** Better lighting
-   - Move kiosk near windows or add task lighting
-   - Avoid backlighting
-   - Increase `EAR_OPEN_THRESHOLD` to 0.22+
-
-3. **Smoother distance updates:** Add filtering
-   ```javascript
-   const smoothDistance = 0.8 * prevDist + 0.2 * newDist;
-   ```
-
-4. **Faster name input:** Shorter names work better
-   - "Sharma" (1 word) faster than "Akshatha A Sharma" (3 words)
-   - Average time: ~1-2 seconds per name
+### 4. Personality & Easter Eggs
+- Ask: *"Are you a robot?"* $\to$ *"I'm a digital receptionist, so yes and no — no body, but I do the job!"*
+- Ask: *"Tell me a joke"* $\to$ *"Why did the student bring a ladder to class? To reach the higher studies!"*
+- Say: *"Thank you so much, bye!"* $\to$ Nova delivers a personalized farewell and transitions cleanly to the goodbye screen.
 
 ---
 
-## Team
+## 👥 Project Team
 
-RNSIT · VRK Kiosk - Alankrita Singh, Akshatha A, and B Sneha
-
-**Latest Updates (Voice-First Release):**
-- ✅ Fully voice-based name input (no text typing)
-- ✅ Blink detection for yes/no confirmation (ready to integrate)
-- ✅ Proximity detection for encouragement
-- ✅ Personality-driven response framework
-- ✅ Zero required clicking/touching (fully hands-free)
-- ✅ No hand gestures (voice + face focus)
-- ✅ All documentation in single README.md file
+**RNS Institute of Technology — VRK Project Team**
+- **Alankrita Singh**
+- **Akshatha A**
+- **B Sneha**
