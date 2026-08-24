@@ -1,81 +1,62 @@
 # VRK Kiosk — Architecture
 
-## System overview
+## System Overview
 
 ```
-KIOSK MACHINE                                   BACKEND SERVER (GPU in prod)
-┌───────────────────────────────┐              ┌────────────────────────────────┐
-│ React app (localhost:3000)    │              │ FastAPI (uvicorn, async)       │
-│                               │              │                                │
-│ camera ─► detection.py loop ──┼── HTTP ────► │ /session/start /visitor/*      │
-│ (face recognize / register)   │              │                                │
-│                               │              │ /stt/pcm                       │
-│ mic ► Silero VAD (in browser) ┼── PCM ─────► │  int16→float32 ► bandpass      │
-│  one utterance = one POST     │              │  ► energy gate ► faster-whisper│
-│                               │ ◄── JSON ─── │  {text, confidence, latency}   │
-│ chat UI + waveform            │              │                                │
-│                               │              │ /ask ► guardrails ► FAQ (Mongo)│
-│ speaker ◄ sentence-pipelined ─┼── WAV ◄───── │  ► Redis cache ► local LLM RAG │
-│  Kokoro audio (/tts)          │              │                                │
-└───────────────────────────────┘              │ MongoDB (motor) · Redis        │
-                                               └────────────────────────────────┘
+KIOSK CLIENT (localhost:3000)                   BACKEND SERVER (GPU / CPU) (Port 8001)
+┌────────────────────────────────┐              ┌────────────────────────────────────────┐
+│ React 18 App                   │              │ FastAPI Backend (uvicorn, async)       │
+│                                │              │                                        │
+│ camera ─► MediaPipe/ArcFace ───┼── WebSocket ─► /ws/detect (presence, blink, identity) │
+│ (SCRFD + ArcFace 512-d embed)  │   /ws        │                                        │
+│                                │              │ /stt/pcm                               │
+│ mic ► Silero VAD (in browser) ─┼── PCM ──────►│  int16→float32 ► bandpass filter       │
+│  one utterance = one POST      │              │  ► energy gate ► faster-whisper (STT)  │
+│                                │ ◄── JSON ────│  {text, confidence, latency}           │
+│ chat UI + Avatar + waveform    │              │                                        │
+│                                │              │ /ask ► safety ► Qwen LLM / Gemini      │
+│ speaker ◄ sentence-pipelined ──┼── WAV ◄──────│  ► RAGService microservice (Port 8600) │
+│  Kokoro audio (/tts)           │              │  ► Redis cache ► MongoDB               │
+└────────────────────────────────┘              └────────────────────────────────────────┘
 ```
 
 Both machines share a LAN; only bytes travel. The mic and camera live on
-the kiosk; all inference lives on the server. In development, both halves
-run on one laptop unchanged (STT auto-falls back to a CPU model).
+the kiosk; all inference lives on the server. In development, all services
+run together via `python run.py`.
 
-## Conversation flow
+---
 
-1. **Detection** (`backend/detection.py`): camera loop recognizes a face
-   → `/session/start` (returning visitor, greeted by name) or
-   `/visitor/unknown` (name/consent modal, then registration).
-2. **Kiosk speaks first**: on session start the frontend speaks the
-   greeting via TTS — the visitor never initiates.
-3. **Listening**: browser VAD (threshold 0.8, ~800 ms end-of-speech)
-   captures one utterance as 16 kHz PCM → `POST /stt/pcm`.
-4. **STT** (`backend/stt.py`): DSP chain (bandpass 80 Hz–7.5 kHz → RMS
-   energy gate) → faster-whisper with campus-vocabulary prompt bias.
-   Runs in a worker thread; the event loop is never blocked.
-5. **Answering** (`/ask`): input-safety guardrail → typo normalization →
-   MongoDB FAQ match → Redis cached answer → local LLM RAG fallback.
-6. **TTS** (`backend/tts.py`): Kokoro-82M; per-sentence synthesis with an
-   in-memory cache. The frontend pipelines playback (sentence N plays
-   while N+1 synthesizes) and prints each answer in sync with the voice.
-7. **Turn-taking**: the VAD pauses while the kiosk speaks (plus browser
-   echo cancellation); speech captured during processing is queued and
-   automatically handled as the next turn.
+## Conversation & Vision Flow
 
-## Latency budget (speech end → first audio of reply)
+1. **Detection & Recognition** (`backend/detection.py` + `backend/recognition.py`):
+   - MediaPipe face mesh tracks landmarks and calculates Eye Aspect Ratio (EAR) for blink detection.
+   - SCRFD + ArcFace (`w600k_r50.onnx`) extracts 512-d facial embeddings.
+   - Cosine similarity matching against MongoDB registers new visitors or identifies returning visitors by name.
+2. **Kiosk Speaks First**: On session start, the frontend speaks the personalized greeting via Kokoro TTS — the visitor never needs to click.
+3. **Hands-Free Name Onboarding**: For new visitors, Nova asks *"What's your name?"*. Spoken names are transcribed, confirmed, and automatically registered after 3 seconds.
+4. **Listening**: Browser VAD (Silero ONNX runtime) captures speech as 16 kHz raw PCM $\to$ `POST /stt/pcm`.
+5. **STT** (`backend/stt.py`): Bandpass DSP chain (80 Hz–7.5 kHz) + energy gate $\to$ `faster-whisper` with campus vocabulary prompting.
+6. **Answering** (`/ask`): Safety guardrail $\to$ Easter egg checks $\to$ RAGService semantic retrieval on Port 8600 $\to$ Qwen primary generation (with Gemini fallback).
+7. **TTS** (`backend/tts.py`): Kokoro-82M synthesis (`af_bella`), sentence chunk prefetching, Web Audio gapless playback, and synchronized text animation.
 
-| Stage | CPU dev | GPU prod |
+---
+
+## Latency Budget (Speech End → First Audio of Reply)
+
+| Stage | CPU Dev | GPU Prod |
 |---|---|---|
 | VAD end-of-speech | ~300 ms | ~300 ms |
-| STT | 1–2 s (small.en int8) | ~300 ms (large-v3-turbo fp16) |
-| Answer (FAQ/cache hit) | <100 ms | <100 ms |
-| TTS first sentence | ~1 s (cached: ~0) | <300 ms |
-| **Total** | **~2.5–3.5 s** | **~1 s** |
+| STT (faster-whisper) | 1–2 s (small.en) | ~300 ms (large-v3-turbo) |
+| Answer (RAG + Qwen LLM) | 0.5–1.5 s | 0.2–0.8 s |
+| TTS First Chunk (Kokoro) | ~400 ms (cached: ~0) | <200 ms |
+| **Total Turn Latency** | **~2.0–3.5 s** | **~1.0–1.6 s** |
 
-## Noise & single-speaker handling (EP-06)
+---
 
-Six layers: browser constraints (noise suppression, echo cancellation,
-AGC off) → neural VAD gate (0.8) → bandpass filter → RMS energy gate
-(rejects voices not at the kiosk) → Whisper-level VAD + vocabulary bias →
-[hardware] beamforming mic array. Layers 1–5 ship in this codebase; the
-energy-gate threshold requires one 10-minute on-site tuning pass
-(docs/OPERATIONS.md §5). Two equally close, equally loud simultaneous
-speakers are out of software scope by design — handled by kiosk placement
-and the beamforming mic.
+## Noise & Single-Speaker Handling
 
-## Key design decisions
-
-- **Raw PCM over WebM**: eliminates ffmpeg, temp files, and ~500 ms per
-  turn; the browser VAD already produces clean 16 kHz float PCM.
-- **CPU/GPU auto-detection**: one codebase; `STT_DEVICE=auto` picks CUDA
-  when present, `small.en` int8 otherwise — dev laptops need no config.
-- **Graceful TTS degradation**: any Kokoro failure returns empty audio and
-  the frontend falls back to the browser voice; the kiosk never goes mute.
-- **Async-first backend**: Mongo via motor, blocking inference (Whisper,
-  Kokoro, DeepFace) confined to `asyncio.to_thread`.
-- **In-memory session + Mongo persistence**: the active session is
-  in-process for speed; sessions/interactions/faces persist to MongoDB.
+1. **Browser Layer**: WebRTC constraints (noise suppression, echo cancellation, automatic gain control).
+2. **Neural VAD Gate**: Silero VAD (0.8 threshold) isolates real speech from background chatter.
+3. **DSP Bandpass Filter**: Restricts frequency spectrum between 80 Hz and 7.5 kHz.
+4. **RMS Energy Gate**: Rejects distant or quiet ambient voices.
+5. **Whisper Prompt Biasing**: Domain vocabulary suppresses hallucinations on Indian campus names and terms.
