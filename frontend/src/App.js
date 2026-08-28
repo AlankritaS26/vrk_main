@@ -32,6 +32,8 @@ export default function App() {
   const [videoDims, setVideoDims] = useState({ w: 640, h: 480 });
   const [camError, setCamError] = useState(null);
   const [camStream, setCamStream] = useState(null);
+  const [doubleBlink, setDoubleBlink] = useState(0);
+  const [blink, setBlink] = useState(0);
 
   const hiddenVideoRef = useRef(null);      // used only for frame capture
   const captureCanvasRef = useRef(null);
@@ -56,6 +58,12 @@ export default function App() {
           setDetState(data.state || 'IDLE');
           setIdentity(data.identity || '');
           setBbox(data.present && data.bbox ? data.bbox : null);
+          if (data.double_blink) {
+            setDoubleBlink(Date.now());
+          }
+          if (data.blink) {
+            setBlink(Date.now());
+          }
         } catch (_) { }
       };
 
@@ -228,7 +236,7 @@ export default function App() {
 
   const askingName = session?.asking_name === true;
 
-  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream };
+  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream, doubleBlink, blink };
 
   return (
     <>

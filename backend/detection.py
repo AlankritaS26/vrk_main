@@ -212,6 +212,8 @@ class DetectionResult:
     bystanders: int = 0
     state: str = "IDLE"
     error: Optional[str] = None
+    blink: bool = False          # single blink event (fires for ONE frame when a full blink completes)
+    double_blink: bool = False   # fires True for ONE frame when 2 blinks detected within BLINK_WINDOW_SECS
 
 
 @dataclass
@@ -329,10 +331,79 @@ def _load_known_faces(force: bool = False) -> list:
             _known_faces_loaded_at = now
         return faces
 
-    # network hiccup — serve stale cache rather than an empty list, which
-    # would otherwise make everyone look "unknown" for one bad request
     with _known_faces_lock:
         return _known_faces
+
+
+# ─── EAR Blink Detection ─────────────────────────────────────────────────────
+# Eye Aspect Ratio computed from MediaPipe 468-point facial landmarks.
+# Left eye:  [33,160,158,133,153,144]  Right eye: [362,385,387,263,373,380]
+# EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
+# EAR < EAR_CLOSED   → eye is shut
+# EAR >= EAR_OPEN    → eye is fully open
+# A blink = EAR drops below EAR_CLOSED then recovers above EAR_OPEN.
+# Two blinks within BLINK_WINDOW_SECS → double_blink fires for ONE frame.
+
+EAR_CLOSED        = float(os.getenv("EAR_CLOSED", "0.20"))   # below = eye shut
+EAR_OPEN          = float(os.getenv("EAR_OPEN",   "0.26"))   # above = eye fully open again
+BLINK_WINDOW_SECS = float(os.getenv("BLINK_WINDOW_SECS", "1.8"))  # max time between 2 blinks
+
+# Per-person blink state (guarded by the GIL — only the main pipeline thread
+# calls detect_presence, so no extra lock is needed here).
+_blink_eye_closed  = False   # True while the eye is currently below EAR_CLOSED
+_blink_timestamps: list = [] # timestamps of completed single blinks (float)
+
+
+def _ear(lm, idx: list, w: float, h: float) -> float:
+    """Compute Eye Aspect Ratio from 6 landmark indices."""
+    pts = np.array([[lm[i].x * w, lm[i].y * h] for i in idx], dtype=np.float32)
+    # vertical distances
+    A = float(np.linalg.norm(pts[1] - pts[5]))
+    B = float(np.linalg.norm(pts[2] - pts[4]))
+    # horizontal distance
+    C = float(np.linalg.norm(pts[0] - pts[3]))
+    return (A + B) / (2.0 * C) if C > 0 else 0.0
+
+
+_L_EYE = [33, 160, 158, 133, 153, 144]
+_R_EYE = [362, 385, 387, 263, 373, 380]
+
+
+def _check_blink(best_lm, w: float, h: float):
+    """Return (single_blink_event, double_blink_event).
+    Each flag is True for at most ONE call per blink/double-blink."""
+    global _blink_eye_closed, _blink_timestamps
+
+    try:
+        ear_l = _ear(best_lm, _L_EYE, w, h)
+        ear_r = _ear(best_lm, _R_EYE, w, h)
+        ear   = (ear_l + ear_r) / 2.0
+    except Exception:
+        return False, False
+
+    single = False
+    double = False
+    now    = time.time()
+
+    if ear < EAR_CLOSED:
+        # Eye is currently shut — record closure
+        _blink_eye_closed = True
+    elif _blink_eye_closed and ear >= EAR_OPEN:
+        # Eye just re-opened after being shut → one blink completed
+        _blink_eye_closed = False
+        single = True
+        _blink_timestamps.append(now)
+
+        # Purge blink timestamps older than the window
+        _blink_timestamps = [t for t in _blink_timestamps
+                             if now - t <= BLINK_WINDOW_SECS]
+
+        # Two or more blinks inside the window → double-blink
+        if len(_blink_timestamps) >= 2:
+            double = True
+            _blink_timestamps.clear()   # consume the event — don't fire again
+
+    return single, double
 
 
 # ─── Vision helpers ───────────────────────────────────────────────────────────
@@ -397,9 +468,14 @@ def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResu
         except Exception:
             kps = None
 
+    # ── Blink detection via EAR on the primary visitor's landmarks ────────────
+    blink_event, double_blink_event = _check_blink(best_lm, w, h) if best_lm else (False, False)
+
     return DetectionResult(present=True, bbox=best, face_crop=crop, kps=kps,
-                           frame_ref=frame,
-                           landmarks_img=mesh, bystanders=max(0, qualifying - 1))
+                           frame_ref=frame, landmarks_img=mesh,
+                           bystanders=max(0, qualifying - 1),
+                           blink=blink_event, double_blink=double_blink_event)
+
 
 
 def extract_embedding(face_crop: np.ndarray,

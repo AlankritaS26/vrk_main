@@ -29,7 +29,7 @@ run together via `python run.py`.
 ## Conversation & Vision Flow
 
 1. **Detection & Recognition** (`backend/detection.py` + `backend/recognition.py`):
-   - MediaPipe face mesh tracks landmarks and calculates Eye Aspect Ratio (EAR) for blink detection.
+   - MediaPipe face mesh tracks landmarks and calculates Eye Aspect Ratio (EAR) for single and double-blink gesture detection (double-blink = "Yes" confirmation).
    - SCRFD + ArcFace (`w600k_r50.onnx`) extracts 512-d facial embeddings.
    - Cosine similarity matching against MongoDB registers new visitors or identifies returning visitors by name.
 2. **Kiosk Speaks First**: On session start, the frontend speaks the personalized greeting via Kokoro TTS — the visitor never needs to click.

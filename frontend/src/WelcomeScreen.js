@@ -3,7 +3,7 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
-export default function WelcomeScreen({ session, messages, setMessages, askingName, detState }) {
+export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
   const camVideoRef = useRef(null);
   const camStreamRef = useRef(null);
@@ -864,9 +864,29 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     return s.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
   }, []);
 
+  // ── Double Blink Listener for Yes/Confirm ──────────────────────────────
+  const prevDoubleBlinkRef = useRef(0);
+  useEffect(() => {
+    if (doubleBlink && doubleBlink !== prevDoubleBlinkRef.current) {
+      prevDoubleBlinkRef.current = doubleBlink;
+      console.log('[BLINK] Double blink detected!');
+      if (activePromptResolverRef.current) {
+        const resolver = activePromptResolverRef.current;
+        activePromptResolverRef.current = null;
+        if (isMounted.current) {
+          setLiveText('👁️ [Double blink detected — Yes]');
+        }
+        statusRef.current = 'ready';
+        setStatus('ready');
+        resolver('👁️ [Blinked twice — Yes]');
+      }
+    }
+  }, [doubleBlink]);
+
   const wantsToGiveName = useCallback((text) => {
     if (!text) return false;
-    return /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will)\b/i.test(text);
+    return /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will|blink|blinked)\b/i.test(text)
+      || text.includes('👁️') || text.toLowerCase().includes('blink');
   }, []);
 
   const isGuestOption = useCallback((text) => {
@@ -908,14 +928,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     });
   }, []);
 
-  // Waits for a spoken "yes"/"no" response or direct correction
+  // Waits for a spoken "yes"/"no" response, double blink, or direct correction
   const captureYesNo = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
       let timer = null;
       const resolver = (rawText) => {
         if (timer) clearTimeout(timer);
         const heard = (rawText || '').trim().toLowerCase();
-        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is)\b/i.test(heard)) {
+        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|blink|blinked)\b/i.test(heard) || heard.includes('👁️')) {
           resolve(true);
         } else if (/\b(no|nope|nah|wrong|incorrect|not right|not that|different|change)\b/i.test(heard) || /don.?t/i.test(heard)) {
           resolve(false);
@@ -954,7 +974,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (isMounted.current) setNameStage('done');
   }, []);
 
-  // ── Integrated Conversation Start Flow (100% Voice: Yes / No / Guest / Name) ──
+  // ── Integrated Conversation Start Flow (Voice + Double-Blink: Yes / No / Guest / Name) ──
   const greetedRef = useRef(null);
   const flowRunningRef = useRef(false);
   const [celebrate, setCelebrate] = useState(false);
@@ -984,8 +1004,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       while (stillCurrent()) {
         setNameStage('asking');
-        const askChatMsg = 'Welcome to RNS Institute of Technology! I am Nova, your digital receptionist.\n\nWould you like to give your name or continue as guest?\n\n• 🗣️ Say "Yes" to give your name\n• 🗣️ Say "Guest" to continue as Guest';
-        const askSpokenMsg = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. Would you like to give your name, or continue as guest? You can say yes to give your name, or say guest to continue as guest.';
+        const askChatMsg = 'Welcome to RNS Institute of Technology! I am Nova, your digital receptionist.\n\nWould you like to give your name or continue as guest?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to give your name\n• 🗣️ Say "Guest" to continue as Guest';
+        const askSpokenMsg = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. Would you like to give your name, or continue as guest? You can say yes or blink twice to give your name, or say guest to continue as guest.';
         addMessage(askChatMsg, 'kiosk');
         await speakAndWait(askSpokenMsg);
         if (!stillCurrent()) return;
@@ -1001,7 +1021,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           addMessage(heard, 'user');
 
           if (wantsToGiveName(heard)) {
-            // User verbally affirmed: e.g. "Yes", "Yes, I would like to give my name"
+            // User affirmed verbally or with double-blink: e.g. "Yes", "👁️ [Blinked twice — Yes]"
             choseGiveName = true;
           } else if (isGuestOption(heard)) {
             // User chose Guest verbally
@@ -1090,10 +1110,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
         if (!finalName) finalName = 'Friend';
 
-        // 3. Confirm name with voice ("Yes" / "No")
+        // 3. Confirm name with voice ("Yes" / "No") or double blink ("Yes")
         setNameStage('confirming');
-        const confirmChatMsg = `I heard ${finalName}. Is that correct?\n\n• 🗣️ Say "Yes" to confirm\n• 🗣️ Say "No" to change it`;
-        const confirmSpokenMsg = `I heard ${finalName}. Is that correct? Say yes to confirm or no to change it.`;
+        const confirmChatMsg = `I heard ${finalName}. Is that correct?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to confirm\n• 🗣️ Say "No" to change it`;
+        const confirmSpokenMsg = `I heard ${finalName}. Is that correct? Say yes or blink twice to confirm, or say no to change it.`;
         addMessage(confirmChatMsg, 'kiosk');
         await speakAndWait(confirmSpokenMsg);
         if (!stillCurrent()) return;

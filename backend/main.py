@@ -78,7 +78,7 @@ def run_pipeline(frame_data):
         class _NoOp:
             present = False; state = "IDLE"; identity = ""
             verified = False; bbox = None; bystanders = 0
-            error = "detection_unavailable"; blink = False
+            error = "detection_unavailable"; blink = False; double_blink = False
         return _NoOp()
     return _run_pipeline(frame_data)
 
@@ -1852,13 +1852,14 @@ async def detect_websocket(ws: WebSocket):
                         "h": result.bbox.h,
                     }
                 await ws.send_json({
-                    "present":    result.present,
-                    "state":      result.state,
-                    "identity":   result.identity or "",
-                    "verified":   result.verified,
-                    "bbox":       bbox,
-                    "bystanders": result.bystanders,
-                    "blink":      bool(getattr(result, "blink", False)),
+                    "present":      result.present,
+                    "state":        result.state,
+                    "identity":     result.identity or "",
+                    "verified":     result.verified,
+                    "bbox":         bbox,
+                    "bystanders":   result.bystanders,
+                    "blink":        bool(getattr(result, "blink", False)),
+                    "double_blink": bool(getattr(result, "double_blink", False)),
                 })
             except Exception as frame_err:
                 logger.warning(f"[WS/DETECT] Frame processing error: {frame_err}")
