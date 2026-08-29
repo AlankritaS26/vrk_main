@@ -71,7 +71,7 @@ venv\Scripts\python.exe run.py
 ```
                                   ┌───────────────────────────────┐
                                   │      Client Web Browser       │
-                                  │  React 18 Kiosk App (Port 3000)│
+                                  │ React 18 Kiosk App (Port 3000)│
                                   └───────────────┬───────────────┘
                                   WebSocket /ws   │ HTTP API Requests
                                  & /ws/detect     │ (/ask, /tts, /stt/pcm)
