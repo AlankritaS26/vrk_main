@@ -276,14 +276,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // Prevent duplicate input processing within 2.5 seconds
         if (lastProcessedTextRef.current.text.toLowerCase() === heard.toLowerCase() && (now - lastProcessedTextRef.current.time) < 2500) {
           console.log('[STT] Dropped duplicate heard text within 2.5s:', heard);
-          setStatus('ready');
+          setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
           return;
         }
         lastProcessedTextRef.current = { text: heard, time: now };
         if (isMounted.current) setLiveText(heard);
         sendToBackend(heard);
       } else {
-        setStatus('ready');
+        setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
       }
     } catch (err) {
       console.error('[STT] Error:', err);
@@ -292,7 +292,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         activePromptResolverRef.current = null;
         resolver('');
       }
-      setStatus('ready');
+      setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     }
   }, []);
 
@@ -362,7 +362,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         stopWaveform();
       } else if (!isSpeaking.current) {
         micRef.current.resume();
-        setStatus('ready');
+        setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
         return;
       } else {
         return;
@@ -399,10 +399,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         },
       });
       micRef.current = mic;
-      if (!isSpeaking.current) setStatus('ready');
+      if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     } catch (err) {
       console.error('[MIC] Error:', err);
-      if (!isSpeaking.current) setStatus('ready');
+      if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     }
   }, [startWaveform, handleUtterance, duckSpeaking, restoreSpeaking]);
 
@@ -676,69 +676,160 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
 
-    // Dynamic Name Change support & Direct Name Introduction
-    const explicitNameChange = text.match(/\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s]+)/i)
-      || text.match(/\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is)\s+([a-zA-Z\s]+)/i)
-      || text.match(/\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s]+)/i);
+    // ── Mid-session bare "change my name" prompt (no name given yet) ──────
+    // Explicit "change my name to X" / "call me X" patterns are handled by
+    // the backend _deterministic_route via /ask below — do NOT early-return
+    // for those, or save_interaction will be skipped and the DB won't log it.
+    const bareNameChange = /\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text)
+      || /\b(?:i want to|can i|can you|please|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text);
 
-    const nameIntroMatch = text.match(/\b(?:i am|i'm|im|this is|myself|it is|it's|its)\s+([a-zA-Z\s]+)/i);
+    // Only fire the interactive prompt when NO name was provided inline
+    const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
+      || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
 
     const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
 
-    let extractedNameFromStatement = null;
-    if (explicitNameChange && explicitNameChange[1]) {
-      extractedNameFromStatement = explicitNameChange[1];
-    } else if (nameIntroMatch && nameIntroMatch[1] && !isQuestionText) {
-      extractedNameFromStatement = nameIntroMatch[1];
-    } else if ((visitorName === 'Guest' || visitorName === 'Unknown' || !visitorName) && !isQuestionText) {
-      const words = text.replace(/[.!?]+$/, '').trim().split(/\s+/);
-      if (words.length >= 1 && words.length <= 3) {
-        extractedNameFromStatement = words.join(' ');
-      }
-    }
-
-    if (extractedNameFromStatement) {
-      let newName = extractedNameFromStatement.replace(/[.!?]+$/, '').trim();
-      const validWords = newName.split(/\s+/).filter(w => !/\b(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the|i|am|im|this|it)\b/i.test(w));
-      if (validWords.length > 0) {
-        newName = validWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
-        setLocalName(newName);
-        // Persist to MongoDB faces collection + sessions collection immediately
-        fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(newName) + '&save=true', { method: 'POST' }).catch(() => { });
-        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(newName), { method: 'POST' }).catch(() => { });
-        const ackName = `Done! Great to meet you, ${newName}. I have saved your name and face. How may I help you today?`;
-        addMessage(ackName, 'kiosk');
-        speak(ackName);
+    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "Akshata, AKSHA, THA"):
+    if (!isQuestionText && !bareNameChange && (hasInlineName || visitorName === 'Guest' || visitorName === 'Unknown')) {
+      const candidateName = extractVisitorName(text);
+      if (candidateName && candidateName.split(' ').length <= 3 && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you)$/i.test(candidateName)) {
+        setLocalName(candidateName);
+        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(candidateName), { method: 'POST' }).catch(() => {});
+        const doneMsg = `Done! I have changed your name to ${candidateName}. How may I assist you today?`;
+        addMessage(doneMsg, 'kiosk');
+        speak(doneMsg);
         return;
       }
     }
 
-    const bareNameChange = /\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text)
-      || /\b(?:i want to|can i|can you|please|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text);
-
-    if (bareNameChange) {
-      const promptChange = "Sure! What should I change your name to?";
+    if (bareNameChange && !hasInlineName) {
+      // ── Step 1: Ask for the new name ────────────────────────────────────
+      const promptChange = 'Sure! What should I change your name to?';
       addMessage(promptChange, 'kiosk');
       await speakAndWait(promptChange);
-      const heardNewName = await captureUtteranceText(10000);
-      if (heardNewName) {
-        addMessage(heardNewName, 'user');
-        let extracted = extractVisitorName(heardNewName) || heardNewName.trim();
-        extracted = extracted.replace(/[.!?]+$/, '').trim();
-        const validWords = extracted.split(/\s+/).filter(w => !/\b(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)\b/i.test(w));
-        if (validWords.length > 0) {
-          extracted = validWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
-          setLocalName(extracted);
-          fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(extracted), { method: 'POST' }).catch(() => { });
-          const doneMsg = `Done! Your name has been changed to ${extracted}. How may I help you?`;
-          addMessage(doneMsg, 'kiosk');
-          speak(doneMsg);
-          return;
-        }
+      const heardNewName = await captureUtteranceText(25000);
+
+      if (!heardNewName) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
       }
-      const cancelMsg = "No problem. Let me know if you would like to change your name or ask a question.";
-      addMessage(cancelMsg, 'kiosk');
-      speak(cancelMsg);
+
+      addMessage(heardNewName, 'user');
+      let extracted = extractVisitorName(heardNewName) || heardNewName.trim();
+      extracted = extracted.replace(/[.!?]+$/, '').trim();
+      const cleanWords = extracted.split(/\s+/).filter(w =>
+        !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
+
+      if (cleanWords.length === 0) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
+      }
+
+      extracted = cleanWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+
+      // ── Step 2: Confirm with voice OR double-blink ───────────────────────
+      const confirmMsg = `Got it — should I call you ${extracted}? Say yes or blink twice to confirm, or say no to spell it out.`;
+      addMessage(confirmMsg, 'kiosk');
+      await speakAndWait(confirmMsg);
+      const confirmed = await captureYesNo(25000);
+
+      // Helper: apply the final name to DB + session
+      const applyName = async (finalName) => {
+        setLocalName(finalName);
+        await fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(finalName), { method: 'POST' }).catch(() => {});
+        const doneMsg = `Done! I have changed your name to ${finalName}. How may I assist you today?`;
+        addMessage(doneMsg, 'kiosk');
+        speak(doneMsg);
+      };
+
+      // ── Helper: letter-by-letter spelling mode ────────────────────────────
+      // Nova echoes each letter as it is heard so the visitor can track
+      // progress. Phonetic alphabet (alpha/bravo/charlie…) is also accepted.
+      const runSpellingMode = async () => {
+        const PHONETIC = {
+          alpha:'a', bravo:'b', charlie:'c', delta:'d', echo:'e', foxtrot:'f',
+          golf:'g', hotel:'h', india:'i', juliet:'j', kilo:'k', lima:'l',
+          mike:'m', november:'n', oscar:'o', papa:'p', quebec:'q', romeo:'r',
+          sierra:'s', tango:'t', uniform:'u', victor:'v', whiskey:'w',
+          xray:'x', 'x-ray':'x', yankee:'y', zulu:'z',
+        };
+        const spellPrompt = 'Sure! Please spell out your name — say each letter one at a time. Say "done" when you are finished.';
+        addMessage(spellPrompt, 'kiosk');
+        await speakAndWait(spellPrompt);
+
+        let spelled = '';
+        let attempts = 0;
+        while (attempts < 25) {
+          const letter = await captureUtteranceText(7000);
+          if (!letter) break;
+
+          const t = letter.trim().toLowerCase();
+          // Finish words
+          if (/^(done|finish|finished|that.?s it|stop|end|complete|that.?s all|ok done)$/i.test(t)) break;
+
+          let ch = '';
+          if (t.length === 1 && /[a-z]/.test(t)) {
+            ch = t.toUpperCase();
+          } else if (PHONETIC[t]) {
+            ch = PHONETIC[t].toUpperCase();
+          } else if (/^[a-z]\s/i.test(t)) {
+            // e.g. STT returns "P." or "P " for a single letter
+            ch = t[0].toUpperCase();
+          }
+
+          if (ch) {
+            spelled += ch;
+            const soFar = spelled.split('').join('-');
+            const echoMsg = `${ch}. So far: ${soFar}`;
+            addMessage(echoMsg, 'kiosk');
+            speak(echoMsg);
+          } else {
+            // Unrecognised syllable — ask them to repeat
+            const retryMsg = "Sorry, I did not catch that letter. Please say it again.";
+            addMessage(retryMsg, 'kiosk');
+            speak(retryMsg);
+          }
+          attempts++;
+        }
+
+        if (spelled.length === 0) return;
+
+        // Capitalise first letter, rest lowercase
+        const spelledName = spelled.charAt(0).toUpperCase() + spelled.slice(1).toLowerCase();
+
+        // Final confirmation after spelling
+        const spelledConfirmMsg = `I have ${spelledName}. Is that correct? Say yes or blink twice.`;
+        addMessage(spelledConfirmMsg, 'kiosk');
+        await speakAndWait(spelledConfirmMsg);
+        const spelledOk = await captureYesNo(12000);
+
+        if (spelledOk !== false) {
+          // Accept on yes, double-blink, or timeout (visitor stayed silent)
+          await applyName(spelledName);
+        } else {
+          const giveUpMsg = 'No problem — I will keep your name as it is for now. You can try again anytime.';
+          addMessage(giveUpMsg, 'kiosk');
+          speak(giveUpMsg);
+        }
+      };
+
+      if (confirmed === true) {
+        // Voice "yes" or double-blink confirmed
+        await applyName(extracted);
+      } else if (
+        confirmed === false ||
+        (typeof confirmed === 'string' && /\b(no|nope|wrong|spell|spelling|incorrect|not right)\b/i.test(confirmed))
+      ) {
+        // User said no / "spell it" — enter spelling mode
+        await runSpellingMode();
+      } else {
+        // captureYesNo timed out (null) — accept the heard name
+        await applyName(extracted);
+      }
       return;
     }
 
@@ -783,12 +874,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       'Of course, just a second.',
       'Right, let me find that.',
     ];
-    if (text.split(' ').length >= 3) {
+    const isInstantCmd = hasInlineName || bareNameChange ||
+      /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+
+    if (!isInstantCmd && text.split(' ').length >= 3) {
       const ack = acks[Math.floor(Math.random() * acks.length)];
-      // Show it as a transient indicator bubble too — otherwise the visitor
-      // sees nothing at all while the real answer is being fetched, which
-      // is exactly the "left confused, feels frozen" problem.
       speak(ack, () => setProcessingHint(ack));
+    } else {
+      setProcessingHint('Thinking...');
+      statusRef.current = 'processing';
+      setStatus('processing');
     }
 
     // 35 s hard cap — prevents status getting stuck at 'processing' if the
@@ -861,7 +956,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     s = s.replace(/^(?:hi|hello|hey|nova|please)[\s,.]+/i, '');
     s = s.replace(/[.!?]+$/, '').trim();
     if (!s) return '';
-    return s.split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+    if (s.includes(',')) {
+      const firstPart = s.split(',')[0].trim();
+      if (firstPart && /^[a-zA-Z\s]+$/.test(firstPart)) {
+        s = firstPart;
+      }
+    }
+    const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
+    if (words.length === 0) return '';
+    return words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
   }, []);
 
   // ── Double Blink Listener for Yes/Confirm ──────────────────────────────
@@ -989,11 +1092,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const stillCurrent = () => nameFlowIdRef.current === myRun && isMounted.current;
 
     try {
-      const isKnownNamedVisitor = isReturning && visitorName && visitorName !== 'Guest' && visitorName !== 'Unknown';
+      const isKnownNamedVisitor = (visitorName && visitorName !== 'Guest' && visitorName !== 'Unknown' && visitorName !== 'Friend')
+        || (session?.user_name && session.user_name !== 'Guest' && session.user_name !== 'Unknown' && session.user_name !== 'Friend');
       if (isKnownNamedVisitor) {
-        // Returning visitor with known real name: greet immediately and start listening for questions
-        addMessage(greeting, 'kiosk');
-        await speakAndWait(greeting);
+        // Visitor already has a known/changed name: greet immediately and start listening for questions
+        const nameToUse = (visitorName && visitorName !== 'Guest' && visitorName !== 'Unknown') ? visitorName : session?.user_name;
+        const greetMsg = greeting || `Welcome back, ${nameToUse}! How may I assist you today?`;
+        addMessage(greetMsg, 'kiosk');
+        await speakAndWait(greetMsg);
         if (stillCurrent()) startListening();
         return;
       }
@@ -1011,7 +1117,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!stillCurrent()) return;
 
         setNameStage('listening_name');
-        const heard = await captureUtteranceText(25000);
+        const heard = await captureUtteranceText(5000);
         if (!stillCurrent()) return;
 
         let choseGiveName = false;
@@ -1258,6 +1364,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: '', userName: localName || session?.user_name } }));
           } else if (msg.type === 'are_you_there') {
             handleDepartureCheck(msg.user_name);
+          } else if (msg.type === 'session_update' && msg.user_name) {
+            // Backend confirmed a name change (e.g. via _deterministic_route in /ask).
+            // Sync localName so farewell + departure messages use the real name.
+            const updatedName = msg.user_name;
+            if (updatedName && updatedName !== 'Guest' && updatedName !== 'Unknown') {
+              setLocalName(updatedName);
+            }
           }
         } catch (_) { }
       };

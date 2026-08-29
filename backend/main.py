@@ -47,7 +47,7 @@ from backend.database import (
     save_session, save_interaction, get_last_interaction, get_recent_interactions,
     update_face_seen, save_face_encoding, get_all_face_encodings,
     delete_face_by_name, update_face_name_with_alias, update_session_user_name,
-    sessions_collection, faces_collection,
+    sessions_collection, faces_collection, interactions_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
 from backend.llm import (
@@ -809,12 +809,19 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
         u_name = item.get('user_name') or 'Guest'
+        input_t = item.get('input_text', '') or ''
+        # Detect name-change interactions so admin can spot them quickly
+        is_name_change = bool(__import__('re').search(
+            r'\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name|\bcall me\b|\bmy name is\b',
+            input_t, __import__('re').IGNORECASE
+        ))
+        name_change_badge = '<span style="background:#fef3c7;color:#92400e;font-size:10px;padding:2px 6px;border-radius:4px;font-weight:700;margin-left:5px;">🏷️ Name Changed</span>' if is_name_change else ''
         interaction_rows += f"""
         <tr id="interaction-{sess_id}">
             <td>{idx + 1}</td>
             <td><strong style="color: #0066cc;">{u_name}</strong></td>
             <td><code>{sess_id[:8] if sess_id != 'N/A' else 'N/A'}</code></td>
-            <td><strong>{item.get('input_text', 'N/A')}</strong></td>
+            <td><strong>{input_t}</strong>{name_change_badge}</td>
             <td>{item.get('response_text', 'N/A')}</td>
             <td><span class="badge">{time_str[:19]}</span></td>
             <td>
@@ -832,14 +839,19 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         current_name = item.get('name', 'Unknown Visitor')
         name_history = item.get('name_history', [])
         name_updated_at = item.get('name_updated_at', '')
-        # Show alias badge if the visitor ever changed their name
         alias_html = ""
         if name_history:
             original_names = ', '.join(name_history)
-            alias_html = f'<br><span style="font-size:11px;color:#888;font-weight:400;">Originally: <em>{original_names}</em></span>'
+            # Prominent rename badge — shows old → new with timestamp
+            alias_html = (
+                f'<br><span style="display:inline-flex;align-items:center;gap:4px;margin-top:3px;'
+                f'background:#dbeafe;color:#1e40af;font-size:11px;padding:2px 7px;'
+                f'border-radius:4px;font-weight:600;">'
+                f'✏️ {original_names} → {current_name}</span>'
+            )
             if name_updated_at:
                 alias_html += f'<br><span style="font-size:10px;color:#bbb;">Renamed at: {name_updated_at[:19]}</span>'
-        has_encoding = item.get('has_encoding', True)  # legacy records default to True
+        has_encoding = item.get('has_encoding', True)
         encoding_badge = '' if has_encoding else '<br><span style="font-size:10px;color:#e67e22;background:#fff3e0;padding:1px 5px;border-radius:3px;font-weight:600;">Name only · no face scan</span>'
         face_rows += f"""
         <tr id="face-{face_id}">
@@ -862,14 +874,18 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
         u_name = item.get('user_name', 'Guest')
+        s_face_id = item.get('face_id') or ''
+        guest_badge = ''
+        if not s_face_id:
+            guest_badge = ' <span style="font-size:10px;background:#f3f4f6;color:#6b7280;padding:2px 6px;border-radius:4px;font-weight:600;">No face scan</span>'
         session_rows += f"""
         <tr id="session-{sess_id}">
             <td><code>{sess_id}</code></td>
-            <td><strong style="color: #0066cc;">{u_name}</strong></td>
+            <td><strong style="color: #0066cc;">{u_name}</strong>{guest_badge}</td>
             <td>{item.get('visit_count', 1)}</td>
             <td><span class="badge">{time_str[:19]}</span></td>
             <td>
-                <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End & Delete</button>
+                <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End &amp; Delete</button>
             </td>
         </tr>
         """
@@ -1124,28 +1140,21 @@ INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
 def build_greeting(name: str, is_returning: bool, resumed: bool,
                     previous_topic: str | None = None) -> str:
-    """The exact spoken lines for first-time vs returning visitors.
-
-    MEMORY-AWARE RE-ENGAGEMENT: when we resume a visitor's thread AND we
-    have a high-confidence topic label for their last stored question,
-    the greeting names that topic and asks (never assumes) whether they
-    want to continue with it. If no topic is available, we fall back to
-    the generic resumed-session line — we never guess or hallucinate a
-    previous topic.
-    """
-    who = name if name and name not in ("Guest", "Unknown", "") else "there"
-    if not is_returning:
-        return (f"Welcome {who}! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
-                f"I can help you with admissions, departments, placements, fees, "
-                f"and finding your way around campus. How may I assist you today?")
-    if resumed:
-        if previous_topic:
-            return (f"Welcome back, {who}!Good to see you again, Last time you were asking about "
+    """The exact spoken lines for first-time vs returning/named visitors."""
+    who = name if name and name not in ("Guest", "Unknown", "", "Friend") else ""
+    if who:
+        if resumed and previous_topic:
+            return (f"Welcome back, {who}! Good to see you again. Last time you were asking about "
                     f"{previous_topic} — would you like to continue with that, "
                     f"or help with something else today?")
-        return (f"Welcome back, {who}! Good to see you again. "
-                f"We can continue where we left off. How may I assist you today?")
-    return f"Welcome back, {who}! How may I assist you today?"
+        if resumed:
+            return (f"Welcome back, {who}! Good to see you again. "
+                    f"We can continue where we left off. How may I assist you today?")
+        return f"Welcome back, {who}! How may I assist you today?"
+
+    return (f"Welcome! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
+            f"I can help you with admissions, departments, placements, fees, "
+            f"and finding your way around campus. How may I assist you today?")
 
 
 async def resume_or_create_session(face_id: str, user_name: str,
@@ -1396,11 +1405,13 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
 
     # ─── Change Name Request ────────────────────────────────────────────────
     # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul"
-    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s]+)", q_normalized) or \
-                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is)\s+([a-zA-Z\s]+)", q_normalized) or \
-                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s]+)", q_normalized)
+    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized)
     if name_change_match:
         new_name_raw = name_change_match.group(1).strip()
+        if "," in new_name_raw:
+            new_name_raw = new_name_raw.split(",")[0].strip()
         new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
         if new_name_words:
             new_name = " ".join(new_name_words)
@@ -1443,7 +1454,7 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
                     "user_name": new_name,
                     "face_id": active_session.get("face_id", ""),
                 })
-            answer = f"Done! Your name has been changed to {new_name}. How may I help you?"
+            answer = f"Done! I have changed your name to {new_name}. How may I assist you today?"
             logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
             return answer, "name_change", "CONTINUE"
 
