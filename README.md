@@ -30,28 +30,33 @@ venv\Scripts\python.exe run.py
 ## 🌟 Core System Capabilities
 
 ### 1. 🎙️ Voice-First Hands-Free Experience
-- **Voice-Based Visitor Onboarding**: When a new face appears, Nova welcomes them: *"Hi! I'm Nova. What's your name?"* Silero Voice Activity Detection (VAD) activates automatically.
-- **Natural Spoken Name Recognition**: Visitors can say *"Akshatha"*, *"I am Sneha"*, or *"My name is Alankrita"*. The system transcribes the name, displays a confirmation badge, and **auto-advances after 3 seconds** without touching the screen.
-- **Zero-Touch Interaction**: From arrival to departure, all operations—including inquiries, topic selection, re-engagement, and farewells—are handled entirely by voice.
+- **Voice-Based Visitor Onboarding**: When a new face appears, Nova welcomes them: *"Would you like to give your name or continue as guest? Say 'Yes' or blink twice to give your name, or say 'Guest' to continue as guest."* Silero Voice Activity Detection (VAD) activates automatically.
+- **Auto-Guest Default (5 Seconds)**: If no voice response or blink is given within 5 seconds, Nova automatically proceeds in Guest mode (*"Continuing as Guest! How may I assist you today?"*).
+- **Dynamic Mid-Session Name Change**: Visitors can change their name at any point (e.g., *"Change my name to Akshata"*, *"Call me Rahul"*, or bare *"Change my name"*). Names are immediately synchronized across MongoDB (`faces`, `sessions`, `interactions`) and broadcast via WebSocket.
+- **Double-Blink & Voice Confirmation**: Confirm names using voice (*"Yes"*) or a double-blink gesture detected via MediaPipe EAR geometry.
+- **Letter-by-Letter Spelling Mode**: If a name is misheard, visitors can say *"No / Spell it"* to spell their name letter by letter (with full NATO phonetic alphabet support: *Alpha, Bravo, Charlie...*).
+- **Known Visitor Auto-Skip**: Returning or already-named visitors are greeted directly (*"Welcome back, {Name}!"*), skipping the onboarding prompt entirely.
 
 ### 2. 👁️ Vision Intelligence & ArcFace Recognition
 - **ArcFace + SCRFD Face Recognition**: Uses InsightFace ArcFace (`w600k_r50.onnx`) with canonical 5-point alignment to extract 512-d L2-normalized embeddings for fast cosine similarity matching against MongoDB face records.
-- **MediaPipe Landmark Tracking**: Real-time facial mesh processing for presence tracking and eye aspect ratio.
-- **Blink Detection (Eye Aspect Ratio - EAR)**: Real-time geometry calculation ($EAR < 0.15$ closed, $EAR \ge 0.20$ open) for natural blink detection.
+- **MediaPipe Landmark Tracking**: Real-time facial mesh processing for presence tracking, eye aspect ratio, and head alignment.
+- **Blink & Double-Blink Detection (Eye Aspect Ratio - EAR)**: Real-time geometry calculation ($EAR < 0.15$ closed, $EAR \ge 0.20$ open) providing hands-free affirmative gesture input.
 - **Nearest-Person / Largest-Face Selection**: Bounding box geometry prioritizes the closest person standing in front of the kiosk.
 - **State Machine**: Clean progression from `IDLE` ("Walk up — I'll recognise you") $\to$ `DWELLING` ("I see you — hold still…") $\to$ `RECOGNIZING` ("Identifying…") $\to$ `ACTIVE` ("Welcome, {Name}!").
 
 ### 3. 🧠 Hybrid RAG Answer Engine & Multi-Tier LLM Architecture
 - **Primary LLM (Qwen)**: Uses Qwen (`Qwen/Qwen2.5-7B-Instruct` or local OpenAI-compatible inference) as the primary generation engine.
-- **Google Gemini Fallback**: Seamless fallback to Gemini Flash if the primary local LLM is unreachable.
+- **Google Gemini Fallback**: Seamless fallback to Gemini Flash (`gemini-2.0-flash` / `gemini-1.5-flash`) if the primary local LLM is unreachable.
 - **RAGService Microservice (Port 8600)**: Standalone ChromaDB vector store with `sentence-transformers` embeddings delivering high-precision semantic retrieval over campus data.
+- **Strict Receptionist Persona**: Enforced system prompt guarantees the assistant always identifies as **Nova** and never confuses visitor names with its own identity.
+- **Persistent Thinking Action**: Visual thinking indicators (avatar thinking arm pose, `💭 Thinking…` status badge, thinking bubble) stay seamlessly active while RAG answers generate.
 - **Grounded Campus Knowledge**: College syllabus, courses, departments, fee structures, faculty contacts, placement statistics, and FAQs.
 - **Redis / Memurai Caching**: Low-latency caching layer for recurring queries and pre-computed embeddings.
 
-### 4. 🎭 Conversational Personality & Easter Eggs
-- **Intent Analysis**: Classifies questions into intents (`curious`, `happy`, `thanks`, `greeting`, `confused`) to trigger contextual avatar expressions and prefixes.
-- **Interactive Small Talk**: Built-in deterministic responses for conversational moments (*"Are you a robot?"*, *"Tell me a joke"*, *"How are you?"*, *"You are smart"*).
-- **Time-Aware Salutations**: Contextual greetings dynamically adapted to the time of day.
+### 4. 📊 Admin Dashboard & Telemetry (`/logs-dashboard`)
+- **Live Interaction Logs**: Full conversation timeline with `🏷️ Name Changed` badges highlighting visitor rename events.
+- **Face Tracks & Alias History**: Visual face records displaying `✏️ Guest → [Name]` badges with historical name tracking and timestamp audit trails.
+- **Session Telemetry**: Track active/past kiosk sessions with face enrollment indicators.
 
 ### 5. 🔊 Neural Text-To-Speech & Audio Sync
 - **Kokoro-82M Neural Synthesis**: High-quality `af_bella` voice at natural conversational pacing.
@@ -185,33 +190,36 @@ vrk_main/
 
 ## 🧪 Testing & Verification Guide
 
-### 1. Hands-Free Voice Onboarding
+### 1. Hands-Free Voice Onboarding & Auto-Guest
 1. Run `python run.py`.
 2. Stand in front of the camera as a new visitor.
-3. Listen for Nova: *"Hi! I'm Nova. What's your name?"*
-4. Speak naturally: *"Akshatha"* or *"I am Sneha"*.
-5. Observe the live audio waveform. The screen updates to: `"✓ Got it! Akshatha"`.
-6. Without touching anything, the system auto-proceeds after 3 seconds and welcomes you.
+3. Listen for Nova: *"Would you like to give your name or continue as guest? Say 'Yes' or blink twice to give your name, or say 'Guest' to continue as guest."*
+4. **Option A (Give Name)**: Say *"Yes"* or blink twice $\to$ say your name (*"Akshatha"*). Nova confirms and saves your face identity.
+5. **Option B (Guest Mode)**: Say *"Guest"* or wait 5 seconds without speaking $\to$ Nova auto-proceeds as Guest.
 
-### 2. Vision State & Recognition
+### 2. Mid-Conversation Name Change
+1. Start as a Guest and ask a few campus questions (e.g. *"Where is the CSE department?"*).
+2. Say: *"Change my name to Akshata"* or *"Actually my name is Rahul"*.
+3. Nova immediately updates MongoDB (`faces`, `sessions`, `interactions`) and confirms:
+   > *"Done! I have changed your name to Akshata. How may I assist you today?"*
+4. Check `/logs-dashboard`:
+   - **Interactions Tab**: Displays the conversation with a `🏷️ Name Changed` tag.
+   - **Face Tracks Tab**: Displays your profile with `✏️ Guest → Akshata`.
+
+### 3. Double-Blink Affirmation & Spelling Fallback
+1. Say: *"Change my name"*.
+2. Nova prompts: *"Sure! What should I change your name to?"*.
+3. Speak your name or name with spelling: *"Akshata, AKSHA, THA"*.
+4. Nova asks: *"Got it — should I call you Akshata? Say yes or blink twice to confirm, or say no to spell it out."*
+5. **Double-Blink**: Blink twice in front of the camera $\to$ confirmed!
+6. **Spelling Mode**: Say *"No / Spell it"* $\to$ Nova enters letter-by-letter spelling mode (*"A"*, *"K"*, *"S"*, *"H"*, *"A"*, *"T"*, *"A"*, *"Done"*).
+
+### 4. Vision State & Recognition
 1. Stand away: Attract screen shows `Walk up — I'll recognise you`.
 2. Approach the camera: State changes to `I see you — hold still…` $\to$ `Identifying…`.
-3. If registered: Greeted with personalized greeting (*"Welcome back, {Name}!"*).
+3. If previously registered: Greeted with personalized greeting (*"Welcome back, Akshata!"*), skipping the guest onboarding prompt.
 
-### 3. Blink Detection (Yes/No Confirmation)
-1. Open Developer Tools (`F12`) $\to$ **Network** $\to$ `ws/detect`.
-2. Blink naturally in front of the camera.
-3. Observe WebSocket payload stream:
-   ```json
-   {
-     "blink_detected": true,
-     "eyes_closed": true,
-     "ear_left": 0.09,
-     "ear_right": 0.08
-   }
-   ```
-
-### 4. Personality & Easter Eggs
+### 5. Personality & Easter Eggs
 - Ask: *"Are you a robot?"* $\to$ *"I'm a digital receptionist, so yes and no — no body, but I do the job!"*
 - Ask: *"Tell me a joke"* $\to$ *"Why did the student bring a ladder to class? To reach the higher studies!"*
 - Say: *"Thank you so much, bye!"* $\to$ Nova delivers a personalized farewell and transitions cleanly to the goodbye screen.

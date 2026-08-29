@@ -41,11 +41,12 @@ npm start
    │  │  • Intent animations    │  │  • Hands-free listening│  │
    │  └─────────────────────────┘  └────────────────────────┘  │
    │                                                           │
-   │  • Hands-Free Name Onboarding (Voice Capture -> 3s Auto)  │
-   │  • Synchronized Text & Voice Streaming with Auto-Scroll   │
-   │  • Multi-intent Personality Reactions & Contextual Hints  │
-   │  • Blink Detection Confirmation (Yes/No prompts)          │
-   │  • Session Re-engagement & Fallback Prompts               │
+    │  • Hands-Free Name Onboarding & 5s Auto-Guest Default     │
+    │  • Dynamic Mid-Session Name Change & DB Synchronization   │
+    │  • Double-Blink Affirmation & NATO Spelling Mode Fallback │
+    │  • Synchronized Text & Voice Streaming with Auto-Scroll   │
+    │  • Multi-intent Personality Reactions & Contextual Hints  │
+    │  • Session Re-engagement & Fallback Departure Prompts     │
    └─────────────────────────────┬─────────────────────────────┘
                                  │ "Thank you" / "Goodbye" / Inactivity Timeout
                                  ▼

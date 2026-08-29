@@ -29,15 +29,16 @@ run together via `python run.py`.
 ## Conversation & Vision Flow
 
 1. **Detection & Recognition** (`backend/detection.py` + `backend/recognition.py`):
-   - MediaPipe face mesh tracks landmarks and calculates Eye Aspect Ratio (EAR) for single and double-blink gesture detection (double-blink = "Yes" confirmation).
+   - MediaPipe face mesh tracks landmarks and calculates Eye Aspect Ratio (EAR) for single and double-blink gesture detection (double-blink = affirmative "Yes" gesture).
    - SCRFD + ArcFace (`w600k_r50.onnx`) extracts 512-d facial embeddings.
    - Cosine similarity matching against MongoDB registers new visitors or identifies returning visitors by name.
-2. **Kiosk Speaks First**: On session start, the frontend speaks the personalized greeting via Kokoro TTS — the visitor never needs to click.
-3. **Hands-Free Name Onboarding**: For new visitors, Nova asks *"What's your name?"*. Spoken names are transcribed, confirmed, and automatically registered after 3 seconds.
-4. **Listening**: Browser VAD (Silero ONNX runtime) captures speech as 16 kHz raw PCM $\to$ `POST /stt/pcm`.
-5. **STT** (`backend/stt.py`): Bandpass DSP chain (80 Hz–7.5 kHz) + energy gate $\to$ `faster-whisper` with campus vocabulary prompting.
-6. **Answering** (`/ask`): Safety guardrail $\to$ Easter egg checks $\to$ RAGService semantic retrieval on Port 8600 $\to$ Qwen primary generation (with Gemini fallback).
-7. **TTS** (`backend/tts.py`): Kokoro-82M synthesis (`af_bella`), sentence chunk prefetching, Web Audio gapless playback, and synchronized text animation.
+2. **Kiosk Speaks First**: On session start, the frontend speaks the personalized greeting via Kokoro TTS — the visitor never needs to touch the screen.
+3. **Hands-Free Name Onboarding & Auto-Guest**: Nova asks *"Would you like to give your name or continue as guest?"*. Visitors can speak their name, blink twice, or remain silent for 5 seconds to auto-default to Guest mode.
+4. **Mid-Conversation Name Modification**: Visitors can update their name at any point. The backend updates MongoDB (`faces`, `sessions`, `interactions`) and preserves alias history. Letter-by-letter spelling mode handles phonetic clarifications.
+5. **Listening**: Browser VAD (Silero ONNX runtime) captures speech as 16 kHz raw PCM $\to$ `POST /stt/pcm`.
+6. **STT** (`backend/stt.py`): Bandpass DSP chain (80 Hz–7.5 kHz) + energy gate $\to$ `faster-whisper` with campus vocabulary prompting.
+7. **Answering** (`/ask`): Safety guardrail $\to$ Easter egg checks $\to$ RAGService semantic retrieval on Port 8600 $\to$ Qwen primary generation (with Gemini fallback) with strict Nova persona enforcement.
+8. **TTS** (`backend/tts.py`): Kokoro-82M synthesis (`af_bella`), sentence chunk prefetching, Web Audio gapless playback, and synchronized text animation.
 
 ---
 
