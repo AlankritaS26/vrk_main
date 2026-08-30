@@ -1,8 +1,8 @@
-﻿"""
+"""
 RNSIT Digital Receptionist - Backend Server
 
-HOW TO RUN (always from VRK_MVP/ folder):
-    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+HOW TO RUN (from repository root):
+    venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 """
 
 import os
@@ -46,7 +46,8 @@ from backend.database import (
     get_kiosk_data,
     save_session, save_interaction, get_last_interaction, get_recent_interactions,
     update_face_seen, save_face_encoding, get_all_face_encodings,
-    delete_face_by_name,
+    delete_face_by_name, update_face_name_with_alias, update_session_user_name,
+    sessions_collection, faces_collection, interactions_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
 )
 from backend.llm import (
@@ -77,7 +78,7 @@ def run_pipeline(frame_data):
         class _NoOp:
             present = False; state = "IDLE"; identity = ""
             verified = False; bbox = None; bystanders = 0
-            error = "detection_unavailable"
+            error = "detection_unavailable"; blink = False; double_blink = False
         return _NoOp()
     return _run_pipeline(frame_data)
 
@@ -90,7 +91,7 @@ logging.basicConfig(
 logger = logging.getLogger("RNSIT_Kiosk")
 
 MAX_QUERY_LENGTH: int = 300 
-SESSION_TIMEOUT_SECONDS: int = 120
+SESSION_TIMEOUT_SECONDS: int = 180
 
 # ── RAG MICROSERVICE CONFIG ────────────────────────────────────────────────
 # Read once, here, near the top of the file — everything else in this module
@@ -300,6 +301,36 @@ EASTER_EGGS = {
     ],
     "do you sleep": [
         "Never! I'm here whenever a visitor needs help, day or night.",
+    ],
+    # ── Interactive/happy-moment additions ────────────────────────────────
+    # Small talk that makes Nova feel like a person at the desk rather than
+    # a search box, without drifting away from the college-assistant role —
+    # deliberately short, warm, and quick to hand the conversation back to
+    # campus topics.
+    "how are you": [
+        "I'm doing great, thanks for asking! Ready to help you explore RNSIT — what can I do for you?",
+        "Feeling good and fully charged! What would you like to know about RNSIT?",
+    ],
+    "what is the weather today": [
+        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
+    ],
+    "how is the weather": [
+        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
+    ],
+    "good job": [
+        "Aw, thank you! That made my day. Anything else I can help you with?",
+    ],
+    "you are smart": [
+        "That's very kind of you to say! I try my best. What else can I help you with?",
+    ],
+    "you are awesome": [
+        "You're pretty awesome yourself for saying that! What can I help you with next?",
+    ],
+    "nice to meet you": [
+        "Nice to meet you too! I'm Nova, RNSIT's digital receptionist. How can I help you today?",
+    ],
+    "good night": [
+        "Good night! It was lovely chatting with you — take care.",
     ],
 }
 
@@ -678,7 +709,8 @@ async def proxy_to_rag(payload: QueryRequest):
     answer = await query_rag_service(payload.query)
 
     try:
-        await save_interaction(sid, payload.query, answer, face_id=fid)
+        user_n = (active_session.get("user_name") or "Guest") if active_session else "Guest"
+        await save_interaction(sid, payload.query, answer, face_id=fid, user_name=user_n)
     except Exception as exc:
         logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
 
@@ -718,13 +750,12 @@ async def delete_face(face_id: str, username: str = Depends(authenticate_admin))
 async def update_face_name(face_id: str, payload: FaceUpdateRequest, username: str = Depends(authenticate_admin)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection is inactive.")
-    result = await db.faces.update_one(
-        {"face_id": face_id},
-        {"$set": {"name": payload.name}}
-    )
-    if result.matched_count == 0:
+    updated = await update_face_name_with_alias(face_id, payload.name)
+    if not updated:
         raise HTTPException(status_code=404, detail="Face record not found.")
-    return {"message": f"Renamed profile to {payload.name}"}
+    if active_session and active_session.get("face_id") == face_id:
+        active_session["user_name"] = payload.name
+    return {"message": f"Renamed profile to '{payload.name}' and updated all associated sessions."}
 
 @app.delete("/api/admin/sessions/{session_id}")
 async def delete_session(session_id: str, username: str = Depends(authenticate_admin)):
@@ -766,9 +797,9 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         )
 
     # 1. Pull data concurrently from all four MongoDB collections
-    interactions_list = await db.interactions.find().sort("timestamp", -1).limit(50).to_list(length=50)
-    faces_list = await db.faces.find().sort("detected_at", -1).limit(50).to_list(length=50)
-    sessions_list = await db.sessions.find().sort("start_time", -1).limit(50).to_list(length=50)
+    interactions_list = await db.interactions.find().sort("timestamp", -1).limit(200).to_list(length=200)
+    faces_list = await db.faces.find().sort([("last_seen", -1), ("detected_at", -1)]).limit(100).to_list(length=100)
+    sessions_list = await db.sessions.find().sort([("started_at", -1), ("last_activity", -1)]).limit(100).to_list(length=100)
     profile_list = await db.college_profile.find().limit(100).to_list(length=100)
 
     # --- Tab 1: Build Interactions rows ---
@@ -777,13 +808,22 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         ts = item.get("timestamp")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
+        u_name = item.get('user_name') or 'Guest'
+        input_t = item.get('input_text', '') or ''
+        # Detect name-change interactions so admin can spot them quickly
+        is_name_change = bool(__import__('re').search(
+            r'\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name|\bcall me\b|\bmy name is\b',
+            input_t, __import__('re').IGNORECASE
+        ))
+        name_change_badge = '<span style="background:#fef3c7;color:#92400e;font-size:10px;padding:2px 6px;border-radius:4px;font-weight:700;margin-left:5px;">🏷️ Name Changed</span>' if is_name_change else ''
         interaction_rows += f"""
         <tr id="interaction-{sess_id}">
             <td>{idx + 1}</td>
-            <td><code>{sess_id}</code></td>
-            <td><strong>{item.get('input_text', 'N/A')}</strong></td>
+            <td><strong style="color: #0066cc;">{u_name}</strong></td>
+            <td><code>{sess_id[:8] if sess_id != 'N/A' else 'N/A'}</code></td>
+            <td><strong>{input_t}</strong>{name_change_badge}</td>
             <td>{item.get('response_text', 'N/A')}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-danger" onclick="deleteInteraction('{sess_id}')">Delete Log</button>
             </td>
@@ -793,17 +833,33 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     # --- Tab 2: Build Faces rows ---
     face_rows = ""
     for idx, item in enumerate(faces_list):
-        ts = item.get("detected_at") or item.get("last_seen")
+        ts = item.get("last_seen") or item.get("detected_at")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         face_id = item.get('face_id', 'N/A')
         current_name = item.get('name', 'Unknown Visitor')
+        name_history = item.get('name_history', [])
+        name_updated_at = item.get('name_updated_at', '')
+        alias_html = ""
+        if name_history:
+            original_names = ', '.join(name_history)
+            # Prominent rename badge — shows old → new with timestamp
+            alias_html = (
+                f'<br><span style="display:inline-flex;align-items:center;gap:4px;margin-top:3px;'
+                f'background:#dbeafe;color:#1e40af;font-size:11px;padding:2px 7px;'
+                f'border-radius:4px;font-weight:600;">'
+                f'✏️ {original_names} → {current_name}</span>'
+            )
+            if name_updated_at:
+                alias_html += f'<br><span style="font-size:10px;color:#bbb;">Renamed at: {name_updated_at[:19]}</span>'
+        has_encoding = item.get('has_encoding', True)
+        encoding_badge = '' if has_encoding else '<br><span style="font-size:10px;color:#e67e22;background:#fff3e0;padding:1px 5px;border-radius:3px;font-weight:600;">Name only · no face scan</span>'
         face_rows += f"""
         <tr id="face-{face_id}">
             <td>{idx + 1}</td>
             <td><code>{face_id}</code></td>
-            <td><strong id="face-name-text-{face_id}">{current_name}</strong></td>
+            <td><strong id="face-name-text-{face_id}">{current_name}</strong>{alias_html}{encoding_badge}</td>
             <td>{item.get('visit_count', 1)}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-edit" onclick="editFaceName('{face_id}', '{current_name}')">Rename</button>
                 <button class="btn btn-danger" onclick="deleteFace('{face_id}')">Delete</button>
@@ -814,17 +870,22 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     # --- Tab 3: Build Sessions rows ---
     session_rows = ""
     for idx, item in enumerate(sessions_list):
-        ts = item.get("start_time")
+        ts = item.get("started_at") or item.get("start_time") or item.get("last_activity")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
+        u_name = item.get('user_name', 'Guest')
+        s_face_id = item.get('face_id') or ''
+        guest_badge = ''
+        if not s_face_id:
+            guest_badge = ' <span style="font-size:10px;background:#f3f4f6;color:#6b7280;padding:2px 6px;border-radius:4px;font-weight:600;">No face scan</span>'
         session_rows += f"""
         <tr id="session-{sess_id}">
             <td><code>{sess_id}</code></td>
-            <td>{item.get('user_name', 'Guest')}</td>
+            <td><strong style="color: #0066cc;">{u_name}</strong>{guest_badge}</td>
             <td>{item.get('visit_count', 1)}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
-                <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End & Delete</button>
+                <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End &amp; Delete</button>
             </td>
         </tr>
         """
@@ -901,16 +962,17 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
                     <table>
                         <thead>
                             <tr>
-                                <th style="width: 5%">#</th>
-                                <th style="width: 15%">Session ID</th>
+                                <th style="width: 4%">#</th>
+                                <th style="width: 14%">Visitor</th>
+                                <th style="width: 12%">Session ID</th>
                                 <th style="width: 25%">User Query</th>
-                                <th style="width: 35%">Kiosk Response</th>
-                                <th style="width: 12%">Timestamp</th>
-                                <th style="width: 8%">Action</th>
+                                <th style="width: 32%">Kiosk Response</th>
+                                <th style="width: 7%">Time</th>
+                                <th style="width: 6%">Action</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {interaction_rows if interaction_rows else "<tr><td colspan='6' style='text-align:center;'>No interactions recorded yet.</td></tr>"}
+                            {interaction_rows if interaction_rows else "<tr><td colspan='7' style='text-align:center;'>No interactions recorded yet.</td></tr>"}
                         </tbody>
                     </table>
                 </div>
@@ -1078,28 +1140,21 @@ INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
 def build_greeting(name: str, is_returning: bool, resumed: bool,
                     previous_topic: str | None = None) -> str:
-    """The exact spoken lines for first-time vs returning visitors.
-
-    MEMORY-AWARE RE-ENGAGEMENT: when we resume a visitor's thread AND we
-    have a high-confidence topic label for their last stored question,
-    the greeting names that topic and asks (never assumes) whether they
-    want to continue with it. If no topic is available, we fall back to
-    the generic resumed-session line — we never guess or hallucinate a
-    previous topic.
-    """
-    who = name if name and name not in ("Guest", "Unknown", "") else "there"
-    if not is_returning:
-        return (f"Welcome {who}! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
-                f"I can help you with admissions, departments, placements, fees, "
-                f"and finding your way around campus. How may I assist you today?")
-    if resumed:
-        if previous_topic:
-            return (f"Welcome back, {who}!Good to see you again, Last time you were asking about "
+    """The exact spoken lines for first-time vs returning/named visitors."""
+    who = name if name and name not in ("Guest", "Unknown", "", "Friend") else ""
+    if who:
+        if resumed and previous_topic:
+            return (f"Welcome back, {who}! Good to see you again. Last time you were asking about "
                     f"{previous_topic} — would you like to continue with that, "
                     f"or help with something else today?")
-        return (f"Welcome back, {who}! Good to see you again. "
-                f"We can continue where we left off. How may I assist you today?")
-    return f"Welcome back, {who}! How may I assist you today?"
+        if resumed:
+            return (f"Welcome back, {who}! Good to see you again. "
+                    f"We can continue where we left off. How may I assist you today?")
+        return f"Welcome back, {who}! How may I assist you today?"
+
+    return (f"Welcome! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
+            f"I can help you with admissions, departments, placements, fees, "
+            f"and finding your way around campus. How may I assist you today?")
 
 
 async def resume_or_create_session(face_id: str, user_name: str,
@@ -1236,9 +1291,29 @@ async def end_session_endpoint(session_id: str = None):
     return {"status": "success"}
 
 
+@app.post("/session/are_you_there")
+async def are_you_there_endpoint():
+    global active_session
+    if active_session:
+        user_name = active_session.get("user_name") or "there"
+        sid = active_session.get("session_id") or ""
+        logger.info(f"[SESSION] Triggering 3s departure prompt for '{user_name}'")
+        tts_prompt = f"Are you there, {user_name}?" if user_name not in ("Guest", "there", "Unknown", "") else "Are you there?"
+        await manager.broadcast({
+            "type": "are_you_there",
+            "user_name": user_name,
+            "session_id": sid,
+            "tts_text": tts_prompt,
+        })
+        return {"status": "ok", "user_name": user_name}
+    return {"status": "no_active_session"}
+
+
 @app.get("/session/current")
 def get_current_session():
+    global _last_activity_ts
     if active_session:
+        _last_activity_ts = datetime.now().timestamp()
         return {"active": True, **active_session}
     return {"active": False}
 
@@ -1327,6 +1402,66 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             answer = responses[hash(sid + phrase) % len(responses)]
             logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
             return answer, "easter_egg", "CONTINUE"
+
+    # ─── Change Name Request ────────────────────────────────────────────────
+    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul"
+    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized)
+    if name_change_match:
+        new_name_raw = name_change_match.group(1).strip()
+        if "," in new_name_raw:
+            new_name_raw = new_name_raw.split(",")[0].strip()
+        new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
+        if new_name_words:
+            new_name = " ".join(new_name_words)
+            if active_session:
+                active_session["user_name"] = new_name
+                face_id_for_rename = active_session.get("face_id") or ""
+                sid_for_rename = active_session.get("session_id") or ""
+                if sid_for_rename:
+                    await update_session_user_name(sid_for_rename, new_name)
+                    await interactions_collection.update_many(
+                        {"session_id": sid_for_rename},
+                        {"$set": {"user_name": new_name}}
+                    )
+                if face_id_for_rename:
+                    await update_face_name_with_alias(face_id_for_rename, new_name)
+                    logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
+                                face_id_for_rename[:8], new_name)
+                else:
+                    # Register face for guest who provided a name so they appear in face tracks
+                    try:
+                        from backend.detection import ST, _load_known_faces
+                        anchor = ST.snapshot().get("anchor")
+                        new_fid = str(uuid.uuid4())
+                        if anchor:
+                            await save_face_encoding(new_fid, new_name, anchor, [anchor])
+                            ST.set(face_id=new_fid, identity=new_name)
+                        else:
+                            await save_face_encoding(new_fid, new_name, [], [])
+                        active_session["face_id"] = new_fid
+                        if sid_for_rename:
+                            await sessions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                            await interactions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                        _load_known_faces(force=True)
+                        logger.info(f"[ROUTE] Registered face for former guest '{new_name}' face_id={new_fid[:8]}")
+                    except Exception as ex:
+                        logger.warning(f"[ROUTE] Could not register face anchor: {ex}")
+                await manager.broadcast({
+                    "type": "session_update",
+                    "session": active_session,
+                    "user_name": new_name,
+                    "face_id": active_session.get("face_id", ""),
+                })
+            answer = f"Done! I have changed your name to {new_name}. How may I assist you today?"
+            logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
+            return answer, "name_change", "CONTINUE"
+
+    if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
+       re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
+        answer = "Sure! You can say \"change my name to [Your Name]\" anytime, and I'll update it for you."
+        return answer, "name_change_help", "CONTINUE"
 
     # ─── Thank you / bye / natural sign-off → end session immediately ───────
     if _is_farewell(q_normalized):
@@ -1430,7 +1565,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
 
     async def _respond(answer: str, source: str = "", session_action: str = "CONTINUE") -> dict:
         try:
-            await save_interaction(sid, question, answer, face_id=fid)
+            await save_interaction(sid, question, answer, face_id=fid, user_name=visitor_name)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
@@ -1546,7 +1681,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
 
     async def _finish(answer: str, session_action: str = "CONTINUE"):
         try:
-            await save_interaction(sid, question, answer, face_id=fid)
+            await save_interaction(sid, question, answer, face_id=fid, user_name=visitor_name)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
@@ -1620,7 +1755,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
 class RegisterFacePayload(BaseModel):
     face_id:  str         = Field(..., description="Unique face id")
     name:     str         = Field(..., description="Person's name")
-    encoding: List[float] = Field(..., description="Face encoding vector")
+    encoding: List[float] = Field(default_factory=list, description="Face encoding vector")
     encodings: List[List[float]] = Field(default_factory=list,
                                          description="Multi-template encodings (preferred)")
 
@@ -1696,9 +1831,13 @@ async def detect_websocket(ws: WebSocket):
     Browser-camera detection pipeline (cross-platform, no native window needed).
 
     Browser → backend : JSON  {"frame": "<base64 JPEG>"}
-    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders}
+    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders, blink}
 
     bbox format when present: {x, y, w, h}  — pixel coords in the captured frame
+    `blink` is an experimental, debounced one-frame blink EVENT (true for
+    exactly the frame the blink completed on) — the frontend can use it as
+    an optional "yes" gesture. It never affects detection.py's own state
+    machine.
     """
     await ws.accept()
     logger.info("[WS/DETECT] Browser camera connected")
@@ -1724,12 +1863,14 @@ async def detect_websocket(ws: WebSocket):
                         "h": result.bbox.h,
                     }
                 await ws.send_json({
-                    "present":    result.present,
-                    "state":      result.state,
-                    "identity":   result.identity or "",
-                    "verified":   result.verified,
-                    "bbox":       bbox,
-                    "bystanders": result.bystanders,
+                    "present":      result.present,
+                    "state":        result.state,
+                    "identity":     result.identity or "",
+                    "verified":     result.verified,
+                    "bbox":         bbox,
+                    "bystanders":   result.bystanders,
+                    "blink":        bool(getattr(result, "blink", False)),
+                    "double_blink": bool(getattr(result, "double_blink", False)),
                 })
             except Exception as frame_err:
                 logger.warning(f"[WS/DETECT] Frame processing error: {frame_err}")
@@ -1795,7 +1936,7 @@ async def greet_visitor(payload: GreetVisitorPayload):
         await manager.broadcast({
             "type": "asking_name", 
             "session": active_session,
-            "tts_text": "Hello! Welcome to RNSIT Kiosk. Please say your name, or say Guest to continue."
+            "tts_text": "Hi! May I know your name?"
         })
         return {"status": "asking", "session_id": active_session["session_id"]}
 
@@ -1845,19 +1986,151 @@ async def visitor_unknown():
     else:
         active_session["asking_name"] = True
 
-    await manager.broadcast({"type": "asking_name", "session": active_session})
+    await manager.broadcast({
+        "type": "asking_name",
+        "session": active_session,
+        "tts_text": "Hi! May I know your name?",
+    })
     return {"status": "asking", "session_id": active_session["session_id"]}
 
 
 @app.post("/visitor/submit_name")
 async def submit_name(name: str = "Guest", save: bool = True):
+    """
+    Called by the frontend when the visitor speaks their name (or chooses Guest).
+
+    FIXED: previously this only renamed a face if `fid` was already set on
+    the session — for a fresh guest (the normal case) fid is empty, so no
+    embedding was ever registered and the visitor was 'unknown' again on
+    their next visit. Now it calls register_or_resume_face(), which uses
+    the live camera anchor embedding detection.py already captured for the
+    current visitor, registers-or-links a real face_id, and includes the
+    same duplicate-hard-block _enroll_worker uses (so if detection's own
+    camera-driven ENROLLING path also fires for this visit, they converge
+    on the same face_id instead of minting two).
+    """
     global visitor_name_response, active_session
+    # Signal to _enroll_worker (camera path) that the name is ready, in case
+    # it's still waiting on /visitor/name_response.
     visitor_name_response = {"ready": True, "name": name, "save": save}
-    if active_session:
-        active_session["asking_name"] = False
-        active_session["user_name"]   = name
-    logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
+    logger.info(f"[VISITOR] submit_name called: name='{name}' save={save}")
+
+    if not active_session:
+        active_session = {
+            "session_id": str(uuid.uuid4()),
+            "user_name": name,
+            "is_returning": False,
+            "visit_count": 1,
+            "face_id": "",
+            "trigger": "camera",
+            "asking_name": False,
+        }
+        logger.info(f"[VISITOR] submit_name: created minimal session for '{name}'")
+
+    active_session["asking_name"] = False
+    active_session["user_name"] = name
+    sid = active_session.get("session_id")
+    fid = active_session.get("face_id") or ""
+
+    if sid:
+        await update_session_user_name(sid, name)
+        await interactions_collection.update_many(
+            {"session_id": sid},
+            {"$set": {"user_name": name}}
+        )
+
+    if save and name not in ("Guest", "Unknown", ""):
+        from backend.detection import register_or_resume_face, ST, _load_known_faces
+        if fid:
+            await update_face_name_with_alias(fid, name)
+            logger.info(f"[VISITOR] submit_name: renamed existing face_id={fid[:8]} to '{name}'")
+        else:
+            result = register_or_resume_face(name, save=True)
+            new_fid = result.get("face_id") or ""
+            if not new_fid:
+                new_fid = str(uuid.uuid4())
+            snap_anchor = ST.snapshot().get("anchor") or []
+            await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+            ST.set(face_id=new_fid, identity=name)
+            _load_known_faces(force=True)
+            active_session["face_id"] = new_fid
+            fid = new_fid
+            if sid:
+                await sessions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+                await interactions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            logger.info(
+                f"[VISITOR] submit_name: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+            )
+
+    # Broadcast the updated name to all connected frontends immediately so the
+    # admin dashboard, GoodbyeScreen, etc. all see the real name right away.
+    await manager.broadcast({
+        "type":     "session_update",
+        "session":  active_session,
+        "user_name": name,
+        "face_id":  fid,
+    })
+    logger.info(f"[VISITOR] submit_name: broadcasted session_update name='{name}'")
     return {"status": "ok"}
+
+
+
+@app.post("/visitor/rename")
+async def rename_visitor(name: str, face_id: str = ""):
+    """Mid-session name change: updates the active_session, the DB face record
+    (with old-name archival), updates sessions collection everywhere, and broadcasts
+    the change so all UI and admin components reflect it immediately.
+    """
+    global active_session
+    fid = face_id or (active_session.get("face_id") if active_session else "") or ""
+    sid = active_session.get("session_id") if active_session else ""
+    if active_session:
+        active_session["user_name"] = name
+
+    if sid:
+        await update_session_user_name(sid, name)
+        await interactions_collection.update_many(
+            {"session_id": sid},
+            {"$set": {"user_name": name}}
+        )
+
+    updated_db = False
+    if fid:
+        updated_db = await update_face_name_with_alias(fid, name)
+    else:
+        from backend.detection import register_or_resume_face, ST, _load_known_faces
+        result = register_or_resume_face(name, save=True)
+        new_fid = result.get("face_id") or ""
+        if not new_fid:
+            new_fid = str(uuid.uuid4())
+        snap_anchor = ST.snapshot().get("anchor") or []
+        await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+        ST.set(face_id=new_fid, identity=name)
+        _load_known_faces(force=True)
+        if active_session:
+            active_session["face_id"] = new_fid
+        if sid:
+            await sessions_collection.update_many(
+                {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            await interactions_collection.update_many(
+                {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+        updated_db = True
+        logger.info(
+            f"[VISITOR] rename: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+        )
+
+    if active_session:
+        await manager.broadcast({
+            "type": "session_update",
+            "session": active_session,
+            "user_name": name,
+            "face_id": active_session.get("face_id", ""),
+        })
+
+    logger.info("[VISITOR] rename: '%s' face_id=%s db_updated=%s", name, fid[:8] if fid else '-', updated_db)
+    return {"status": "ok", "db_updated": updated_db}
 
 
 @app.get("/visitor/name_response")
@@ -1870,27 +2143,6 @@ def clear_response():
     global visitor_name_response
     visitor_name_response = {"ready": False, "name": "", "save": True}
     return {"status": "cleared"}
-
-
-@app.post("/visitor/delete_my_data")
-async def delete_my_data(name: str):
-    """Erase a visitor's face data (GDPR-style right to be forgotten)."""
-    try:
-        face_ids = await delete_face_by_name(name)
-        if not face_ids:
-            return {"success": False, "message": f"No data found for '{name}'."}
-
-        for face_id in face_ids:
-            face_dir = PROJECT_ROOT / "faces" / face_id
-            if face_dir.exists():
-                shutil.rmtree(face_dir)
-                logger.info(f"[DELETE] Removed face dir: {face_dir}")
-
-        await manager.broadcast({"type": "cache_reload"})
-        return {"success": True, "message": f"All data for '{name}' has been permanently deleted."}
-    except Exception as e:
-        logger.error(f"[DELETE] Error: {e}")
-        return {"success": False, "message": "Deletion failed. Please contact staff."}
 
 
 # ==========================================

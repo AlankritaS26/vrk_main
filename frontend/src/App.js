@@ -17,6 +17,7 @@ export default function App() {
   const [session, setSession] = useState(null);
   const [lastSession, setLastSession] = useState(null);
   const [messages, setMessages] = useState([]);
+  const [lastFarewell, setLastFarewell] = useState('');
   const pollRef = useRef(null);
   const goodbyeTimer = useRef(null);
   const prevActiveRef = useRef(false);
@@ -31,6 +32,8 @@ export default function App() {
   const [videoDims, setVideoDims] = useState({ w: 640, h: 480 });
   const [camError, setCamError] = useState(null);
   const [camStream, setCamStream] = useState(null);
+  const [doubleBlink, setDoubleBlink] = useState(0);
+  const [blink, setBlink] = useState(0);
 
   const hiddenVideoRef = useRef(null);      // used only for frame capture
   const captureCanvasRef = useRef(null);
@@ -55,6 +58,12 @@ export default function App() {
           setDetState(data.state || 'IDLE');
           setIdentity(data.identity || '');
           setBbox(data.present && data.bbox ? data.bbox : null);
+          if (data.double_blink) {
+            setDoubleBlink(Date.now());
+          }
+          if (data.blink) {
+            setBlink(Date.now());
+          }
         } catch (_) { }
       };
 
@@ -90,8 +99,6 @@ export default function App() {
       }
     }
 
-    // 3 fps — runs continuously regardless of screen or conversation state,
-    // so departure/face-swap detection always works.
     function startSending() {
       sendIntervalRef.current = setInterval(() => {
         const ws = wsRef.current;
@@ -101,12 +108,16 @@ export default function App() {
         if (!video || video.videoWidth === 0) return;
 
         const ctx = cvs.getContext('2d');
-        cvs.width = video.videoWidth;
-        cvs.height = video.videoHeight;
-        ctx.drawImage(video, 0, 0);
-        const b64 = cvs.toDataURL('image/jpeg', 0.7).split(',')[1];
+        const w = video.videoWidth || 640;
+        const h = video.videoHeight || 480;
+        if (cvs.width !== w || cvs.height !== h) {
+          cvs.width = w;
+          cvs.height = h;
+        }
+        ctx.drawImage(video, 0, 0, w, h);
+        const b64 = cvs.toDataURL('image/jpeg', 0.65).split(',')[1];
         try { ws.send(JSON.stringify({ frame: b64 })); } catch (_) { }
-      }, 333);
+      }, 250);
     }
 
     startCamera();
@@ -140,6 +151,7 @@ export default function App() {
           setScreen('welcome');
         } else {
           if (prevActiveRef.current) {
+            setLastFarewell('');
             setSession(current => { setLastSession(current); return null; });
             setScreen('goodbye');
             goodbyeTimer.current = setTimeout(() => {
@@ -159,7 +171,17 @@ export default function App() {
     poll();
     pollRef.current = setInterval(poll, IDLE_POLL_MS);
 
-    const onEnded = () => {
+    const onEnded = (ev) => {
+      // Capture the farewell text if WelcomeScreen sent it with the event
+      if (ev.detail?.farewell) setLastFarewell(ev.detail.farewell);
+      // Capture the visitor's real name from the event so the Goodbye screen
+      // always shows the correct name even if session state was stale.
+      if (ev.detail?.userName && ev.detail.userName !== 'Unknown') {
+        setLastSession(current => current
+          ? { ...current, user_name: ev.detail.userName }
+          : { user_name: ev.detail.userName }
+        );
+      }
       clearInterval(pollRef.current);
       pollRef.current = setInterval(poll, IDLE_POLL_MS);
       poll();
@@ -181,10 +203,21 @@ export default function App() {
       startWs.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data);
-          if (msg.type === 'session_start') {
+          if (msg.type === 'session_start' || msg.type === 'asking_name') {
             clearInterval(pollRef.current);
             poll();                          // switch screens right now
             pollRef.current = setInterval(poll, ACTIVE_POLL_MS);
+          } else if (msg.type === 'session_update') {
+            // Guest gave their name — update session state IMMEDIATELY so the
+            // Goodbye screen and header always show the real name. Don't wait
+            // for the slow 12-second poll tick.
+            if (msg.session) {
+              setSession(prev => prev ? { ...prev, ...msg.session } : msg.session);
+            } else if (msg.user_name) {
+              setSession(prev => prev ? { ...prev, user_name: msg.user_name, face_id: msg.face_id || prev.face_id } : prev);
+            }
+            // Also re-sync with backend to confirm
+            poll();
           }
         } catch (_) { }
       };
@@ -203,7 +236,7 @@ export default function App() {
 
   const askingName = session?.asking_name === true;
 
-  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream };
+  const detectionProps = { detState, identity, bbox, videoDims, camError, camStream, doubleBlink, blink };
 
   return (
     <>
@@ -216,7 +249,7 @@ export default function App() {
         <WelcomeScreen session={session} messages={messages} setMessages={setMessages}
           askingName={askingName} {...detectionProps} />
       )}
-      {screen === 'goodbye' && <GoodbyeScreen session={lastSession} />}
+      {screen === 'goodbye' && <GoodbyeScreen session={lastSession} farewell={lastFarewell} />}
       {screen === 'idle' && <IdleScreen {...detectionProps} />}
     </>
   );

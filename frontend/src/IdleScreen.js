@@ -86,11 +86,11 @@ export default function IdleScreen({ detState, identity, bbox, videoDims, camErr
 
         {/* ── Live camera feed with face-detection overlay ───────────────── */}
         <div style={{
-          opacity: visible ? 1 : 0, transition: 'opacity 0.8s ease 0.4s',
+          opacity: visible ? 1 : 0,
           position: 'relative', borderRadius: '18px', overflow: 'hidden',
           boxShadow: '0 8px 36px rgba(26,35,126,0.20)',
           border: `3px solid ${borderColor}`,
-          transition: 'border-color 0.4s ease',
+          transition: 'opacity 0.8s ease 0.4s, border-color 0.4s ease',
         }}>
           <video
             ref={videoRef}
