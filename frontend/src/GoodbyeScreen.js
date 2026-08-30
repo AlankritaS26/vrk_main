@@ -1,7 +1,24 @@
 import React from 'react';
 
-export default function GoodbyeScreen({ session }) {
-  const name = session?.user_name && session.user_name !== 'Unknown' ? session.user_name : '';
+export default function GoodbyeScreen({ session, farewell }) {
+  // Layer 1: use session.user_name (exclude only "Unknown" — "Guest" is a
+  //          valid choice the visitor made, and real names are always valid)
+  let name = (session?.user_name && session.user_name !== 'Unknown') ? session.user_name : '';
+
+  // Layer 2: try to extract the name from the farewell text itself.
+  // The farewell is always one of:
+  //   "Goodbye, {name}! Have a wonderful day."
+  //   "Goodbye! Have a wonderful day."  (when name was unknown)
+  // This covers the race where session state was still stale.
+  if (!name && farewell) {
+    const m = farewell.match(/Goodbye,\s+([A-Z][a-zA-Z\s]+?)!/);
+    if (m) name = m[1].trim();
+  }
+
+  // Suppress "Guest" in the displayed line — showing "Goodbye, Guest." is
+  // impersonal and reads as a bug; an anonymous goodbye is warmer without it.
+  const displayName = (name && name !== 'Guest') ? name : '';
+
   return (
     <div style={{
       minHeight: '100vh', background: '#f5f6fa',
@@ -40,7 +57,7 @@ export default function GoodbyeScreen({ session }) {
         </div>
 
         <div style={{ fontSize: '19px', color: '#444', marginTop: '14px', lineHeight: '1.6' }}>
-          Goodbye{name ? <>, <strong style={{ color: '#1a237e' }}>{name}</strong></> : ''}.
+          Goodbye{displayName ? <>, <strong style={{ color: '#1a237e' }}>{displayName}</strong></> : ''}.
           Wishing you a wonderful day ahead.
         </div>
 
@@ -48,7 +65,7 @@ export default function GoodbyeScreen({ session }) {
           Returning to the welcome screen shortly
         </div>
 
-        {/* animated progress line replaces the static dash */}
+        {/* animated progress line */}
         <div style={{
           height: '4px', width: '160px', margin: '18px auto 0',
           borderRadius: '2px', background: '#e8eaf6',

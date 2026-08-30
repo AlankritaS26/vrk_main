@@ -3,26 +3,28 @@ import { createKioskMic, float32ToInt16 } from './kioskMic';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
-export default function WelcomeScreen({ session, messages, setMessages, askingName }) {
+export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
-  const inputRef = useRef(null);
   const camVideoRef = useRef(null);
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
   const isSpeaking = useRef(false);
   const awaitingAnswerRef = useRef(false);     // true from "ack started" until the real answer's speech starts/fails —
-                                               // keeps status at 'processing' (not 'ready') through that gap
+  // keeps status at 'processing' (not 'ready') through that gap
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
-                                               // (explicitly non-interruptible, per spec — it
-                                               // is one short message that must always finish)
+  // (explicitly non-interruptible, per spec — it
+  // is one short message that must always finish)
+  const handlingDepartureRef = useRef(false);  // true while handling 3s face departure prompt
   const isListening = useRef(false);
   const analyserRef = useRef(null);
   const animFrameRef = useRef(null);
   const canvasRef = useRef(null);
   const audioCtxRef = useRef(null);
   const statusRef = useRef('ready');        // readable inside callbacks
+  const detStateRef = useRef(detState || 'IDLE');
+  useEffect(() => { detStateRef.current = detState || 'IDLE'; }, [detState]);
   const streamRef = useRef(null);           // persistent mic stream
   const pendingUtteranceRef = useRef(null);
   const playCtxRef = useRef(null);              // Web Audio playback context
@@ -52,9 +54,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);      // speech captured while busy
 
-  const [name, setName] = useState('');
-  const [saveData, setSaveData] = useState(true);
-  const [submitted, setSubmitted] = useState(false);
   const [privacyOpen, setPrivacyOpen] = useState(false);
   const [hintIndex, setHintIndex] = useState(0);
   const hints = [
@@ -73,7 +72,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
 
-  const visitorName = session?.user_name || 'Guest';
+  // ── Voice-based name capture (NO TYPING) ──────────────────────────────────
+  // Replaces the old "type your name" modal entirely. Nova asks out loud,
+  // listens for the spoken answer via the same STT pipeline used for
+  // regular questions, then asks (out loud) whether to remember the
+  // visitor — answerable by voice ("yes"/"no") or, experimentally, by
+  // blinking once for "yes". A single tap fallback ("Continue as Guest")
+  // stays available for accessibility/robustness, but there is no keyboard
+  // entry anywhere in this flow.
+  const [nameStage, setNameStage] = useState('idle');
+  // idle | asking | listening_name | confirming | listening_confirm | saving | done
+  const nameFlowIdRef = useRef(0);          // bumped to invalidate an in-flight run
+
+  const [localName, setLocalName] = useState('');
+  const visitorName = localName || (session?.user_name && session.user_name !== 'Unknown' ? session.user_name : 'Guest');
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
 
@@ -101,37 +113,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     return () => { isMounted.current = false; stopWaveform(); };
   }, []);
 
-  // ── Backend event WebSocket — server-pushed session_end ─────────────────
-  // Handles inactivity timeout and detection-triggered session ends so the
-  // goodbye screen appears immediately without waiting for the poll heartbeat.
-  useEffect(() => {
-    const WS = BACKEND.replace(/^http/, 'ws');
-    let ws;
-    let dead = false;
-    function connect() {
-      if (dead) return;
-      ws = new WebSocket(WS + '/ws');
-      ws.onmessage = (e) => {
-        try {
-          const msg = JSON.parse(e.data);
-          if (msg.type === 'session_end') {
-            // Kill any audio + pending work from the ended session so nothing
-            // bleeds into the next visitor — EXCEPT the farewell, which is the
-            // one line meant to play as the session ends.
-            if (!farewellPlayingRef.current) {
-              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) {}
-              pendingUtteranceRef.current = null;
-            }
-            window.dispatchEvent(new Event('vrk-session-ended'));
-          }
-        } catch (_) { }
-      };
-      ws.onclose = () => { if (!dead) setTimeout(connect, 3000); };
-    }
-    connect();
-    return () => { dead = true; ws?.close(); };
-  }, []);
-
   // ── Camera sidebar ────────────────────────────────────────────────────────
   useEffect(() => {
     let active = true;
@@ -148,13 +129,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       camStreamRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    if (askingName) {
-      setSubmitted(false); setName(''); setSaveData(true);
-      setTimeout(() => inputRef.current?.focus(), 100);
-    }
-  }, [askingName]);
 
   const cleanText = (t) => (t || '').replace(/\u2014|\u2013/g, ', ').replace(/\s+,/g, ',');
 
@@ -248,31 +222,27 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   // ── STT: browser VAD → Int16 PCM → POST /stt/pcm (GPU backend) ──────────
   const micRef = useRef(null);
+  const activePromptResolverRef = useRef(null);
+  const lastProcessedTextRef = useRef({ text: '', time: 0 });
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const handleUtterance = useCallback(async (float32Audio) => {
-    if (!isMounted.current || askingName) return;
+    if (!isMounted.current) return;
     if (greetingPlayingRef.current) {
-      // The one-time first-visit greeting is non-interruptible by design —
-      // drop anything spoken while it's still playing rather than cutting
-      // it off. The visitor can speak again the instant it finishes.
       return;
     }
     if (isSpeaking.current) {
-      // The VAD just CONFIRMED real speech (this is onSpeechEnd) while TTS
-      // was still playing — commit the barge-in now and process it right away.
       interruptSpeaking();
-    } else if (statusRef.current === 'processing') {
-      // Visitor spoke while we were busy — save it as the next prompt
-      pendingUtteranceRef.current = float32Audio;
+    } else if (!activePromptResolverRef.current && statusRef.current === 'processing') {
       return;
     }
     isListening.current = false;
     setListening(false);
+    statusRef.current = 'processing';
     setStatus('processing');
 
     try {
-      const i16 = float32ToInt16(float32Audio);   // halves bytes over the LAN
+      const i16 = float32ToInt16(float32Audio);
       const response = await fetch(BACKEND + '/stt/pcm', {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
@@ -283,17 +253,48 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       console.log('[STT WHISPER]', result);
       const heard = (result.text || '').trim();
 
+      // If a specific conversation prompt (e.g. name prompt, Yes/No confirm) is waiting for speech:
+      if (activePromptResolverRef.current) {
+        if (heard && heard.length > 0) {
+          const resolver = activePromptResolverRef.current;
+          activePromptResolverRef.current = null;
+          if (isMounted.current) setLiveText(heard);
+          statusRef.current = 'ready';
+          setStatus('ready');
+          resolver(heard);
+          return;
+        } else {
+          console.log('[STT] Empty transcript during prompt wait, continuing to wait for speech');
+          statusRef.current = 'ready';
+          setStatus('ready');
+          return;
+        }
+      }
+
+      const now = Date.now();
       if (heard && heard.length > 1 && !isSpeaking.current) {
+        // Prevent duplicate input processing within 2.5 seconds
+        if (lastProcessedTextRef.current.text.toLowerCase() === heard.toLowerCase() && (now - lastProcessedTextRef.current.time) < 2500) {
+          console.log('[STT] Dropped duplicate heard text within 2.5s:', heard);
+          setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+          return;
+        }
+        lastProcessedTextRef.current = { text: heard, time: now };
         if (isMounted.current) setLiveText(heard);
         sendToBackend(heard);
       } else {
-        setStatus('ready');   // VAD keeps listening — no restart needed
+        setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
       }
     } catch (err) {
       console.error('[STT] Error:', err);
-      setStatus('ready');
+      if (activePromptResolverRef.current) {
+        const resolver = activePromptResolverRef.current;
+        activePromptResolverRef.current = null;
+        resolver('');
+      }
+      setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     }
-  }, [askingName]);
+  }, []);
 
   // Barge-in has two stages, matching the two things the VAD can tell us:
   //
@@ -347,18 +348,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const startListening = useCallback(async () => {
-    if (!isMounted.current || askingName) return;
+    if (!isMounted.current) return;
 
-    // Mic already initialized — just resume the VAD (e.g. after TTS finished).
-    // Only mark status 'ready' if TTS is not currently playing; when called from
-    // inside finish() isSpeaking is already false and finish() itself sets 'ready'
-    // first, so either way the state transition is correct.
+    // Mic already initialized — check if the underlying stream is still alive
     if (micRef.current) {
-      if (!isSpeaking.current) {
+      const trackEnded = streamRef.current
+        && streamRef.current.getTracks().some(t => t.readyState === 'ended');
+      if (trackEnded) {
+        console.info('[MIC] Track ended (OS mic toggled) — reinitializing VAD');
+        micRef.current.destroy();
+        micRef.current = null;
+        streamRef.current = null;
+        stopWaveform();
+      } else if (!isSpeaking.current) {
         micRef.current.resume();
-        setStatus('ready');
+        setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+        return;
+      } else {
+        return;
       }
-      return;
     }
 
     try {
@@ -366,51 +374,48 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         onStream: (stream) => { streamRef.current = stream; },
         onSpeechStart: () => {
           if (!isMounted.current) return;
-          // HARD barge-in: the instant the visitor starts speaking, STOP the
-          // kiosk's voice immediately — don't just duck and wait for the VAD
-          // to confirm at speech-end. A receptionist stops talking the moment
-          // you speak; so does this. EXCEPTION: the first-visit greeting is
-          // deliberately NOT interruptible — it's one short message and
-          // every visitor should hear the whole thing once.
-          if (isSpeaking.current && !greetingPlayingRef.current) interruptSpeaking();
+          if (isSpeaking.current) {
+            if (greetingPlayingRef.current) return;
+            interruptSpeaking();
+          }
           isListening.current = true;
           setListening(true);
           setLiveText('');
           setStatus('listening');
-          if (streamRef.current) startWaveform(streamRef.current);  // canvas is visible now
+          if (streamRef.current) startWaveform(streamRef.current);
         },
-        onSpeechEnd: (audio) => handleUtterance(audio),
+        onSpeechEnd: (audio) => {
+          handleUtterance(audio);
+        },
         onMisfire: () => {
-          // We hard-stopped TTS on speech-start, so there's nothing to
-          // restore. A misfire just means no real question followed — return
-          // to ready and let the visitor speak again.
-          isListening.current = false;
-          if (isMounted.current) { setListening(false); setStatus('ready'); }
+          if (!isMounted.current) return;
+          if (isSpeaking.current) {
+            restoreSpeaking();
+          } else {
+            isListening.current = false;
+            setListening(false);
+            setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+          }
         },
       });
       micRef.current = mic;
-      // Leave the VAD running even if TTS is already playing (e.g. the
-      // greeting started before the mic finished initializing) — this lets
-      // the visitor barge in on the very first greeting too. Status stays
-      // whatever speak() already set ('speaking'); only set 'ready' when
-      // nothing is currently talking.
-      if (!isSpeaking.current) setStatus('ready');
+      if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     } catch (err) {
       console.error('[MIC] Error:', err);
-      if (!isSpeaking.current) setStatus('ready');
+      if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     }
-  }, [askingName, startWaveform, handleUtterance]);
-
-  // pause the mic while the name modal is open; the mount effect resumes it
-  useEffect(() => {
-    if (askingName) micRef.current?.pause();
-  }, [askingName]);
+  }, [startWaveform, handleUtterance, duckSpeaking, restoreSpeaking]);
 
   // release mic + VAD on unmount (session end)
   useEffect(() => () => {
     micRef.current?.destroy();
     micRef.current = null;
   }, []);
+
+  // auto-boot mic when component mounts
+  useEffect(() => {
+    startListening();
+  }, [startListening]);
 
   // if the visitor spoke while we were processing/speaking, handle it now
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -468,7 +473,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // as "did it hear me?" to the visitor. startListening() above may
       // have just set 'ready' synchronously; this runs right after and wins.
       setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
-      if (onDone) { try { onDone(); } catch (e) {} onDone = null; }
+      if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
     };
 
     const fireStart = () => {
@@ -481,7 +486,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // (still correct: it's the moment THIS voice actually starts talking).
     const browserSpeak = () => {
       fireStart();
-      if (onSentence) { try { onSentence(text, 0); } catch (e) {} }
+      if (onSentence) { try { onSentence(text, 0); } catch (e) { } }
       const utter = new SpeechSynthesisUtterance(text);
       utter.lang = 'en-US';
       utter.rate = 1.0;
@@ -555,7 +560,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // of firing immediately, so text and voice stay in lockstep.
         const announce = () => {
           fireStart();                                     // status + first-clip-only hook
-          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) {} }
+          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
           resolveStarted();
         };
         if (delayMs > 0) setTimeout(announce, delayMs);
@@ -643,11 +648,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, [startListening]);
 
   // Thin wrapper over speakStream for callers that don't need per-sentence
-  // sync (ack bubble, farewell, greeting, error fallback) — same (onStart,
-  // onDone) signature as before.
+  // sync (ack bubble, farewell, greeting, error fallback, name flow) — same
+  // (onStart, onDone) signature as before.
   const speak = useCallback((text, onStart, onDone) => (
     speakStream(text, { onStart, onDone })
   ), [speakStream]);
+
+  // Promise-returning wrapper: resolves once THIS utterance has fully
+  // finished playing. Pauses the mic during prompts to prevent speaker echo.
+  const speakAndWait = useCallback((text, onStart) => (
+    new Promise((resolve) => {
+      micRef.current?.pause();
+      speak(text, onStart, () => {
+        if (isMounted.current && micRef.current) {
+          micRef.current.resume();
+        }
+        resolve();
+      });
+    })
+  ), [speak]);
 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
@@ -656,6 +675,163 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
+
+    // ── Mid-session bare "change my name" prompt (no name given yet) ──────
+    // Explicit "change my name to X" / "call me X" patterns are handled by
+    // the backend _deterministic_route via /ask below — do NOT early-return
+    // for those, or save_interaction will be skipped and the DB won't log it.
+    const bareNameChange = /\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text)
+      || /\b(?:i want to|can i|can you|please|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text);
+
+    // Only fire the interactive prompt when NO name was provided inline
+    const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
+      || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
+
+    const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
+
+    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "Akshata, AKSHA, THA"):
+    if (!isQuestionText && !bareNameChange && (hasInlineName || visitorName === 'Guest' || visitorName === 'Unknown')) {
+      const candidateName = extractVisitorName(text);
+      if (candidateName && candidateName.split(' ').length <= 3 && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you)$/i.test(candidateName)) {
+        setLocalName(candidateName);
+        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(candidateName), { method: 'POST' }).catch(() => {});
+        const doneMsg = `Done! I have changed your name to ${candidateName}. How may I assist you today?`;
+        addMessage(doneMsg, 'kiosk');
+        speak(doneMsg);
+        return;
+      }
+    }
+
+    if (bareNameChange && !hasInlineName) {
+      // ── Step 1: Ask for the new name ────────────────────────────────────
+      const promptChange = 'Sure! What should I change your name to?';
+      addMessage(promptChange, 'kiosk');
+      await speakAndWait(promptChange);
+      const heardNewName = await captureUtteranceText(25000);
+
+      if (!heardNewName) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
+      }
+
+      addMessage(heardNewName, 'user');
+      let extracted = extractVisitorName(heardNewName) || heardNewName.trim();
+      extracted = extracted.replace(/[.!?]+$/, '').trim();
+      const cleanWords = extracted.split(/\s+/).filter(w =>
+        !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
+
+      if (cleanWords.length === 0) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
+      }
+
+      extracted = cleanWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+
+      // ── Step 2: Confirm with voice OR double-blink ───────────────────────
+      const confirmMsg = `Got it — should I call you ${extracted}? Say yes or blink twice to confirm, or say no to spell it out.`;
+      addMessage(confirmMsg, 'kiosk');
+      await speakAndWait(confirmMsg);
+      const confirmed = await captureYesNo(25000);
+
+      // Helper: apply the final name to DB + session
+      const applyName = async (finalName) => {
+        setLocalName(finalName);
+        await fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(finalName), { method: 'POST' }).catch(() => {});
+        const doneMsg = `Done! I have changed your name to ${finalName}. How may I assist you today?`;
+        addMessage(doneMsg, 'kiosk');
+        speak(doneMsg);
+      };
+
+      // ── Helper: letter-by-letter spelling mode ────────────────────────────
+      // Nova echoes each letter as it is heard so the visitor can track
+      // progress. Phonetic alphabet (alpha/bravo/charlie…) is also accepted.
+      const runSpellingMode = async () => {
+        const PHONETIC = {
+          alpha:'a', bravo:'b', charlie:'c', delta:'d', echo:'e', foxtrot:'f',
+          golf:'g', hotel:'h', india:'i', juliet:'j', kilo:'k', lima:'l',
+          mike:'m', november:'n', oscar:'o', papa:'p', quebec:'q', romeo:'r',
+          sierra:'s', tango:'t', uniform:'u', victor:'v', whiskey:'w',
+          xray:'x', 'x-ray':'x', yankee:'y', zulu:'z',
+        };
+        const spellPrompt = 'Sure! Please spell out your name — say each letter one at a time. Say "done" when you are finished.';
+        addMessage(spellPrompt, 'kiosk');
+        await speakAndWait(spellPrompt);
+
+        let spelled = '';
+        let attempts = 0;
+        while (attempts < 25) {
+          const letter = await captureUtteranceText(7000);
+          if (!letter) break;
+
+          const t = letter.trim().toLowerCase();
+          // Finish words
+          if (/^(done|finish|finished|that.?s it|stop|end|complete|that.?s all|ok done)$/i.test(t)) break;
+
+          let ch = '';
+          if (t.length === 1 && /[a-z]/.test(t)) {
+            ch = t.toUpperCase();
+          } else if (PHONETIC[t]) {
+            ch = PHONETIC[t].toUpperCase();
+          } else if (/^[a-z]\s/i.test(t)) {
+            // e.g. STT returns "P." or "P " for a single letter
+            ch = t[0].toUpperCase();
+          }
+
+          if (ch) {
+            spelled += ch;
+            const soFar = spelled.split('').join('-');
+            const echoMsg = `${ch}. So far: ${soFar}`;
+            addMessage(echoMsg, 'kiosk');
+            speak(echoMsg);
+          } else {
+            // Unrecognised syllable — ask them to repeat
+            const retryMsg = "Sorry, I did not catch that letter. Please say it again.";
+            addMessage(retryMsg, 'kiosk');
+            speak(retryMsg);
+          }
+          attempts++;
+        }
+
+        if (spelled.length === 0) return;
+
+        // Capitalise first letter, rest lowercase
+        const spelledName = spelled.charAt(0).toUpperCase() + spelled.slice(1).toLowerCase();
+
+        // Final confirmation after spelling
+        const spelledConfirmMsg = `I have ${spelledName}. Is that correct? Say yes or blink twice.`;
+        addMessage(spelledConfirmMsg, 'kiosk');
+        await speakAndWait(spelledConfirmMsg);
+        const spelledOk = await captureYesNo(12000);
+
+        if (spelledOk !== false) {
+          // Accept on yes, double-blink, or timeout (visitor stayed silent)
+          await applyName(spelledName);
+        } else {
+          const giveUpMsg = 'No problem — I will keep your name as it is for now. You can try again anytime.';
+          addMessage(giveUpMsg, 'kiosk');
+          speak(giveUpMsg);
+        }
+      };
+
+      if (confirmed === true) {
+        // Voice "yes" or double-blink confirmed
+        await applyName(extracted);
+      } else if (
+        confirmed === false ||
+        (typeof confirmed === 'string' && /\b(no|nope|wrong|spell|spelling|incorrect|not right)\b/i.test(confirmed))
+      ) {
+        // User said no / "spell it" — enter spelling mode
+        await runSpellingMode();
+      } else {
+        // captureYesNo timed out (null) — accept the heard name
+        await applyName(extracted);
+      }
+      return;
+    }
 
     const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
     if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
@@ -675,8 +851,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // keeps the session_end handler from stopping it. We clear the flag
       // when the voice actually finishes.
       speak(farewell, null, () => { farewellPlayingRef.current = false; });
-      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => {});
-      window.dispatchEvent(new Event('vrk-session-ended'));   // goodbye screen appears now
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => { });
+      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell, userName: localName || session?.user_name } }));   // goodbye screen appears now
       return;
     }
 
@@ -698,12 +874,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       'Of course, just a second.',
       'Right, let me find that.',
     ];
-    if (text.split(' ').length >= 3) {
+    const isInstantCmd = hasInlineName || bareNameChange ||
+      /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+
+    if (!isInstantCmd && text.split(' ').length >= 3) {
       const ack = acks[Math.floor(Math.random() * acks.length)];
-      // Show it as a transient indicator bubble too — otherwise the visitor
-      // sees nothing at all while the real answer is being fetched, which
-      // is exactly the "left confused, feels frozen" problem.
       speak(ack, () => setProcessingHint(ack));
+    } else {
+      setProcessingHint('Thinking...');
+      statusRef.current = 'processing';
+      setStatus('processing');
     }
 
     // 35 s hard cap — prevents status getting stuck at 'processing' if the
@@ -768,70 +948,439 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [session, addMessage, speakStream, startProgressiveMessage]);
 
-  useEffect(() => {
-    if (askingName) return;
-    const t = setTimeout(startListening, 500);
-    return () => clearTimeout(t);
-  }, [askingName, startListening]);
-
-  // ── Kiosk opens the conversation ────────────────────────────────────────
-  // When a visitor is detected (session starts) and the name flow is done,
-  // the kiosk speaks the greeting first — the visitor never has to start.
-  const greetedRef = useRef(null);
-  const lastGreetRef = useRef({ text: '', ts: 0 });
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => {
-    if (askingName) return;
-    const sid = session?.session_id;
-    // Day-2 resume reuses the SAME session_id, so key the guard on the
-    // visit instant too — otherwise a resumed visitor is never greeted.
-    const visitKey = sid ? sid + '|' + (session?.resumed_at || '') : null;
-    if (!visitKey || greetedRef.current === visitKey) return;
-    greetedRef.current = visitKey;
-
-    // Even if the session id churns (detection re-firing), never repeat
-    // the same greeting within 20s — kills the double "welcome back"
-    const now = Date.now();
-    if (lastGreetRef.current.text === greeting && now - lastGreetRef.current.ts < 20000) return;
-    lastGreetRef.current = { text: greeting, ts: now };
-
-    // Fire the greeting as SOON as the session/window is active — no
-    // artificial delay. The first-visit line is pre-cached server-side at
-    // startup (see tts.py _PREWARM), so this plays near-instantly without
-    // needing a client-side pre-warm round-trip first.
-    if (isSpeaking.current) return;       // something else already talking
-
-    if (!isReturning) {
-      // NEW VISITOR: this greeting is explicitly non-interruptible and
-      // fires exactly once (guarded by visitKey above).
-      greetingPlayingRef.current = true;
-      speak(greeting, () => addMessage(greeting, 'kiosk'), () => {
-        greetingPlayingRef.current = false;
-      });
-    } else {
-      // Returning-visitor greeting keeps normal barge-in behavior.
-      speak(greeting, () => addMessage(greeting, 'kiosk'));
+  // ── Helper parsing for name & guest choices ──
+  const extractVisitorName = useCallback((raw) => {
+    if (!raw) return '';
+    let s = raw.trim();
+    s = s.replace(/^(?:hi|hello|hey|nova|please|ok|okay)?[\s,.]*(?:my name is|i am called|call me|myself|i am|im|it's|its|this is)\s+/i, '');
+    s = s.replace(/^(?:hi|hello|hey|nova|please)[\s,.]+/i, '');
+    s = s.replace(/[.!?]+$/, '').trim();
+    if (!s) return '';
+    if (s.includes(',')) {
+      const firstPart = s.split(',')[0].trim();
+      if (firstPart && /^[a-zA-Z\s]+$/.test(firstPart)) {
+        s = firstPart;
+      }
     }
-  }, [session?.session_id, session?.resumed_at, askingName]);
+    const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
+    if (words.length === 0) return '';
+    return words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+  }, []);
 
-  const handleSubmitName = async (overrideName, overrideSave) => {
-    const finalName = (overrideName ?? name).trim() || 'Guest';
-    const finalSave = overrideSave ?? saveData;
-    setSubmitted(true);
+  // ── Double Blink Listener for Yes/Confirm ──────────────────────────────
+  const prevDoubleBlinkRef = useRef(0);
+  useEffect(() => {
+    if (doubleBlink && doubleBlink !== prevDoubleBlinkRef.current) {
+      prevDoubleBlinkRef.current = doubleBlink;
+      console.log('[BLINK] Double blink detected!');
+      if (activePromptResolverRef.current) {
+        const resolver = activePromptResolverRef.current;
+        activePromptResolverRef.current = null;
+        if (isMounted.current) {
+          setLiveText('👁️ [Double blink detected — Yes]');
+        }
+        statusRef.current = 'ready';
+        setStatus('ready');
+        resolver('👁️ [Blinked twice — Yes]');
+      }
+    }
+  }, [doubleBlink]);
+
+  const wantsToGiveName = useCallback((text) => {
+    if (!text) return false;
+    return /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will|blink|blinked)\b/i.test(text)
+      || text.includes('👁️') || text.toLowerCase().includes('blink');
+  }, []);
+
+  const isGuestOption = useCallback((text) => {
+    if (!text) return false;
+    return /\b(guest|guest mode|continue as guest|as guest|no name|anonymous|just guest)\b/i.test(text);
+  }, []);
+
+  const isContinueOption = useCallback((text) => {
+    if (!text) return false;
+    return /\b(skip|dont want|neither|no thanks|continue|just continue|start|just start|proceed|dont give)\b/i.test(text);
+  }, []);
+
+  // ── Voice prompt capture helpers (uses single persistent mic) ──────────
+  const captureUtteranceText = useCallback((timeoutMs = 25000) => {
+    return new Promise((resolve) => {
+      let timer = null;
+      const resolver = (text) => {
+        if (timer) clearTimeout(timer);
+        resolve((text || '').trim());
+      };
+      const checkTimeout = () => {
+        // If user is currently speaking or audio is being transcribed (Whisper STT), keep waiting!
+        if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
+          timer = setTimeout(checkTimeout, 3000);
+          return;
+        }
+        if (activePromptResolverRef.current === resolver) {
+          activePromptResolverRef.current = null;
+        }
+        resolve('');
+      };
+      timer = setTimeout(checkTimeout, timeoutMs);
+
+      activePromptResolverRef.current = resolver;
+      if (micRef.current) {
+        micRef.current.resume();
+      }
+      setStatus('ready');
+    });
+  }, []);
+
+  // Waits for a spoken "yes"/"no" response, double blink, or direct correction
+  const captureYesNo = useCallback((timeoutMs = 25000) => {
+    return new Promise((resolve) => {
+      let timer = null;
+      const resolver = (rawText) => {
+        if (timer) clearTimeout(timer);
+        const heard = (rawText || '').trim().toLowerCase();
+        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|blink|blinked)\b/i.test(heard) || heard.includes('👁️')) {
+          resolve(true);
+        } else if (/\b(no|nope|nah|wrong|incorrect|not right|not that|different|change)\b/i.test(heard) || /don.?t/i.test(heard)) {
+          resolve(false);
+        } else if (rawText && rawText.trim().length > 0) {
+          resolve(rawText.trim());
+        } else {
+          resolve(null);
+        }
+      };
+      const checkTimeout = () => {
+        // If user is currently speaking or audio is being transcribed, keep waiting!
+        if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
+          timer = setTimeout(checkTimeout, 3000);
+          return;
+        }
+        if (activePromptResolverRef.current === resolver) {
+          activePromptResolverRef.current = null;
+        }
+        resolve(null);
+      };
+      timer = setTimeout(checkTimeout, timeoutMs);
+
+      activePromptResolverRef.current = resolver;
+      if (micRef.current) {
+        micRef.current.resume();
+      }
+      setStatus('ready');
+    });
+  }, []);
+
+  const submitVoiceName = useCallback(async (finalName, save) => {
     try {
-      await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) + '&save=' + finalSave, { method: 'POST' });
-    } catch (e) { console.error(e); }
-  };
+      await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) +
+        '&save=' + save, { method: 'POST' });
+    } catch (e) { console.error('[NAME FLOW] submit failed', e); }
+    if (isMounted.current) setNameStage('done');
+  }, []);
+
+  // ── Integrated Conversation Start Flow (Voice + Double-Blink: Yes / No / Guest / Name) ──
+  const greetedRef = useRef(null);
+  const flowRunningRef = useRef(false);
+  const [celebrate, setCelebrate] = useState(false);
+
+  const runSessionStartFlow = useCallback(async () => {
+    const sid = session?.session_id || 'active_session';
+    if (greetedRef.current === sid || flowRunningRef.current) return;
+    greetedRef.current = sid;
+    flowRunningRef.current = true;
+
+    const myRun = ++nameFlowIdRef.current;
+    const stillCurrent = () => nameFlowIdRef.current === myRun && isMounted.current;
+
+    try {
+      const isKnownNamedVisitor = (visitorName && visitorName !== 'Guest' && visitorName !== 'Unknown' && visitorName !== 'Friend')
+        || (session?.user_name && session.user_name !== 'Guest' && session.user_name !== 'Unknown' && session.user_name !== 'Friend');
+      if (isKnownNamedVisitor) {
+        // Visitor already has a known/changed name: greet immediately and start listening for questions
+        const nameToUse = (visitorName && visitorName !== 'Guest' && visitorName !== 'Unknown') ? visitorName : session?.user_name;
+        const greetMsg = greeting || `Welcome back, ${nameToUse}! How may I assist you today?`;
+        addMessage(greetMsg, 'kiosk');
+        await speakAndWait(greetMsg);
+        if (stillCurrent()) startListening();
+        return;
+      }
+
+      // First time or guest visitor: celebrate burst + single unified welcome & name prompt
+      setCelebrate(true);
+      setTimeout(() => setCelebrate(false), 2400);
+
+      while (stillCurrent()) {
+        setNameStage('asking');
+        const askChatMsg = 'Welcome to RNS Institute of Technology! I am Nova, your digital receptionist.\n\nWould you like to give your name or continue as guest?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to give your name\n• 🗣️ Say "Guest" to continue as Guest';
+        const askSpokenMsg = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. Would you like to give your name, or continue as guest? You can say yes or blink twice to give your name, or say guest to continue as guest.';
+        addMessage(askChatMsg, 'kiosk');
+        await speakAndWait(askSpokenMsg);
+        if (!stillCurrent()) return;
+
+        setNameStage('listening_name');
+        const heard = await captureUtteranceText(5000);
+        if (!stillCurrent()) return;
+
+        let choseGiveName = false;
+        let directNameProvided = null;
+
+        if (heard) {
+          addMessage(heard, 'user');
+
+          if (wantsToGiveName(heard)) {
+            // User affirmed verbally or with double-blink: e.g. "Yes", "👁️ [Blinked twice — Yes]"
+            choseGiveName = true;
+          } else if (isGuestOption(heard)) {
+            // User chose Guest verbally
+            const guestMsg = 'Continuing as Guest! How may I assist you today?';
+            addMessage(guestMsg, 'kiosk');
+            setLocalName('Guest');
+            await submitVoiceName('Guest', false);
+            await speakAndWait(guestMsg);
+            if (stillCurrent()) startListening();
+            break;
+          } else if (isContinueOption(heard)) {
+            // User chose skip/continue
+            const contMsg = "Sure, let's continue! How may I assist you today?";
+            addMessage(contMsg, 'kiosk');
+            setLocalName('Guest');
+            await submitVoiceName('Guest', false);
+            await speakAndWait(contMsg);
+            if (stillCurrent()) startListening();
+            break;
+          } else {
+            // Check if user spoke a campus question directly
+            const cleanNameCandidate = extractVisitorName(heard);
+            const isQuestion = heard.includes('?') || heard.split(' ').length >= 4 ||
+              /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod)\b/i.test(heard);
+
+            if (isQuestion && !cleanNameCandidate) {
+              setLocalName('Guest');
+              await submitVoiceName('Guest', false);
+              sendToBackend(heard);
+              break;
+            }
+
+            // User directly provided their name: e.g. "Rahul", "Akshatha", "My name is John"
+            directNameProvided = cleanNameCandidate || heard.trim();
+          }
+        } else {
+          // Timeout — check if anyone is still in front of the camera before
+          // defaulting to Guest. If the person walked away while we were
+          // waiting, silently abort rather than creating a phantom session.
+          const stateNow = detStateRef.current;
+          if (stateNow === 'IDLE' || stateNow === 'COOLDOWN') {
+            // Nobody there — abort the flow entirely
+            break;
+          }
+          const noAnsMsg = 'Continuing as Guest! How may I assist you today?';
+          addMessage(noAnsMsg, 'kiosk');
+          setLocalName('Guest');
+          await submitVoiceName('Guest', false);
+          await speakAndWait(noAnsMsg);
+          if (stillCurrent()) startListening();
+          break;
+        }
+
+        // If user indicated they want to give their name (or direct name not provided yet)
+        let finalName = directNameProvided;
+        if (choseGiveName && !finalName) {
+          setNameStage('asking');
+          const askNamePrompt = 'Great! What is your name?';
+          addMessage(askNamePrompt, 'kiosk');
+          await speakAndWait(askNamePrompt);
+          if (!stillCurrent()) return;
+
+          setNameStage('listening_name');
+          const heardSpokenName = await captureUtteranceText(25000);
+          if (!stillCurrent()) return;
+
+          if (heardSpokenName) {
+            addMessage(heardSpokenName, 'user');
+            finalName = extractVisitorName(heardSpokenName) || heardSpokenName.trim();
+          } else {
+            // Ask once more if missed
+            const askRetry = "Could you please say your name?";
+            addMessage(askRetry, 'kiosk');
+            await speakAndWait(askRetry);
+            if (!stillCurrent()) return;
+
+            const retrySpoken = await captureUtteranceText(25000);
+            if (retrySpoken) {
+              addMessage(retrySpoken, 'user');
+              finalName = extractVisitorName(retrySpoken) || retrySpoken.trim();
+            } else {
+              finalName = 'Friend';
+            }
+          }
+        }
+
+        if (!finalName) finalName = 'Friend';
+
+        // 3. Confirm name with voice ("Yes" / "No") or double blink ("Yes")
+        setNameStage('confirming');
+        const confirmChatMsg = `I heard ${finalName}. Is that correct?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to confirm\n• 🗣️ Say "No" to change it`;
+        const confirmSpokenMsg = `I heard ${finalName}. Is that correct? Say yes or blink twice to confirm, or say no to change it.`;
+        addMessage(confirmChatMsg, 'kiosk');
+        await speakAndWait(confirmSpokenMsg);
+        if (!stillCurrent()) return;
+
+        setNameStage('listening_confirm');
+        const confirmed = await captureYesNo(25000);
+        if (!stillCurrent()) return;
+
+        if (confirmed === true) {
+          setNameStage('saving');
+          const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
+          addMessage(greetNamed, 'kiosk');
+          setLocalName(finalName);
+          await submitVoiceName(finalName, true);
+          await speakAndWait(greetNamed);
+          if (stillCurrent()) startListening();
+          break;
+        } else if (confirmed === false || (typeof confirmed === 'string' && confirmed.length > 0)) {
+          let correctedName = '';
+          if (typeof confirmed === 'string' && confirmed.length > 0 && !/\b(no|nope|nah|wrong|change|not)\b/i.test(confirmed)) {
+            correctedName = extractVisitorName(confirmed) || confirmed.trim();
+          } else {
+            setNameStage('asking');
+            const retryMsg = "My apologies! What should I change your name to?";
+            addMessage(retryMsg, 'kiosk');
+            await speakAndWait(retryMsg);
+            if (!stillCurrent()) return;
+
+            setNameStage('listening_name');
+            const retrySpokenName = await captureUtteranceText(25000);
+            if (!stillCurrent()) return;
+
+            correctedName = extractVisitorName(retrySpokenName) || retrySpokenName || finalName;
+          }
+
+          setNameStage('saving');
+          const changedMsg = `Done! Your name has been changed to ${correctedName}. How may I assist you today?`;
+          addMessage(changedMsg, 'kiosk');
+          setLocalName(correctedName);
+          await submitVoiceName(correctedName, true);
+          await speakAndWait(changedMsg);
+          if (stillCurrent()) startListening();
+          break;
+        }
+
+        // If captureYesNo timed out — check face presence before assuming name is confirmed
+        const stateAtTimeout = detStateRef.current;
+        if (stateAtTimeout === 'IDLE' || stateAtTimeout === 'COOLDOWN') {
+          // Nobody in front anymore — abort silently
+          break;
+        }
+        setNameStage('saving');
+        const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
+        addMessage(greetNamed, 'kiosk');
+        setLocalName(finalName);
+        await submitVoiceName(finalName, true);
+        await speakAndWait(greetNamed);
+        if (stillCurrent()) startListening();
+        break;
+      }
+    } finally {
+      flowRunningRef.current = false;
+    }
+  }, [session, isReturning, greeting, extractVisitorName, wantsToGiveName, isGuestOption, isContinueOption, captureUtteranceText, captureYesNo, submitVoiceName, speakAndWait, addMessage, sendToBackend, startListening]);
+
+  useEffect(() => {
+    runSessionStartFlow();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session?.session_id]);
+
+  // ── Backend event WebSocket — server-pushed session_end & are_you_there ──
+  const handleDepartureCheck = useCallback(async (targetName) => {
+    if (handlingDepartureRef.current || farewellPlayingRef.current) return;
+    handlingDepartureRef.current = true;
+    const name = targetName || localName || session?.user_name || 'there';
+    const promptText = (name !== 'there' && name !== 'Guest' && name !== 'Unknown' && name !== '')
+      ? `Are you there, ${name}?`
+      : 'Are you there?';
+
+    try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) { }
+
+    // Show the prompt in the chat UI too
+    addMessage(promptText, 'kiosk');
+    await speakAndWait(promptText);
+
+    // Listen for up to 9 seconds for a response
+    const heardAnswer = await captureUtteranceText(9000);
+
+    // Face is genuinely BACK only if detection says ACTIVE — DEPARTING means
+    // they are STILL gone (camera hasn't seen them yet). DWELLING/RECOGNIZING
+    // means someone stepped in front but we don't yet know who — also count that.
+    const faceBack = detStateRef.current === 'ACTIVE'
+      || detStateRef.current === 'DWELLING'
+      || detStateRef.current === 'RECOGNIZING';
+
+    // Require an EXPLICIT confirmation word — do NOT treat random noise / empty
+    // transcription as "yes". Background noise often produces short garbage text
+    // (1-2 chars) which was incorrectly triggering "Glad you're still here"
+    // even when the visitor had already left.
+    const heardYes = /\b(yes|yeah|yep|yup|here|i'm here|im here|i am here|present|hi|hello|hey|stay|i am|nova|what)\b/i.test(heardAnswer || '');
+
+    if (faceBack || heardYes) {
+      handlingDepartureRef.current = false;
+      // Only say "glad you're still here" if the face is ACTUALLY back, not
+      // just because we heard something ambiguous.
+      if (faceBack) {
+        const gladText = "Great! Glad you're still here.";
+        addMessage(gladText, 'kiosk');
+        speak(gladText);
+      }
+      startListening();
+    } else {
+      // Face is still gone AND no clear verbal response — say goodbye
+      const farewellText = (name !== 'there' && name !== 'Guest' && name !== 'Unknown' && name !== '')
+        ? `Goodbye, ${name}! Have a wonderful day.`
+        : 'Goodbye! Have a wonderful day.';
+      addMessage(farewellText, 'kiosk');
+      farewellPlayingRef.current = true;
+      speak(farewellText, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + (session?.session_id || ''), { method: 'POST' }).catch(() => { });
+      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: farewellText, userName: localName || session?.user_name } }));
+      handlingDepartureRef.current = false;
+    }
+  }, [session, localName, speak, speakAndWait, captureUtteranceText, addMessage, startListening]);
 
 
+  useEffect(() => {
+    const WS = BACKEND.replace(/^http/, 'ws');
+    let ws;
+    let dead = false;
+    function connect() {
+      if (dead) return;
+      ws = new WebSocket(WS + '/ws');
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'session_end') {
+            if (!farewellPlayingRef.current) {
+              try { interruptSpeakingRef.current && interruptSpeakingRef.current(); } catch (_) { }
+              pendingUtteranceRef.current = null;
+            }
+            window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell: '', userName: localName || session?.user_name } }));
+          } else if (msg.type === 'are_you_there') {
+            handleDepartureCheck(msg.user_name);
+          } else if (msg.type === 'session_update' && msg.user_name) {
+            // Backend confirmed a name change (e.g. via _deterministic_route in /ask).
+            // Sync localName so farewell + departure messages use the real name.
+            const updatedName = msg.user_name;
+            if (updatedName && updatedName !== 'Guest' && updatedName !== 'Unknown') {
+              setLocalName(updatedName);
+            }
+          }
+        } catch (_) { }
+      };
+      ws.onclose = () => { if (!dead) setTimeout(connect, 3000); };
+    }
+    connect();
+    return () => { dead = true; ws?.close(); };
+  }, [handleDepartureCheck]);
 
-  const inputStyle = {
-    width: '100%', padding: '12px 16px', border: '1.5px solid #c5cae9',
-    borderRadius: '8px', fontSize: '15px', boxSizing: 'border-box',
-    outline: 'none', color: '#1a237e', background: '#f8f9ff', transition: 'border 0.2s'
-  };
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
-  const btnSecondary = { padding: '11px 24px', border: '1.5px solid #c5cae9', borderRadius: '8px', background: '#fff', color: '#555', cursor: 'pointer', fontSize: '14px' };
 
   /* ── ANIMATED NOVA CHARACTER ─────────────────────────────────────────── */
   const NovaCharacter = ({ st }) => (
@@ -1014,53 +1563,53 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               <div style={{ width: '44px', height: '44px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
                 <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2">
                   <path d="M12 2 4 6v6c0 5 3.5 9 8 10 4.5-1 8-5 8-10V6l-8-4z" />
-                      <path d="M9 12l2 2 4-4" />
-                    </svg>
-                  </div>
+                  <path d="M9 12l2 2 4-4" />
+                </svg>
+              </div>
+              <div>
+                <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
+                <div style={{ fontSize: '12px', color: '#999' }}>How Nova sees and remembers you</div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+              {[
+                {
+                  icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
+                  title: 'The camera is only used to greet you',
+                  body: 'The kiosk camera looks for a face so Nova knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
+                },
+                {
+                  icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
+                  title: 'Face data is saved only if you say yes',
+                  body: 'When Nova asks for your name, she also asks — out loud — whether you\'d like to be remembered for next time. Say yes and your name and face are stored so Nova can greet you by name next time. Say no, or continue as a guest, and nothing is saved.'
+                },
+                {
+                  icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
+                  title: 'Conversations are used only to help you',
+                  body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\'t used for advertising or shared outside the institute.'
+                },
+                {
+                  icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
+                  title: 'Your session ends automatically',
+                  body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
+                },
+              ].map((item, i) => (
+                <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
+                    {item.icon}
+                  </svg>
                   <div>
-                    <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Your Privacy at this Kiosk</div>
-                    <div style={{ fontSize: '12px', color: '#999' }}>How Nova sees and remembers you</div>
+                    <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
+                    <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
                   </div>
                 </div>
+              ))}
+            </div>
 
-                <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
-                  {[
-                    {
-                      icon: <path d="M23 7l-7 5 7 5V7zM1 5h15v14H1z" />,
-                      title: 'The camera is only used to greet you',
-                      body: 'The kiosk camera looks for a face so Nova knows a visitor has arrived and can recognise returning visitors. It is not recorded or streamed anywhere.'
-                    },
-                    {
-                      icon: <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2M12 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8z" />,
-                      title: 'Face data is saved only if you say yes',
-                      body: 'When you\'re asked for your name, the "Remember me for next visit" toggle is your choice. If you leave it on, your name and face are stored so Nova can greet you by name next time. If you turn it off or continue as guest, nothing is saved.'
-                    },
-                    {
-                      icon: <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />,
-                      title: 'Conversations are used only to help you',
-                      body: 'What you say is used to answer your questions during this visit and briefly shown on screen. It isn\'t used for advertising or shared outside the institute.'
-                    },
-                    {
-                      icon: <path d="M12 8v4l3 3M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" />,
-                      title: 'Your session ends automatically',
-                      body: 'After you say goodbye or step away, the session closes and live conversation data is cleared from the screen.'
-                    },
-                  ].map((item, i) => (
-                    <div key={i} style={{ display: 'flex', gap: '12px', alignItems: 'flex-start' }}>
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#5c6bc0" strokeWidth="2" style={{ flexShrink: 0, marginTop: '2px' }}>
-                        {item.icon}
-                      </svg>
-                      <div>
-                        <div style={{ fontSize: '13.5px', fontWeight: '700', color: '#333' }}>{item.title}</div>
-                        <div style={{ fontSize: '12.5px', color: '#777', lineHeight: '1.55', marginTop: '2px' }}>{item.body}</div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-
-                <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-                  Questions about your data? Speak to a staff member at the Admin Block.
-                </p>
+            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
+              Questions about your data? Speak to a staff member at the Admin Block.
+            </p>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
               <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
@@ -1069,57 +1618,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       )}
 
-      {askingName && !privacyOpen && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-          <div style={{ background: '#fff', borderRadius: '20px', padding: '40px', width: '440px', boxShadow: '0 24px 64px rgba(0,0,0,0.22)' }}>
-            {submitted ? (
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ width: '64px', height: '64px', borderRadius: '50%', background: '#e8eaf6', display: 'flex', alignItems: 'center', justifyContent: 'center', margin: '0 auto 16px' }}>
-                  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#1a237e" strokeWidth="2.5"><polyline points="20 6 9 17 4 12" /></svg>
-                </div>
-                <div style={{ fontSize: '20px', fontWeight: '700', color: '#1a237e' }}>
-                  {saveData ? 'Welcome, ' + (name || 'Guest') + '!' : 'Welcome, Guest!'}
-                </div>
-                <p style={{ color: '#666', marginTop: '10px', fontSize: '14px', lineHeight: '1.6' }}>
-                  {saveData ? "Your face is registered. We'll recognise you next time." : 'Visiting as a guest — no data saved.'}
-                </p>
-              </div>
-            ) : (<>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '14px', marginBottom: '20px' }}>
-                <svg viewBox="0 0 80 80" width="56" height="56" style={{ flexShrink: 0 }}>
-                  <circle cx="40" cy="40" r="40" fill="url(#suitG2)" />
-                  <defs><linearGradient id="suitG2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" /></linearGradient></defs>
-                  <circle cx="40" cy="30" r="14" fill="#FFCFA0" />
-                  <path d="M12 72 Q12 54 40 54 Q68 54 68 72" fill="#FFCFA0" />
-                </svg>
-                <div>
-                  <div style={{ fontSize: '18px', fontWeight: '700', color: '#1a237e' }}>Hi! I&apos;m Nova 👋</div>
-                  <div style={{ fontSize: '13px', color: '#888' }}>I don&apos;t recognise you yet — what&apos;s your name?</div>
-                </div>
-              </div>
-              <div style={{ marginBottom: '16px' }}>
-                <label style={{ fontSize: '13px', fontWeight: '600', color: '#444', display: 'block', marginBottom: '6px' }}>Your Full Name</label>
-                <input ref={inputRef} style={inputStyle} placeholder="e.g. Akshatha A" value={name} onChange={e => setName(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleSubmitName()} autoFocus />
-              </div>
-              <div style={{ background: '#f8f9ff', border: '1.5px solid #e8eaf6', borderRadius: '10px', padding: '14px 16px', marginBottom: '20px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                  <div>
-                    <div style={{ fontSize: '13px', fontWeight: '600', color: '#333' }}>Remember me for next visit</div>
-                    <div style={{ fontSize: '12px', color: '#999', marginTop: '2px' }}>{saveData ? 'Face saved securely' : 'No data stored'}</div>
-                  </div>
-                  <div onClick={() => setSaveData(s => !s)} style={{ width: '48px', height: '26px', borderRadius: '13px', background: saveData ? '#1a237e' : '#ddd', cursor: 'pointer', position: 'relative', transition: 'background 0.25s', flexShrink: 0 }}>
-                    <div style={{ position: 'absolute', top: '3px', left: saveData ? '25px' : '3px', width: '20px', height: '20px', borderRadius: '50%', background: '#fff', transition: 'left 0.25s', boxShadow: '0 1px 4px rgba(0,0,0,0.2)' }} />
-                  </div>
-                </div>
-              </div>
-              <div style={{ display: 'flex', gap: '10px' }}>
-                <button onClick={() => handleSubmitName('Guest', false)} style={{ ...btnSecondary, flex: 1 }}>Continue as Guest</button>
-                <button onClick={() => handleSubmitName()} style={{ ...btnPrimary, flex: 1 }}>{saveData ? 'Register & Continue' : 'Continue'}</button>
-              </div>
-            </>)}
-          </div>
-        </div>
-      )}
+
 
       {/* ── SLIM HEADER ── */}
       <header style={{
@@ -1142,10 +1641,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
             </div>
           </div>
-          <button onClick={() => setPrivacyOpen(o => !o)}
-            style={{ background: 'rgba(255,255,255,0.12)', border: '1px solid rgba(255,255,255,0.2)', color: 'rgba(255,255,255,0.8)', borderRadius: '7px', padding: '6px 12px', fontSize: '12px', cursor: 'pointer', fontWeight: '600' }}>
-            🔒 Privacy
-          </button>
         </div>
       </header>
 
@@ -1166,6 +1661,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             width: '320px', height: '320px', borderRadius: '50%',
             background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
           }} />
+
+          {/* ── happy-moment sparkle burst: first-time-visitor greeting only ── */}
+          {celebrate && (
+            <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 2 }}>
+              {['10%', '25%', '75%', '88%', '45%', '60%'].map((left, i) => (
+                <span key={i} className="sparkle-burst" style={{
+                  position: 'absolute', left, top: `${30 + (i % 3) * 12}%`,
+                  fontSize: `${14 + (i % 3) * 6}px`, animationDelay: `${i * 0.12}s`,
+                }}>✨</span>
+              ))}
+            </div>
+          )}
 
           {/* ── Nova SVG character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
@@ -1274,52 +1781,53 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               );
             })}
 
-              {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
+            {/* FOLLOW-UP CHIPS: shown after the kiosk's most recent reply,
                   while idle (not mid-question). Turns "answer machine" into
                   something that keeps the conversation moving — tapping a
                   chip routes through the SAME sendToBackend() pipeline as a
                   spoken question, so it inherits every existing guard
                   (barge-in, stale-answer checks, goodbye handling) for free. */}
-              {status === 'ready' && !processingHint && !liveText &&
-                messages.length > 0 && messages[messages.length - 1].speaker === 'kiosk' && (
-                <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', paddingLeft: '4px', marginTop: '2px' }}>
-                  <button
-                    onClick={() => sendToBackend('Anything else you can help with?')}
-                    style={{ padding: '9px 18px', background: '#fff', border: '1.5px solid #c7cbe8',
-                             borderRadius: '20px', fontSize: '14px', fontWeight: '600', color: '#3c4370',
-                             cursor: 'pointer', boxShadow: '0 2px 6px rgba(26,35,126,0.05)' }}>
-                    Ask something else
-                  </button>
-                  <button
-                    onClick={() => sendToBackend('That is all, thank you')}
-                    style={{ padding: '9px 18px', background: '#fff', border: '1.5px solid #c7cbe8',
-                             borderRadius: '20px', fontSize: '14px', fontWeight: '600', color: '#3c4370',
-                             cursor: 'pointer', boxShadow: '0 2px 6px rgba(26,35,126,0.05)' }}>
-                    That's all, thanks
-                  </button>
+            {/* Hands-free voice prompt hints (0% clicking required) */}
+            {status === 'ready' && !processingHint && !liveText &&
+              messages.length > 0 && messages[messages.length - 1].speaker === 'kiosk' && (
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', paddingLeft: '4px', marginTop: '4px' }}>
+                  <div style={{
+                    padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
+                    borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370'
+                  }}>
+                    💬 Try saying: "Ask something else"
+                  </div>
+                  <div style={{
+                    padding: '6px 14px', background: '#eef2ff', border: '1px solid #c7cbe8',
+                    borderRadius: '16px', fontSize: '12px', fontWeight: '600', color: '#3c4370'
+                  }}>
+                    💬 Or say: "That's all, thanks"
+                  </div>
                 </div>
               )}
 
-              {processingHint && !liveText && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: '4px', fontWeight: '500' }}>
-                    RNSIT Kiosk &nbsp;·&nbsp; thinking
-                  </div>
-                  <div style={{ maxWidth: '60%', padding: '13px 18px', borderRadius: '4px 18px 18px 18px',
-                                background: '#f3f2fb', color: '#6a6f8c', fontSize: '15.5px', fontStyle: 'italic',
-                                lineHeight: '1.6', border: '1.5px dashed #d8d6ea' }}>
-                    {processingHint}
-                  </div>
+            {processingHint && !liveText && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start' }}>
+                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingLeft: '4px', fontWeight: '500' }}>
+                  RNSIT Kiosk &nbsp;·&nbsp; thinking
                 </div>
-              )}
-              {liveText && (
-                <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
-                  <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
-                  <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
-                    {liveText}
-                  </div>
+                <div style={{
+                  maxWidth: '60%', padding: '13px 18px', borderRadius: '4px 18px 18px 18px',
+                  background: '#f3f2fb', color: '#6a6f8c', fontSize: '15.5px', fontStyle: 'italic',
+                  lineHeight: '1.6', border: '1.5px dashed #d8d6ea'
+                }}>
+                  {processingHint}
                 </div>
-              )}
+              </div>
+            )}
+            {liveText && (
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', marginTop: '8px' }}>
+                <div style={{ fontSize: '11px', color: '#bbb', marginBottom: '4px', paddingRight: '4px' }}>{visitorName} (speaking...)</div>
+                <div style={{ maxWidth: '60%', padding: '14px 18px', borderRadius: '18px 4px 18px 18px', background: '#e8eaf6', color: '#1a237e', fontSize: '16px', fontStyle: 'italic', lineHeight: '1.65', border: '1.5px solid #c5cae9' }}>
+                  {liveText}
+                </div>
+              </div>
+            )}
           </div>
 
           {/* voice footer */}
@@ -1391,6 +1899,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         .td { display:inline-block; width:7px; height:7px; border-radius:50%; background:#c5cae9;
               animation:tdBounce 1.1s ease-in-out infinite; animation-delay:var(--d); }
         @keyframes tdBounce { 0%,60%,100%{transform:translateY(0);background:#c5cae9} 30%{transform:translateY(-6px);background:#7e57c2} }
+
+        /* ── name-flow listening pulse (small dot in the voice-name card) ── */
+        .name-flow-pulse { animation: nfPulse 1.3s ease-in-out infinite; }
+        @keyframes nfPulse { 0%,100%{box-shadow:0 0 0 0 rgba(67,160,71,0.45)} 50%{box-shadow:0 0 0 6px rgba(67,160,71,0)} }
+
+        /* ── happy-moment sparkle burst (first-visit greeting only) ── */
+        .sparkle-burst { animation: sparkleBurst 1.8s ease-out both; }
+        @keyframes sparkleBurst {
+          0% { opacity:0; transform: translateY(10px) scale(0.5) rotate(0deg); }
+          25% { opacity:1; }
+          100% { opacity:0; transform: translateY(-60px) scale(1.15) rotate(25deg); }
+        }
 
         /* ══════════════════════════════
              Nova CHARACTER ANIMATIONS
