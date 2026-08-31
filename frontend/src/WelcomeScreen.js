@@ -704,8 +704,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
     const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
 
-    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "Akshata, AKSHA, THA"):
-    if (!isQuestionText && !bareNameChange && (hasInlineName || visitorName === 'Guest' || visitorName === 'Unknown')) {
+    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "My name is Akshata", "I am Akshata"):
+    if (!isQuestionText && !bareNameChange) {
       const candidateName = extractVisitorName(text);
       if (candidateName && candidateName.split(' ').length <= 3 && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you)$/i.test(candidateName)) {
         setLocalName(candidateName);

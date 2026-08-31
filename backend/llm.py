@@ -79,11 +79,15 @@ _QA_LABEL_RE_LLM = re.compile(r"Q:\s*.*?\s*A:\s*", re.IGNORECASE)
 _FACILITY_LABEL_RE_LLM = re.compile(r"^Facility:\s*.*?\.\s*Details:\s*", re.IGNORECASE)
 
 _REPETITIVE_GREETING_RE = re.compile(
-    r"^(?:(?:hello|hi|hey|greetings)[\s,!.:-]+)?(?:i am nova|this is nova|nova here|iam nova|my name is nova|hello nova|hi nova)[\s,!.:-]+",
+    r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[\s,!.:-]+)?(?:i am nova|i'm nova|im nova|this is nova|nova here|iam nova|my name is nova|hello nova|hi nova|hii nova|as nova(?:, the (?:ai )?digital receptionist)?)[\s,!.:-]+",
     re.IGNORECASE
 )
 _HELLO_NOVA_RE = re.compile(
-    r"^(?:hello|hi|hey)[\s,]+nova[\s,!.:-]+",
+    r"^(?:hello|hi|hey|hii|heyy|greetings|hi there)[\s,!]+(?:nova|i am nova|i'm nova|im nova)[\s,!.:-]+",
+    re.IGNORECASE
+)
+_STANDALONE_GREETING_INTRO_RE = re.compile(
+    r"^(?:hello|hi|hey|hii|heyy|greetings)[\s,!]+(?:welcome to rnsit[.!]*\s*)?(?:i am nova|i'm nova|im nova|my name is nova)[^.!?]*[.!?]+\s*",
     re.IGNORECASE
 )
 
@@ -91,7 +95,8 @@ _HELLO_NOVA_RE = re.compile(
 def _clean_repetitive_greeting(text: str) -> str:
     if not text:
         return text
-    cleaned = _REPETITIVE_GREETING_RE.sub("", text).strip()
+    cleaned = _STANDALONE_GREETING_INTRO_RE.sub("", text).strip()
+    cleaned = _REPETITIVE_GREETING_RE.sub("", cleaned).strip()
     cleaned = _HELLO_NOVA_RE.sub("", cleaned).strip()
     if cleaned and cleaned[0].islower():
         cleaned = cleaned[0].upper() + cleaned[1:]
@@ -1389,7 +1394,8 @@ async def _handle_offtopic(question: str, history: list) -> tuple[str, str]:
         route = "RNSIT_UNKNOWN"
 
     if route == "GENERAL_LLM" and len(lines) > 1 and lines[1].strip():
-        return route, lines[1].strip()
+        ans = _clean_repetitive_greeting(lines[1].strip())
+        return route, ans
 
     if route == "LIVE_INFO":
         weather_answer = await _try_fetch_weather(question)

@@ -1404,10 +1404,18 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             return answer, "easter_egg", "CONTINUE"
 
     # ─── Change Name Request ────────────────────────────────────────────────
-    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul"
+    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
     name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
                         re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized)
+                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"^(?:i am|iam|myself)\s+([a-zA-Z\s,.-]+)", q_normalized)
+
+    if not name_change_match and len(q_normalized.split()) in (1, 2):
+        _words = q_normalized.split()
+        if all(w.isalpha() and len(w) >= 2 for w in _words):
+            _non_name = {"where", "what", "how", "when", "who", "which", "can", "tell", "fees", "admission", "hostel", "placement", "library", "department", "principal", "hod", "contact", "address", "course", "branch", "branches", "syllabus", "exam", "seat", "cutoff", "rnsit", "college", "campus", "building", "block", "canteen", "sports", "yes", "no", "guest", "skip", "continue", "ok", "okay", "bye", "thanks", "thank you", "hello", "hi", "hey", "help", "info", "details"}
+            if not any(w in _non_name for w in _words):
+                name_change_match = re.search(r"^([a-zA-Z\s]+)$", q_normalized)
     if name_change_match:
         new_name_raw = name_change_match.group(1).strip()
         if "," in new_name_raw:
