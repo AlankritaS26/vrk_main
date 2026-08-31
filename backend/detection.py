@@ -344,9 +344,9 @@ def _load_known_faces(force: bool = False) -> list:
 # A blink = EAR drops below EAR_CLOSED then recovers above EAR_OPEN.
 # Two blinks within BLINK_WINDOW_SECS → double_blink fires for ONE frame.
 
-EAR_CLOSED        = float(os.getenv("EAR_CLOSED", "0.20"))   # below = eye shut
-EAR_OPEN          = float(os.getenv("EAR_OPEN",   "0.26"))   # above = eye fully open again
-BLINK_WINDOW_SECS = float(os.getenv("BLINK_WINDOW_SECS", "1.8"))  # max time between 2 blinks
+EAR_CLOSED        = float(os.getenv("EAR_CLOSED", "0.18"))   # below = eye shut (tightened for accuracy)
+EAR_OPEN          = float(os.getenv("EAR_OPEN",   "0.28"))   # above = eye fully open again (tightened for accuracy)
+BLINK_WINDOW_SECS = float(os.getenv("BLINK_WINDOW_SECS", "1.5"))  # max time between 2 blinks (tightened for snappier double-blink)
 
 # Per-person blink state (guarded by the GIL — only the main pipeline thread
 # calls detect_presence, so no extra lock is needed here).
