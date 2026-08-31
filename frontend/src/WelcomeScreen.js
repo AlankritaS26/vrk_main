@@ -11,6 +11,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isSpeaking = useRef(false);
   const awaitingAnswerRef = useRef(false);     // true from "ack started" until the real answer's speech starts/fails —
   // keeps status at 'processing' (not 'ready') through that gap
+  const requestSeqRef = useRef(0);             // increments per question asked; used to drop an answer ONLY when a
+  // *newer* question has since been asked — NOT when the backend's session
+  // bookkeeping (session_id) happens to churn while the answer is in flight
+  // (e.g. a slow LLM fallback overlapping a face-detection re-engagement
+  // cycle). Comparing session_id for "staleness" was dropping perfectly
+  // valid answers whenever the backend ended/resumed the session mid-request.
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
@@ -675,6 +681,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setLiveText('');
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
+    const myReqSeq = ++requestSeqRef.current;   // this question's sequence number
     addMessage(text, 'user');
 
     // ── Check if visitor is affirming a pending name confirmation ──────
@@ -918,9 +925,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       clearTimeout(askTimeout);
       const data = await askRes.json();
 
-      // STALE-ANSWER GUARD: only drop if sessions are distinct and neither is guest
-      const liveSid = sessionRef.current?.session_id || 'guest';
-      if (data.dropped || (sid !== 'guest' && liveSid !== 'guest' && liveSid !== sid)) {
+      // STALE-ANSWER GUARD: only drop if the backend explicitly says so, or if
+      // the visitor has since asked ANOTHER question that superseded this one.
+      // We intentionally do NOT compare session_id here anymore — the backend
+      // can end/resume a session (face-detection hiccups, re-engagement
+      // lookups) while a slow /ask call (e.g. local-LLM timeout -> Gemini
+      // fallback) is still in flight for the SAME visitor, which used to make
+      // this guard discard a perfectly valid, on-topic answer and leave the
+      // UI stuck on the "just a second" filler forever.
+      if (data.dropped || myReqSeq !== requestSeqRef.current) {
         console.info('[sendToBackend] dropped stale answer for', sid);
         awaitingAnswerRef.current = false;
         isSpeaking.current = false;
