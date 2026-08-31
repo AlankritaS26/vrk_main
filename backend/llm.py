@@ -78,29 +78,43 @@ _QA_LABEL_RE_LLM = re.compile(r"Q:\s*.*?\s*A:\s*", re.IGNORECASE)
 # shape happens to be top-ranked, not just the Q/A one.
 _FACILITY_LABEL_RE_LLM = re.compile(r"^Facility:\s*.*?\.\s*Details:\s*", re.IGNORECASE)
 
-_REPETITIVE_GREETING_RE = re.compile(
-    r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[\s,!.:-]+)?(?:i am nova|i'm nova|im nova|this is nova|nova here|iam nova|my name is nova|hello nova|hi nova|hii nova|as nova(?:, the (?:ai )?digital receptionist)?)[\s,!.:-]+",
-    re.IGNORECASE
-)
-_HELLO_NOVA_RE = re.compile(
-    r"^(?:hello|hi|hey|hii|heyy|greetings|hi there)[\s,!]+(?:nova|i am nova|i'm nova|im nova)[\s,!.:-]+",
-    re.IGNORECASE
-)
-_STANDALONE_GREETING_INTRO_RE = re.compile(
-    r"^(?:hello|hi|hey|hii|heyy|greetings)[\s,!]+(?:welcome to rnsit[.!]*\s*)?(?:i am nova|i'm nova|im nova|my name is nova)[^.!?]*[.!?]+\s*",
-    re.IGNORECASE
-)
+_INTRO_FULL_PATTERNS = [
+    re.compile(r"^(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there|welcome|welcome to rnsit|welcome to rns institute of technology)[\s,!.]*$", re.I),
+    re.compile(r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[\s,!.:-]+)?(?:i am nova|i'm nova|im nova|this is nova|my name is nova|nova here|hello nova|hi nova)[\s,!.]*$", re.I),
+    re.compile(r"^(?:(?:hello|hi|hey|hii|heyy|greetings|welcome(?: to rnsit)?)[\s,!.:-]+)?(?:i am|i'm|im|this is|my name is|as) nova(?:,?\s+(?:the|an|your|rnsit's)\s+(?:ai\s+)?(?:digital\s+)?receptionist(?:\s+(?:for|at|of|here at)\s+rnsit)?)?[\s,!.]*$", re.I),
+    re.compile(r"^(?:i am|i'm|im)\s+(?:the|an|your|rnsit's)\s+(?:ai\s+)?(?:digital\s+)?receptionist(?:\s+(?:for|at|of|here at)\s+rnsit)?[\s,!.]*$", re.I),
+]
+
+_PREFIX_PATTERNS = [
+    re.compile(
+        r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there|welcome to rnsit)[,\s!.:-]+)*"
+        r"(?:(?:i am|i'm|im|this is|my name is|myself|as)\s+nova(?:,?\s+(?:the|an|your|rnsit's)\s+(?:ai\s+)?(?:digital\s+)?receptionist(?:\s+(?:for|at|of|here at)\s+rnsit)?)?"
+        r"|(?:i am|i'm|im)\s+(?:the|an|your|rnsit's)\s+(?:ai\s+)?(?:digital\s+)?receptionist(?:\s+(?:for|at|of|here at)\s+rnsit)?"
+        r"|nova here|hello nova|hi nova)"
+        r"[,!\s.:-]+",
+        re.I
+    ),
+    re.compile(r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[,\s!.:-]+)+(?:welcome to (?:rnsit|rns institute of technology)[.!]*\s*)?", re.I),
+    re.compile(r"^(?:welcome to (?:rnsit|rns institute of technology)[,!.:\s-]+)", re.I),
+    re.compile(r"^(?:sure[!,.]*\s*(?:here is the information[.:\s]*)?|certainly[!,.]*\s*)", re.I),
+]
 
 
 def _clean_repetitive_greeting(text: str) -> str:
     if not text:
         return text
-    cleaned = _STANDALONE_GREETING_INTRO_RE.sub("", text).strip()
-    cleaned = _REPETITIVE_GREETING_RE.sub("", cleaned).strip()
-    cleaned = _HELLO_NOVA_RE.sub("", cleaned).strip()
+    cleaned = text.strip()
+    for p in _INTRO_FULL_PATTERNS:
+        if p.match(cleaned):
+            return ""
+    for p in _PREFIX_PATTERNS:
+        cleaned = p.sub("", cleaned).strip()
+    for p in _INTRO_FULL_PATTERNS:
+        if p.match(cleaned):
+            return ""
     if cleaned and cleaned[0].islower():
         cleaned = cleaned[0].upper() + cleaned[1:]
-    return cleaned or text
+    return cleaned
 
 
 # ==========================================
@@ -1167,12 +1181,12 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
         return
 
     system_prompt = (
-        "You are Nova, the official AI Digital Receptionist for RNS Institute of Technology (RNSIT), Bengaluru.\n"
-        "Your workspace is a public campus kiosk. Your tone must remain welcoming, polite, and professional.\n\n"
+        "You are the AI Digital Assistant for RNS Institute of Technology (RNSIT), Bengaluru.\n"
+        "Your task is to provide direct, factual, and concise answers to visitor questions.\n\n"
         f"Use ONLY the following verified campus facts to answer the visitor:\n\n"
         f"{context_text}\n\n"
         "CRITICAL RESPONSE CONSTRAINTS:\n"
-        "1. NEVER start your answers with greetings or self-introductions (do NOT say 'Hello Nova', 'Hello! I am Nova', 'Hi, Nova here', etc.). Answer the visitor's question directly and concisely.\n"
+        "1. Give ONLY the direct answer to the question immediately. NEVER say 'I am Nova', 'Hello! I am Nova', 'As Nova', 'Nova here', etc., and do NOT include any introductory greetings, self-introductions, or pleasantries. Jump straight into the facts.\n"
         "2. Rely only on the facts provided above. If the context does not contain the answer, "
         "say: 'I don't have that detail — please visit the Admin Block or call our admissions desk.'\n"
         "3. Keep responses snappy and punchy (2-3 sentences maximum). Avoid long paragraphs.\n"
@@ -1209,6 +1223,8 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
             for s in ready:
                 if not first_sentence_sent:
                     s = _clean_repetitive_greeting(s)
+                    if not s:
+                        continue
                     first_sentence_sent = True
                 if s:
                     full_answer_parts.append(s)
@@ -1217,7 +1233,8 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
             b = buf.strip()
             if not first_sentence_sent:
                 b = _clean_repetitive_greeting(b)
-                first_sentence_sent = True
+                if b:
+                    first_sentence_sent = True
             if b:
                 full_answer_parts.append(b)
                 yield b
@@ -1269,11 +1286,11 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
 # One cheap LLM call classifies + drafts a response in a single round trip
 # instead of a large keyword/if-else tree.
 _OFFTOPIC_ROUTER_PROMPT = (
-    "You are Nova, the AI voice receptionist behind the RNSIT campus kiosk. Your name is always Nova.\n"
+    "You are the AI voice assistant behind the RNSIT campus kiosk.\n"
     "The visitor's question did not match anything in the RNSIT knowledge base. "
     "Classify it into exactly one category and reply with ONLY that category word "
-    "on the first line, then (if GENERAL_LLM) a short 1-2 sentence helpful answer "
-    "on the second line. If you introduce yourself or answer small talk in GENERAL_LLM, you are Nova (never call yourself by the visitor's name).\n"
+    "on the first line, then (if GENERAL_LLM) a direct, short 1-2 sentence answer "
+    "on the second line (do NOT say 'I am Nova' or introduce yourself).\n"
     "Categories:\n"
     "GENERAL_LLM — harmless general-knowledge or small-talk question you can answer "
     "yourself (e.g. 'what is machine learning', 'how are you', 'who are you').\n"

@@ -259,8 +259,8 @@ GREETING_PHRASES = {
 }
 _GREETING_RESPONSES = [
     "Hello! Welcome to RNSIT. How can I help you today?",
-    "Hi there! I'm the RNSIT digital receptionist — what would you like to know?",
-    "Hey! Welcome to RNS Institute of Technology. What can I help you with?",
+    "Hi there! How can I help you today?",
+    "Welcome to RNS Institute of Technology! What can I help you with?",
 ]
 
 # ── Easter eggs: the handful of off-topic, personality questions every
@@ -278,10 +278,10 @@ EASTER_EGGS = {
         "Guilty as charged! But I promise I'm a friendly one.",
     ],
     "are you real": [
-        "Real enough to help you find the CSE block! I'm Nova, RNSIT's digital receptionist.",
+        "Real enough to help you find your way around campus! What can I help you with?",
     ],
     "are you human": [
-        "Not quite — I'm Nova, a digital receptionist. But I'll do my best to sound like one!",
+        "Not quite — I'm a digital receptionist. But I'll do my best to help you!",
     ],
     "tell me a joke": [
         "Why did the student bring a ladder to class? To reach the higher studies!",
@@ -327,7 +327,7 @@ EASTER_EGGS = {
         "You're pretty awesome yourself for saying that! What can I help you with next?",
     ],
     "nice to meet you": [
-        "Nice to meet you too! I'm Nova, RNSIT's digital receptionist. How can I help you today?",
+        "Nice to meet you too! How can I help you today?",
     ],
     "good night": [
         "Good night! It was lovely chatting with you — take care.",
