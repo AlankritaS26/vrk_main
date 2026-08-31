@@ -1,4 +1,6 @@
-import React from 'react';
+import React, { useEffect, useRef } from 'react';
+
+const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
 export default function GoodbyeScreen({ session, farewell }) {
   // Layer 1: use session.user_name (exclude only "Unknown" — "Guest" is a
@@ -6,18 +8,49 @@ export default function GoodbyeScreen({ session, farewell }) {
   let name = (session?.user_name && session.user_name !== 'Unknown') ? session.user_name : '';
 
   // Layer 2: try to extract the name from the farewell text itself.
-  // The farewell is always one of:
-  //   "Goodbye, {name}! Have a wonderful day."
-  //   "Goodbye! Have a wonderful day."  (when name was unknown)
-  // This covers the race where session state was still stale.
   if (!name && farewell) {
     const m = farewell.match(/Goodbye,\s+([A-Z][a-zA-Z\s]+?)!/);
     if (m) name = m[1].trim();
   }
 
-  // Suppress "Guest" in the displayed line — showing "Goodbye, Guest." is
-  // impersonal and reads as a bug; an anonymous goodbye is warmer without it.
+  // Suppress "Guest" in the displayed line
   const displayName = (name && name !== 'Guest') ? name : '';
+  const spokenFarewell = farewell || (displayName
+    ? `Goodbye, ${displayName}! Wishing you a wonderful day ahead.`
+    : 'Goodbye! Wishing you a wonderful day ahead.');
+
+  const spokenRef = useRef(false);
+
+  useEffect(() => {
+    if (spokenRef.current) return;
+    spokenRef.current = true;
+
+    async function speakFarewell() {
+      try {
+        const res = await fetch(BACKEND + '/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: spokenFarewell })
+        });
+        const data = await res.json();
+        if (data.audio) {
+          const snd = new Audio(`data:audio/wav;base64,${data.audio}`);
+          await snd.play();
+          return;
+        }
+      } catch (_) { }
+
+      // Browser TTS Fallback
+      try {
+        window.speechSynthesis.cancel();
+        const u = new SpeechSynthesisUtterance(spokenFarewell);
+        u.lang = 'en-US';
+        window.speechSynthesis.speak(u);
+      } catch (_) { }
+    }
+
+    speakFarewell();
+  }, [spokenFarewell]);
 
   return (
     <div style={{

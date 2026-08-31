@@ -85,6 +85,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const nameFlowIdRef = useRef(0);          // bumped to invalidate an in-flight run
 
   const [localName, setLocalName] = useState('');
+  const pendingCandidateNameRef = useRef('');
   const visitorName = localName || (session?.user_name && session.user_name !== 'Unknown' ? session.user_name : 'Guest');
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
@@ -676,6 +677,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
 
+    // ── Check if visitor is affirming a pending name confirmation ──────
+    const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
+      || /\b(?:yes that is my name|yes that is correct|yes that is me|thats my name|that's my name)\b/i.test(text.trim());
+    if (pendingCandidateNameRef.current && isAffirmation) {
+      const confirmedName = pendingCandidateNameRef.current;
+      pendingCandidateNameRef.current = '';
+      setLocalName(confirmedName);
+      await submitVoiceName(confirmedName, true);
+      const greetNamed = `Great to meet you, ${confirmedName}! How may I assist you today?`;
+      addMessage(greetNamed, 'kiosk');
+      speak(greetNamed);
+      return;
+    }
+
     // ── Mid-session bare "change my name" prompt (no name given yet) ──────
     // Explicit "change my name to X" / "call me X" patterns are handled by
     // the backend _deterministic_route via /ask below — do NOT early-return
@@ -689,8 +704,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
     const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
 
-    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "Akshata, AKSHA, THA"):
-    if (!isQuestionText && !bareNameChange && (hasInlineName || visitorName === 'Guest' || visitorName === 'Unknown')) {
+    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "My name is Akshata", "I am Akshata"):
+    if (!isQuestionText && !bareNameChange) {
       const candidateName = extractVisitorName(text);
       if (candidateName && candidateName.split(' ').length <= 3 && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you)$/i.test(candidateName)) {
         setLocalName(candidateName);
@@ -903,15 +918,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       clearTimeout(askTimeout);
       const data = await askRes.json();
 
-      // STALE-ANSWER GUARD: if the session changed while this request was in
-      // flight (visitor said goodbye and left, next visitor arrived), this
-      // answer belongs to nobody on screen — drop it so it never bleeds into
-      // the next person's session.
+      // STALE-ANSWER GUARD: only drop if sessions are distinct and neither is guest
       const liveSid = sessionRef.current?.session_id || 'guest';
-      if (data.dropped || liveSid !== sid) {
+      if (data.dropped || (sid !== 'guest' && liveSid !== 'guest' && liveSid !== sid)) {
         console.info('[sendToBackend] dropped stale answer for', sid);
         awaitingAnswerRef.current = false;
         isSpeaking.current = false;
+        setProcessingHint('');
         setStatus('ready');
         return;
       }
@@ -923,10 +936,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
       });
 
-      // Text and voice move together: an empty kiosk bubble opens the
-      // instant speech begins, then grows one sentence at a time — each
-      // sentence appears exactly when its audio starts playing, never
-      // before. No more "reveal the whole answer as soon as it's fetched".
+      // Clear processing hint when answer arrives
+      setProcessingHint('');
+
       let appendSentence = null;
       speakStream(answer, {
         onStart: () => {
@@ -949,6 +961,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, [session, addMessage, speakStream, startProgressiveMessage]);
 
   // ── Helper parsing for name & guest choices ──
+  // Words that must NEVER be treated as a visitor name regardless of context.
+  const _REJECTION_WORDS = /^(no|nope|nah|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend|none|null|undefined|yes|yeah|yep|yup|sure|ok|okay)$/i;
+
   const extractVisitorName = useCallback((raw) => {
     if (!raw) return '';
     let s = raw.trim();
@@ -964,24 +979,35 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
     if (words.length === 0) return '';
-    return words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+    // Guard: if the entire result is a single rejection/control word, return empty
+    const result = words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+    if (words.length === 1 && _REJECTION_WORDS.test(words[0])) return '';
+    return result;
   }, []);
 
   // ── Double Blink Listener for Yes/Confirm ──────────────────────────────
   const prevDoubleBlinkRef = useRef(0);
+  // Latches a double-blink that fired while no prompt was active (e.g. while
+  // Nova is speaking). captureUtteranceText/captureYesNo consume it instantly
+  // on their next call so the blink is never silently lost.
+  const pendingBlinkRef = useRef(false);
+
   useEffect(() => {
     if (doubleBlink && doubleBlink !== prevDoubleBlinkRef.current) {
       prevDoubleBlinkRef.current = doubleBlink;
       console.log('[BLINK] Double blink detected!');
       if (activePromptResolverRef.current) {
+        // A prompt is already waiting — resolve it immediately
         const resolver = activePromptResolverRef.current;
         activePromptResolverRef.current = null;
-        if (isMounted.current) {
-          setLiveText('👁️ [Double blink detected — Yes]');
-        }
         statusRef.current = 'ready';
         setStatus('ready');
         resolver('👁️ [Blinked twice — Yes]');
+      } else {
+        // No prompt active yet (Nova still speaking) — latch it so the
+        // NEXT captureUtteranceText/captureYesNo call picks it up instantly
+        console.log('[BLINK] No resolver active — latching blink for next prompt');
+        pendingBlinkRef.current = true;
       }
     }
   }, [doubleBlink]);
@@ -1005,6 +1031,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // ── Voice prompt capture helpers (uses single persistent mic) ──────────
   const captureUtteranceText = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
+      // If a double-blink was latched while Nova was speaking, consume it now
+      if (pendingBlinkRef.current) {
+        pendingBlinkRef.current = false;
+        resolve('👁️ [Blinked twice — Yes]');
+        return;
+      }
       let timer = null;
       const resolver = (text) => {
         if (timer) clearTimeout(timer);
@@ -1031,9 +1063,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     });
   }, []);
 
+
   // Waits for a spoken "yes"/"no" response, double blink, or direct correction
   const captureYesNo = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
+      // If a double-blink was latched while Nova was speaking, consume it now
+      if (pendingBlinkRef.current) {
+        pendingBlinkRef.current = false;
+        resolve(true);
+        return;
+      }
       let timer = null;
       const resolver = (rawText) => {
         if (timer) clearTimeout(timer);
@@ -1068,6 +1107,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       setStatus('ready');
     });
   }, []);
+
 
   const submitVoiceName = useCallback(async (finalName, save) => {
     try {
@@ -1117,7 +1157,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!stillCurrent()) return;
 
         setNameStage('listening_name');
-        const heard = await captureUtteranceText(5000);
+        const heard = await captureUtteranceText(6000);
         if (!stillCurrent()) return;
 
         let choseGiveName = false;
@@ -1196,7 +1236,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
           if (heardSpokenName) {
             addMessage(heardSpokenName, 'user');
-            finalName = extractVisitorName(heardSpokenName) || heardSpokenName.trim();
+            // Guard: never treat a single rejection/negation word as a visitor name
+            const _NAME_REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
+            const extractedName = extractVisitorName(heardSpokenName);
+            if (extractedName && !_NAME_REJECTION.test(extractedName.trim())) {
+              finalName = extractedName;
+            } else if (!_NAME_REJECTION.test(heardSpokenName.trim())) {
+              finalName = heardSpokenName.trim();
+            } else {
+              finalName = null; // will trigger the retry below
+            }
           } else {
             // Ask once more if missed
             const askRetry = "Could you please say your name?";
@@ -1218,6 +1267,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
         // 3. Confirm name with voice ("Yes" / "No") or double blink ("Yes")
         setNameStage('confirming');
+        pendingCandidateNameRef.current = finalName;
         const confirmChatMsg = `I heard ${finalName}. Is that correct?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to confirm\n• 🗣️ Say "No" to change it`;
         const confirmSpokenMsg = `I heard ${finalName}. Is that correct? Say yes or blink twice to confirm, or say no to change it.`;
         addMessage(confirmChatMsg, 'kiosk');
@@ -1225,10 +1275,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!stillCurrent()) return;
 
         setNameStage('listening_confirm');
-        const confirmed = await captureYesNo(25000);
+        const confirmed = await captureYesNo(45000);
         if (!stillCurrent()) return;
 
         if (confirmed === true) {
+          pendingCandidateNameRef.current = '';
           setNameStage('saving');
           const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
           addMessage(greetNamed, 'kiosk');
@@ -1238,12 +1289,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (stillCurrent()) startListening();
           break;
         } else if (confirmed === false || (typeof confirmed === 'string' && confirmed.length > 0)) {
+          pendingCandidateNameRef.current = '';
           let correctedName = '';
           if (typeof confirmed === 'string' && confirmed.length > 0 && !/\b(no|nope|nah|wrong|change|not)\b/i.test(confirmed)) {
             correctedName = extractVisitorName(confirmed) || confirmed.trim();
           } else {
             setNameStage('asking');
-            const retryMsg = "My apologies! What should I change your name to?";
+            const retryMsg = "My apologies! Could you please spell out your name?";
             addMessage(retryMsg, 'kiosk');
             await speakAndWait(retryMsg);
             if (!stillCurrent()) return;
@@ -1252,7 +1304,29 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             const retrySpokenName = await captureUtteranceText(25000);
             if (!stillCurrent()) return;
 
-            correctedName = extractVisitorName(retrySpokenName) || retrySpokenName || finalName;
+            // Guard: never accept rejection/negation words as a name
+            const _REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
+            const extracted = extractVisitorName(retrySpokenName);
+            if (extracted && !_REJECTION.test(extracted.trim())) {
+              correctedName = extracted;
+            } else if (retrySpokenName && retrySpokenName.trim().split(/\s+/).length > 1) {
+              // Multi-word response not matching rejection — treat as spelled name
+              correctedName = retrySpokenName.trim();
+            } else {
+              // Still got a rejection word or silence — fall back to Guest rather than saving garbage
+              correctedName = 'Guest';
+            }
+          }
+
+          if (!correctedName || correctedName === 'Guest') {
+            // Couldn't get a valid name — proceed as Guest
+            setNameStage('saving');
+            const guestFallback = 'No problem! Continuing as Guest. How may I assist you today?';
+            addMessage(guestFallback, 'kiosk');
+            await submitVoiceName('Guest', false);
+            await speakAndWait(guestFallback);
+            if (stillCurrent()) startListening();
+            break;
           }
 
           setNameStage('saving');

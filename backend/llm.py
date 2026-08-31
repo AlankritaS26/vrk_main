@@ -78,6 +78,30 @@ _QA_LABEL_RE_LLM = re.compile(r"Q:\s*.*?\s*A:\s*", re.IGNORECASE)
 # shape happens to be top-ranked, not just the Q/A one.
 _FACILITY_LABEL_RE_LLM = re.compile(r"^Facility:\s*.*?\.\s*Details:\s*", re.IGNORECASE)
 
+_REPETITIVE_GREETING_RE = re.compile(
+    r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[\s,!.:-]+)?(?:i am nova|i'm nova|im nova|this is nova|nova here|iam nova|my name is nova|hello nova|hi nova|hii nova|as nova(?:, the (?:ai )?digital receptionist)?)[\s,!.:-]+",
+    re.IGNORECASE
+)
+_HELLO_NOVA_RE = re.compile(
+    r"^(?:hello|hi|hey|hii|heyy|greetings|hi there)[\s,!]+(?:nova|i am nova|i'm nova|im nova)[\s,!.:-]+",
+    re.IGNORECASE
+)
+_STANDALONE_GREETING_INTRO_RE = re.compile(
+    r"^(?:hello|hi|hey|hii|heyy|greetings)[\s,!]+(?:welcome to rnsit[.!]*\s*)?(?:i am nova|i'm nova|im nova|my name is nova)[^.!?]*[.!?]+\s*",
+    re.IGNORECASE
+)
+
+
+def _clean_repetitive_greeting(text: str) -> str:
+    if not text:
+        return text
+    cleaned = _STANDALONE_GREETING_INTRO_RE.sub("", text).strip()
+    cleaned = _REPETITIVE_GREETING_RE.sub("", cleaned).strip()
+    cleaned = _HELLO_NOVA_RE.sub("", cleaned).strip()
+    if cleaned and cleaned[0].islower():
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned or text
+
 
 # ==========================================
 # SHARED HTTP CLIENT
@@ -944,24 +968,25 @@ async def initialize_rag_knowledge_base():
 
     client = get_shared_client()
     try:
-        # Check whether collection already has data
-        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}",
-                                timeout=5.0)
-        if resp.status_code == 200:
-            stats = resp.json()
-            if stats.get("total_chunks", 0) > 0:
-                logger.info(
-                    "[RAG] Collection '%s' already has %d chunks — skipping seed.",
-                    RAG_COLLECTION, stats["total_chunks"]
-                )
-                _rag_seeded = True
-                return
-        # Collection missing or empty — seed from JSON
         chunks = _json_to_text_chunks(JSON_PATH)
         if not chunks:
             logger.warning("[RAG] college_info.json not found or empty — nothing to seed.")
             _rag_seeded = True
             return
+
+        # Check whether collection already has data
+        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}",
+                                timeout=5.0)
+        if resp.status_code == 200:
+            stats = resp.json()
+            total_in_db = stats.get("total_chunks", 0)
+            if total_in_db >= len(chunks):
+                logger.info(
+                    "[RAG] Collection '%s' already has %d chunks (>= %d) — skipping seed.",
+                    RAG_COLLECTION, total_in_db, len(chunks)
+                )
+                _rag_seeded = True
+                return
 
         logger.info("[RAG] Seeding collection '%s' with %d chunks from college_info.json …",
                     RAG_COLLECTION, len(chunks))
@@ -1141,18 +1166,13 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
         yield answer
         return
 
-    logger.info("ROUTE: RNSIT_RAG")
-    logger.info("LLM CALLED: YES | MODEL: %s", LLM_CHAT_MODEL)
-
     system_prompt = (
         "You are Nova, the official AI Digital Receptionist for RNS Institute of Technology (RNSIT), Bengaluru.\n"
-        "Your name is Nova. NEVER call yourself by the visitor's name or any name other than Nova. The person speaking to you is a visitor, and you are Nova.\n"
-        "Your workspace is a public campus kiosk visible to parents, children, and students. "
-        "Your tone must remain completely child-safe, welcoming, polite, and professional at all times.\n\n"
+        "Your workspace is a public campus kiosk. Your tone must remain welcoming, polite, and professional.\n\n"
         f"Use ONLY the following verified campus facts to answer the visitor:\n\n"
         f"{context_text}\n\n"
         "CRITICAL RESPONSE CONSTRAINTS:\n"
-        "1. Your name is Nova. If asked who you are or what your name is, always say you are Nova.\n"
+        "1. NEVER start your answers with greetings or self-introductions (do NOT say 'Hello Nova', 'Hello! I am Nova', 'Hi, Nova here', etc.). Answer the visitor's question directly and concisely.\n"
         "2. Rely only on the facts provided above. If the context does not contain the answer, "
         "say: 'I don't have that detail — please visit the Admin Block or call our admissions desk.'\n"
         "3. Keep responses snappy and punchy (2-3 sentences maximum). Avoid long paragraphs.\n"
@@ -1162,9 +1182,7 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
         "the placement figures you have are INSTITUTE-WIDE totals, not broken down per department. "
         "Do NOT invent a per-department ranking or imply one department outperforms another unless "
         "the context above explicitly states department-specific figures. If asked to compare "
-        "departments and you only have overall numbers, say so plainly — e.g. 'I only have "
-        "placement numbers for RNSIT overall, not broken down by department, so I can't say which "
-        "is best — but I can tell you the departments and overall placement stats we do have.' "
+        "departments and you only have overall numbers, say so plainly. "
         "Never present a guess as if it were verified data.\n"
     )
 
@@ -1180,6 +1198,7 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
     buf = ""
     full_answer_parts: list[str] = []
     tier_seen, model_seen = "", ""
+    first_sentence_sent = False
     try:
         async for delta, tier, model_used in chat_completion_with_fallback_stream(
             messages=messages, temperature=0.2, max_tokens=180,
@@ -1188,11 +1207,20 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
             buf += delta
             ready, buf = _pop_complete_sentences(buf)
             for s in ready:
-                full_answer_parts.append(s)
-                yield s
+                if not first_sentence_sent:
+                    s = _clean_repetitive_greeting(s)
+                    first_sentence_sent = True
+                if s:
+                    full_answer_parts.append(s)
+                    yield s
         if buf.strip():
-            full_answer_parts.append(buf)
-            yield buf
+            b = buf.strip()
+            if not first_sentence_sent:
+                b = _clean_repetitive_greeting(b)
+                first_sentence_sent = True
+            if b:
+                full_answer_parts.append(b)
+                yield b
         full_answer = "".join(full_answer_parts).strip()
         if not full_answer:
             full_answer = "I am having trouble formatting the response. Please try again."
@@ -1209,6 +1237,7 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
         top_fact = raw_results[0].get("text", "") if raw_results else ""
         top_fact = _QA_LABEL_RE_LLM.sub("", top_fact).strip()
         top_fact = _FACILITY_LABEL_RE_LLM.sub("", top_fact).strip()
+        top_fact = _clean_repetitive_greeting(top_fact)
         if top_fact:
             answer = (
                 "I am currently unable to generate a conversational response, "
@@ -1228,7 +1257,8 @@ async def generate_rag_kiosk_response(question: str, history: list = None) -> st
     never drift out of sync with the streaming path — one implementation,
     two ways to consume it."""
     parts = [s async for s in generate_rag_kiosk_response_stream(question, history)]
-    return "".join(parts).strip()
+    full = "".join(parts).strip()
+    return _clean_repetitive_greeting(full)
 
 
 # ==========================================
@@ -1364,7 +1394,8 @@ async def _handle_offtopic(question: str, history: list) -> tuple[str, str]:
         route = "RNSIT_UNKNOWN"
 
     if route == "GENERAL_LLM" and len(lines) > 1 and lines[1].strip():
-        return route, lines[1].strip()
+        ans = _clean_repetitive_greeting(lines[1].strip())
+        return route, ans
 
     if route == "LIVE_INFO":
         weather_answer = await _try_fetch_weather(question)

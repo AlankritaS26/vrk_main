@@ -443,8 +443,12 @@
       "answer": "Dr. Andhe Pallavi is the HOD of the AI and ML department at RNSIT."
     },
     {
+      "question": "Where is the canteen located?",
+      "answer": "The canteen is located near the sports ground and hostel entrance on the RNSIT campus."
+    },
+    {
       "question": "Where is admin block?",
-      "answer": "The Administrative Block houses the Director and Principal offices, Accounts, Admissions, Placement Cell and the Dr. Shivaram Karanth Auditorium."
+      "answer": "The Administrative Block is located opposite the Central Library and houses the Director and Principal offices, Accounts, Admissions, Placement Cell, and the Dr. Shivaram Karanth Auditorium."
     }
   ]
 }
