@@ -772,22 +772,42 @@ async def extract_topic_label(questions) -> str | None:
 # RAGService INTEGRATION
 # ==========================================
 
-def _json_to_text_chunks(json_path: str) -> list[str]:
-    """Convert college_info.json into readable text chunks for RAGService indexing."""
+def _json_to_text_chunks(json_path: str) -> list[dict]:
+    """
+    Convert college_info.json into text chunks for RAGService indexing,
+    EACH tagged with structured metadata (entity_type / entity_name).
+
+    Returns list[{"text": str, "metadata": {"entity_type": str, "entity_name": str}}]
+    instead of a flat list[str] — this is what makes the confidence-RAG
+    ambiguity check (backend/confidence_rag.py) actually able to compare
+    "is top-1 and top-2 about the SAME entity or a DIFFERENT one" for the
+    original seed data, not just for entries an admin creates later
+    through the dashboard. Every admin-verified knowledge_entries chunk
+    already carries this metadata (see backend/admin_knowledge.py); this
+    backfills the same convention onto the seed data at index time.
+    """
     if not os.path.exists(json_path):
         return []
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    chunks: list[str] = []
+    chunks: list[dict] = []
+
+    def _add(text: str, entity_type: str, entity_name: str):
+        text = (text or "").strip()
+        if text:
+            chunks.append({"text": text, "metadata": {
+                "entity_type": entity_type, "entity_name": entity_name,
+            }})
 
     c = data.get("college", {})
-    chunks.append(
+    _add(
         f"{c.get('name')} ({c.get('short_name')}) was established in {c.get('established')} "
         f"by {c.get('founder')}. It is a {c.get('type')} affiliated to {c.get('affiliation')}. "
         f"Location: {c.get('location')}. Website: {c.get('website')}. "
         f"COMEDK code: {c.get('admission_codes', {}).get('comedk')}, "
-        f"CET code: {c.get('admission_codes', {}).get('cet')}."
+        f"CET code: {c.get('admission_codes', {}).get('cet')}.",
+        "college", c.get("short_name") or c.get("name") or "RNSIT",
     )
 
     # ── Administration: one focused chunk per fact instead of one bundled
@@ -796,25 +816,44 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
     # hours / director / admissions info all mashed into the same vector. ──
     adm = data.get("administration", {})
     if adm.get("working_hours"):
-        chunks.append(f"RNSIT working hours: {adm.get('working_hours')}.")
+        _add(f"RNSIT working hours: {adm.get('working_hours')}.",
+             "administration", "Working Hours")
     director = adm.get("director", {})
     if director.get("name"):
-        chunks.append(f"RNSIT Director: {director.get('name')}. Contact: {director.get('phone')}.")
+        _add(f"RNSIT Director: {director.get('name')}. Contact: {director.get('phone')}.",
+             "administration", "Director")
     principal = adm.get("principal", {})
     if principal.get("name"):
-        chunks.append(f"RNSIT Principal: {principal.get('name')}. Contact: {principal.get('phone')}.")
+        _add(f"RNSIT Principal: {principal.get('name')}. Contact: {principal.get('phone')}.",
+             "administration", "Principal")
     contacts = adm.get("contacts", {})
     if contacts.get("admissions_phone") or contacts.get("admissions_email"):
-        chunks.append(
+        _add(
             f"RNSIT admissions phone: {contacts.get('admissions_phone')}. "
-            f"Admissions email: {contacts.get('admissions_email')}."
+            f"Admissions email: {contacts.get('admissions_email')}.",
+            "administration", "Admissions Contact",
         )
     enquiry = contacts.get("enquiry_phone", [])
     if enquiry:
-        chunks.append(f"RNSIT general enquiry numbers: {', '.join(enquiry)}.")
+        _add(f"RNSIT general enquiry numbers: {', '.join(enquiry)}.",
+             "administration", "General Enquiry")
 
-    for code, dept in data.get("departments", {}).items():
-        parts = [f"Department: {dept.get('name')} ({code.upper()})."]
+    depts = data.get("departments", {})
+    if depts:
+        dept_names = [d.get("name") or k.upper() for k, d in depts.items()]
+        _add(
+            f"RNSIT has {len(depts)} departments: {', '.join(dept_names)}. "
+            f"These include undergraduate engineering branches as well as postgraduate programs like MCA and MBA.",
+            "department", "Departments Overview",
+        )
+
+    for code, dept in depts.items():
+        name_str = dept.get("name") or code.upper()
+        if code.lower() in ("aiml", "ai_ml", "aids"):
+            syns = " (AIML / AI ML / AI & ML / Artificial Intelligence and Machine Learning)"
+        else:
+            syns = ""
+        parts = [f"Department: {name_str}{syns} ({code.upper()})."]
         if dept.get("block"):
             parts.append(f"Located in: {dept['block']}.")
         if dept.get("hod"):
@@ -823,18 +862,29 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
             parts.append(f"Annual intake: {dept['intake']} students.")
         if dept.get("phd_center"):
             parts.append("Has a PhD research centre.")
-        chunks.append(" ".join(parts))
+        _add(" ".join(parts), "department", dept.get("name") or code.upper())
 
-    for fname, fdet in data.get("facilities", {}).items():
+    facs = data.get("facilities", {})
+    if facs:
+        fac_labels = [fname.replace("_", " ").title() for fname in facs.keys()]
+        _add(
+            f"RNSIT Campus Facilities Overview: RNSIT provides campus-wide facilities including "
+            f"{', '.join(fac_labels)}. Key facilities on campus include Central Library, Canteen, Shivaram Karanth Auditorium, "
+            f"Boys and Girls Hostels, Gym, Sports Ground, Placement Cell, Medical & 24/7 Ambulance service, "
+            f"Campus-wide Wi-Fi, Canara Bank ATM, Toyota Center of Excellence, and Student Counselling.",
+            "facility", "Campus Facilities Overview",
+        )
+
+    for fname, fdet in facs.items():
+        label = fname.replace("_", " ").title()
         if isinstance(fdet, dict):
-            label = fname.replace("_", " ").title()
             parts = [f"Facility: {label}."]
             for key in ("name", "location", "timings", "details", "capacity", "platform"):
                 if fdet.get(key):
                     parts.append(f"{key.title()}: {fdet[key]}.")
-            chunks.append(" ".join(parts))
+            _add(" ".join(parts), "facility", label)
         elif isinstance(fdet, str):
-            chunks.append(f"Facility {fname.replace('_', ' ').title()}: {fdet}.")
+            _add(f"Facility {label}: {fdet}.", "facility", label)
 
     pl = data.get("placements", {})
     if pl:
@@ -843,7 +893,7 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
             parts.append(f"{pl['total_companies']} companies recruit from RNSIT.")
         if pl.get("recent_recruiters"):
             parts.append(f"Recent recruiters: {', '.join(pl['recent_recruiters'][:15])}.")
-        chunks.append(" ".join(parts))
+        _add(" ".join(parts), "placements", "Placements Overview")
 
         for yr, stats in pl.get("stats", {}).items():
             s_parts = [f"Placement stats {yr}:"]
@@ -853,7 +903,7 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
                 s_parts.append(f"Average package: {stats['average_ctc_lpa']} LPA.")
             if stats.get("students_placed"):
                 s_parts.append(f"Students placed: {stats['students_placed']}.")
-            chunks.append(" ".join(s_parts))
+            _add(" ".join(s_parts), "placements", f"Placement Stats {yr}")
 
     # ── Admissions: dedicated builder (not the generic key:val loop below) ──
     # because admissions now holds nested dicts/lists (eligibility per
@@ -872,59 +922,66 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
             headline.append(f"KCET institute code: {adms['cet_code']}.")
         if adms.get("comedk_code"):
             headline.append(f"COMEDK institute code: {adms['comedk_code']}.")
-        chunks.append(" ".join(headline))
+        _add(" ".join(headline), "admissions", "Admissions Status")
 
         modes = adms.get("modes", {})
         if isinstance(modes, dict):
             for course, exams in modes.items():
                 if exams:
                     label = course.replace("_", " ").upper()
-                    chunks.append(f"RNSIT admission route for {label}: {', '.join(exams)}.")
+                    _add(f"RNSIT admission route for {label}: {', '.join(exams)}.",
+                         "admissions", f"Admission Route — {label}")
         elif isinstance(modes, list) and modes:
-            chunks.append(f"RNSIT admission modes: {', '.join(modes)}.")
+            _add(f"RNSIT admission modes: {', '.join(modes)}.", "admissions", "Admission Modes")
 
         elig = adms.get("eligibility", {})
         if isinstance(elig, dict):
             for course, text in elig.items():
                 if isinstance(text, str) and text.strip():
                     label = course.replace("_", " ").upper()
-                    chunks.append(f"RNSIT eligibility for {label}: {text}")
+                    _add(f"RNSIT eligibility for {label}: {text}",
+                         "admissions", f"Eligibility — {label}")
 
         steps = adms.get("process_steps", [])
         if steps:
             numbered = " ".join(f"({i+1}) {s}" for i, s in enumerate(steps))
-            chunks.append(f"RNSIT admission process: {numbered}")
+            _add(f"RNSIT admission process: {numbered}", "admissions", "Admission Process")
 
         docs = adms.get("documents_required", [])
         if docs:
-            chunks.append("Documents required for RNSIT admission: " + "; ".join(docs) + ".")
+            _add("Documents required for RNSIT admission: " + "; ".join(docs) + ".",
+                 "admissions", "Documents Required")
 
         fees = adms.get("fees", {})
         if isinstance(fees, dict):
             if fees.get("quota_types"):
-                chunks.append(f"RNSIT admission quota types: {', '.join(fees['quota_types'])}.")
+                _add(f"RNSIT admission quota types: {', '.join(fees['quota_types'])}.",
+                     "admissions", "Fees — Quota Types")
             if fees.get("note"):
-                chunks.append(f"RNSIT fee information: {fees['note']}")
+                _add(f"RNSIT fee information: {fees['note']}", "admissions", "Fees")
 
         schol = adms.get("scholarships", {})
         if isinstance(schol, dict):
             if schol.get("general"):
-                chunks.append("RNSIT scholarship options: " + "; ".join(schol["general"]) + ".")
+                _add("RNSIT scholarship options: " + "; ".join(schol["general"]) + ".",
+                     "admissions", "Scholarships")
             if schol.get("note"):
-                chunks.append(f"RNSIT scholarship note: {schol['note']}")
+                _add(f"RNSIT scholarship note: {schol['note']}", "admissions", "Scholarships")
 
     for section, content in data.items():
         if section in ("meta", "college", "administration", "departments",
                         "facilities", "placements", "admissions", "faqs"):
             continue
+        section_label = section.replace("_", " ").title()
         if isinstance(content, dict):
             for key, val in content.items():
+                key_label = f"{section_label} — {key.replace('_', ' ').title()}"
                 if isinstance(val, str) and val.strip():
-                    chunks.append(f"{section.replace('_', ' ').title()} — {key}: {val}")
+                    _add(f"{section_label} — {key}: {val}", section, key_label)
                 elif isinstance(val, list):
-                    chunks.append(f"{section.replace('_', ' ').title()} — {key}: {', '.join(str(v) for v in val)}")
+                    _add(f"{section_label} — {key}: {', '.join(str(v) for v in val)}", section, key_label)
         elif isinstance(content, str):
-            chunks.append(f"{section.replace('_', ' ').title()}: {content}")
+            _add(f"{section_label}: {content}", section, section_label)
 
     # ── FAQs: these are hand-written, single-topic Q&A pairs — the best
     # possible chunks for direct-match retrieval. Previously silently
@@ -944,26 +1001,86 @@ def _json_to_text_chunks(json_path: str) -> list[str]:
         "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
         "thank you", "thanks", "bye", "goodbye",
     }
+    # EXCLUDE meta/capability FAQs ("What can you do?", "Who are you?",
+    # "What do you know?"). These describe the ASSISTANT, not the campus,
+    # and their answers tend to be broad, keyword-dense summaries ("I can
+    # help with admissions, departments, facilities, placements...") that
+    # end up scoring moderately similar to almost EVERY real question.
+    # In production this showed up as exactly that: the same "What can
+    # you do" chunk kept surfacing as a false second-place candidate
+    # against unrelated department/HOD/principal queries, repeatedly
+    # triggering the ambiguity check on already-correct top-1 matches.
+    # A single broad "attractor" chunk like this does more harm sitting
+    # in a fact-retrieval index than good.
+    _META_CAPABILITY_FAQ_PATTERNS = (
+        "what can you do", "what can you help", "how can you help",
+        "what do you know", "who are you", "what are you",
+        "what is your name", "are you a bot", "are you human",
+        "what languages do you", "how do you work",
+    )
     skipped = 0
     for faq in data.get("faqs", []):
         q = (faq.get("question") or "").strip()
         a = (faq.get("answer") or "").strip()
         if not (q and a):
             continue
-        if q.lower().strip(" ?!.") in _CONVERSATIONAL_FAQ_QUESTIONS:
+        q_norm = q.lower().strip(" ?!.")
+        if q_norm in _CONVERSATIONAL_FAQ_QUESTIONS:
             skipped += 1
             continue
-        chunks.append(f"Q: {q} A: {a}")
+        if any(pat in q_norm for pat in _META_CAPABILITY_FAQ_PATTERNS):
+            skipped += 1
+            continue
+        
+        # Map FAQ questions to target entity_name & entity_type to avoid false ambiguity gaps
+        faq_entity_type = "faq"
+        faq_entity_name = q[:80]
+        q_lower = q_norm.lower()
+        if "principal" in q_lower:
+            faq_entity_type = "administration"
+            faq_entity_name = "Principal"
+        elif "director" in q_lower:
+            faq_entity_type = "administration"
+            faq_entity_name = "Director"
+        elif "chairman" in q_lower or "founder" in q_lower:
+            faq_entity_type = "administration"
+            faq_entity_name = "Group Chairman"
+        elif "hod of cse" in q_lower or "head of cse" in q_lower:
+            faq_entity_type = "department"
+            faq_entity_name = "Computer Science and Engineering"
+        elif "hod of ai" in q_lower or "hod of aiml" in q_lower:
+            faq_entity_type = "department"
+            faq_entity_name = "CSE (AI and ML)"
+        elif "management fee" in q_lower or "management quota" in q_lower or "fee structure" in q_lower or "management phase" in q_lower:
+            faq_entity_type = "admissions"
+            faq_entity_name = "Fees"
+        elif "working hours" in q_lower or "college timings" in q_lower or "college working hours" in q_lower:
+            faq_entity_type = "administration"
+            faq_entity_name = "Working Hours"
+        elif "highest package in 2025" in q_lower or "highest placement package in 2025" in q_lower or "placements in 2025" in q_lower or "2025" in q_lower:
+            faq_entity_type = "placements"
+            faq_entity_name = "Placement Stats 2025"
+        elif "companies recruit" in q_lower or "placement package" in q_lower or "highest package" in q_lower or "highest ctc" in q_lower:
+            faq_entity_type = "placements"
+            faq_entity_name = "Placements Overview"
+        elif "what departments" in q_lower or "how many departments" in q_lower:
+            faq_entity_type = "department"
+            faq_entity_name = "Departments Overview"
+        elif "facilities" in q_lower or "facility" in q_lower:
+            faq_entity_type = "facility"
+            faq_entity_name = "Campus Facilities Overview"
+
+        _add(f"Q: {q} A: {a}", faq_entity_type, faq_entity_name)
     if skipped:
         logger.info("[RAG SEED] Skipped %d conversational FAQ entries (handled deterministically, not indexed).", skipped)
 
-    return [c.strip() for c in chunks if c.strip()]
+    return chunks
 
 
-async def initialize_rag_knowledge_base():
-    """Seed the RAGService collection from college_info.json if the collection is empty."""
+async def initialize_rag_knowledge_base(force_reseed: bool = False):
+    """Seed the RAGService collection from college_info.json if empty or force_reseed=True."""
     global _rag_seeded
-    if _rag_seeded:
+    if _rag_seeded and not force_reseed:
         return
 
     client = get_shared_client()
@@ -974,19 +1091,30 @@ async def initialize_rag_knowledge_base():
             _rag_seeded = True
             return
 
-        # Check whether collection already has data
-        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}",
-                                timeout=5.0)
-        if resp.status_code == 200:
-            stats = resp.json()
-            total_in_db = stats.get("total_chunks", 0)
-            if total_in_db >= len(chunks):
-                logger.info(
-                    "[RAG] Collection '%s' already has %d chunks (>= %d) — skipping seed.",
-                    RAG_COLLECTION, total_in_db, len(chunks)
+        if force_reseed:
+            try:
+                await client.delete(
+                    f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/source/college_info.json",
+                    timeout=5.0
                 )
-                _rag_seeded = True
-                return
+                logger.info("[RAG] Cleared existing college_info.json chunks for re-seed.")
+            except Exception as del_err:
+                logger.warning("[RAG] Failed to clear existing source chunks: %s", del_err)
+
+        # Check whether collection already has data
+        if not force_reseed:
+            resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}",
+                                    timeout=5.0)
+            if resp.status_code == 200:
+                stats = resp.json()
+                total_in_db = stats.get("total_chunks", 0)
+                if total_in_db >= len(chunks):
+                    logger.info(
+                        "[RAG] Collection '%s' already has %d chunks (>= %d) — skipping seed.",
+                        RAG_COLLECTION, total_in_db, len(chunks)
+                    )
+                    _rag_seeded = True
+                    return
 
         logger.info("[RAG] Seeding collection '%s' with %d chunks from college_info.json …",
                     RAG_COLLECTION, len(chunks))
@@ -994,7 +1122,7 @@ async def initialize_rag_knowledge_base():
         for chunk in chunks:
             r = await client.post(
                 f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/index/text",
-                json={"text": chunk, "source": "college_info.json"},
+                json={"text": chunk["text"], "source": "college_info.json", "metadata": chunk["metadata"]},
                 timeout=15.0,
             )
             if r.status_code == 200:
@@ -1005,6 +1133,35 @@ async def initialize_rag_knowledge_base():
 
     except Exception as e:
         logger.warning("[RAG] RAGService unreachable during init (%s). Will retry on next query.", e)
+
+
+async def rag_upsert_entry(entry_id: str, text: str, metadata: dict | None = None) -> int:
+    """
+    Embed + upsert one admin-verified knowledge entry into the RAGService
+    collection, replacing any previous chunks for the same entry_id (see
+    RAGService/rag_store.py::upsert_entry). This is the "self-updating
+    RAG" step: called by backend/admin_knowledge.py right after an admin
+    verifies/edits an answer — no LLM retraining, no server restart, the
+    new fact is searchable on the very next query.
+    """
+    client = get_shared_client()
+    resp = await client.post(
+        f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/entries",
+        json={"entry_id": entry_id, "text": text, "metadata": metadata or {}},
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    return resp.json().get("added", 0)
+
+
+async def rag_delete_entry(entry_id: str) -> None:
+    """Remove a knowledge entry's chunks from the vector store (admin deleted it)."""
+    client = get_shared_client()
+    resp = await client.delete(
+        f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/entries/{entry_id}",
+        timeout=10.0,
+    )
+    resp.raise_for_status()
 
 
 async def retrieve_relevant_context(user_query: str, top_k: int = None) -> tuple[str, float, list[dict]]:

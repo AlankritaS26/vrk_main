@@ -102,35 +102,22 @@ RAG_COLLECTION:  str   = os.getenv("RAG_COLLECTION", "kiosk-rnsit")
 RAG_TOP_K:       int   = int(os.getenv("RAG_TOP_K", "5"))
 RAG_SIMILARITY_THRESHOLD: float = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
 
-DOMAINS_CORRECTIONS = {
-    "pricipal":  "principal",
-    "prinsipal": "principal",
-    "libary":    "library",
-    "placment":  "placement",
-    "fees":      "fee",
-    # Common STT mis-hearings of "RNSIT" (the college's own name!) — these
-    # were silently NOT being fixed before: see the note further down
-    # where q_normalized is built vs. what actually got sent to RAG.
-    "rnsfit":    "rnsit",
-    "ransit":    "rnsit",
-    "rnscit":    "rnsit",
-    "arnsit":    "rnsit",
-    "rnsit's":   "rnsit",
-    "rnsits":    "rnsit",
-}
+# DOMAINS_CORRECTIONS / PHRASE_CORRECTIONS moved to backend/query_correction.py
+# so the deterministic fast-path routing below AND backend/confidence_rag.py
+# (the confidence-based HIGH/MEDIUM/LOW pipeline) always normalize STT input
+# the exact same way — see query_correction.normalize_query().
+from backend.query_correction import normalize_query
+from backend.confidence_rag import (
+    handle_query as confidence_rag_handle_query,
+    handle_query_stream as confidence_rag_handle_query_stream,
+)
+from backend.admin_knowledge import router as admin_knowledge_router
+from backend.database import update_session_context
+from backend.database import (
+    get_unanswered_questions, get_knowledge_entries, get_rag_settings,
+)
+from backend.rag_calibration_log import read_recent_rows
 
-# STT sometimes splits "RNSIT" across multiple tokens instead of mishearing
-# it as one word (e.g. "R N S fit", "run sit") — those can't be fixed by a
-# single-word dict lookup, so they're corrected as whole phrases BEFORE the
-# text is split into words.
-PHRASE_CORRECTIONS = {
-    "rns fit":     "rnsit",
-    "r n s fit":   "rnsit",
-    "run sit":     "rnsit",
-    "rn sit":      "rnsit",
-    "r and s fit": "rnsit",
-    "r n site":    "rnsit",
-}
 # --- REDIS / MEMURAI CACHING ---
 try:
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
@@ -148,21 +135,11 @@ mongo_client = AsyncIOMotorClient(MONGO_URI) if MONGO_URI else None
 db = mongo_client.rnsit_db if mongo_client else None
 
 # --- SECURITY GATE CONFIGURATION ---
-security = HTTPBasic()
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "111111"
-
-def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
-    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
-    
-    if not (correct_username and correct_password):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid admin credentials",
-            headers={},
-        )
-    return credentials.username
+# Moved to backend/admin_auth.py — was previously duplicated (with a
+# different credential source!) in backend/admin_knowledge.py. Both now
+# import from the same place. See admin_auth.py's docstring for the bug
+# this fixes.
+from backend.admin_auth import security, ADMIN_USERNAME, ADMIN_PASSWORD, authenticate_admin
 
 # Shared state
 active_session: dict | None = None
@@ -310,12 +287,6 @@ EASTER_EGGS = {
     "how are you": [
         "I'm doing great, thanks for asking! Ready to help you explore RNSIT — what can I do for you?",
         "Feeling good and fully charged! What would you like to know about RNSIT?",
-    ],
-    "what is the weather today": [
-        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
-    ],
-    "how is the weather": [
-        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
     ],
     "good job": [
         "Aw, thank you! That made my day. Anything else I can help you with?",
@@ -595,6 +566,10 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="RNSIT Digital Receptionist", lifespan=lifespan)
 
+# Admin Knowledge-Update Loop endpoints (unanswered-question review,
+# verify/answer, knowledge_entries CRUD -> self-updating RAGService upsert)
+app.include_router(admin_knowledge_router)
+
 # 1. Read the comma-separated string from .env and split it into an actual list
 origins_raw = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [origin.strip() for origin in origins_raw.split(",") if origin.strip()]
@@ -802,6 +777,15 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     sessions_list = await db.sessions.find().sort([("started_at", -1), ("last_activity", -1)]).limit(100).to_list(length=100)
     profile_list = await db.college_profile.find().limit(100).to_list(length=100)
 
+    # NEW: Knowledge Update Loop — pending unknown questions + admin-
+    # verified knowledge entries (see backend/admin_knowledge.py). These
+    # power the two new tabs below, so admin can review/answer/edit
+    # straight from this dashboard instead of calling the API directly.
+    unanswered_list = await get_unanswered_questions(status="pending", limit=200)
+    knowledge_list = await get_knowledge_entries(limit=300)
+    rag_settings = await get_rag_settings()
+    calibration_rows = read_recent_rows(limit=100)
+
     # --- Tab 1: Build Interactions rows ---
     interaction_rows = ""
     for idx, item in enumerate(interactions_list):
@@ -900,6 +884,83 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
             <td><strong>{item.get('question_or_key', item.get('question', 'N/A'))}</strong></td>
             <td>{item.get('fact_details', item.get('answer', 'N/A'))}</td>
             <td><span class="badge" style="background:#e2e8f0; color:#475569;">Static</span></td>
+        </tr>
+        """
+
+    # --- Tab 5: Build Unanswered Questions rows (Admin Knowledge-Update Loop) ---
+    import json as _json_mod
+    unanswered_rows = ""
+    for idx, item in enumerate(unanswered_list):
+        qid = item.get("question_id", "")
+        qtext = item.get("question_text", "")
+        ask_count = item.get("ask_count", 1)
+        last_asked = (item.get("last_asked_at") or "")[:19]
+        qtext_js = _json_mod.dumps(qtext)
+        unanswered_rows += f"""
+        <tr id="unanswered-{qid}">
+            <td>{idx + 1}</td>
+            <td><strong>{qtext}</strong></td>
+            <td><span class="badge" style="background:#fef3c7;color:#92400e;">Asked {ask_count}x</span></td>
+            <td><span class="badge">{last_asked}</span></td>
+            <td id="unanswered-actions-{qid}">
+                <button class="btn btn-edit" onclick="showAnswerForm('{qid}', {qtext_js})">Answer</button>
+                <button class="btn btn-danger" onclick="dismissUnanswered('{qid}')">Dismiss</button>
+            </td>
+        </tr>
+        """
+
+    # --- Tab 6: Build Knowledge Entries rows (verified, self-updating source of truth) ---
+    knowledge_rows = ""
+    for idx, item in enumerate(knowledge_list):
+        eid = item.get("entry_id", "")
+        q_js = _json_mod.dumps(item.get("question", ""))
+        a_js = _json_mod.dumps(item.get("answer", ""))
+        cat_js = _json_mod.dumps(item.get("category", "General"))
+        etype_js = _json_mod.dumps(item.get("entity_type", ""))
+        ename_js = _json_mod.dumps(item.get("entity_name", ""))
+        updated_at = (item.get("updated_at") or "")[:19]
+        knowledge_rows += f"""
+        <tr id="knowledge-{eid}">
+            <td>{idx + 1}</td>
+            <td><span class="badge" style="background:#0066cc; color:white;">{item.get('category', 'General')}</span></td>
+            <td><strong id="knowledge-q-{eid}">{item.get('question', '')}</strong></td>
+            <td id="knowledge-a-{eid}">{item.get('answer', '')}</td>
+            <td><span class="badge">{updated_at}</span></td>
+            <td id="knowledge-actions-{eid}">
+                <button class="btn btn-edit" onclick="showEditEntryForm('{eid}', {q_js}, {a_js}, {cat_js}, {etype_js}, {ename_js})">Edit</button>
+                <button class="btn btn-danger" onclick="deleteKnowledgeEntry('{eid}')">Delete</button>
+            </td>
+        </tr>
+        """
+
+    # --- Tab 7: Build Calibration Log rows (threshold-tuning event log) ---
+    def _route_badge_color(route: str) -> str:
+        route = (route or "").upper()
+        if "AMBIGUOUS" in route: return "#fef3c7;color:#92400e"
+        if "OUT_OF_SCOPE" in route: return "#fee2e2;color:#991b1b"
+        if "UNKNOWN" in route: return "#fee2e2;color:#991b1b"
+        if route.startswith("HIGH"): return "#dcfce7;color:#166534"
+        if route.startswith("MEDIUM"): return "#fef3c7;color:#92400e"
+        return "#e2e8f0;color:#475569"
+
+    calibration_rows_html = ""
+    for row in calibration_rows:
+        route = row.get("route") or row.get("resolution", "")
+        badge = _route_badge_color(route)
+        calibration_rows_html += f"""
+        <tr>
+            <td style="white-space:nowrap;">{(row.get('timestamp') or '')[:19]}</td>
+            <td><strong>{row.get('question', '')}</strong></td>
+            <td>{row.get('top_score', '')}</td>
+            <td>{row.get('second_score', '')}</td>
+            <td>{row.get('score_gap', '')}</td>
+            <td>{row.get('top_entity', '')}</td>
+            <td>{row.get('second_entity', '')}</td>
+            <td>{row.get('confidence_band', '')}</td>
+            <td><span class="badge" style="background:{badge};">{route}</span></td>
+            <td>{row.get('event_type', '')}</td>
+            <td>{row.get('resolution', '')}</td>
+            <td>{row.get('answer_source', '')}</td>
         </tr>
         """
 
@@ -1037,6 +1098,132 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
                         </tbody>
                     </table>
                 </div>
+
+                <input type="radio" name="admin_tabs" id="tab_unanswered">
+                <label for="tab_unanswered"> ❓ Unknown Questions ({len(unanswered_list)})</label>
+                <div class="tab-content">
+                    <h3>Unanswered Questions Queue (`unanswered_questions` collection)</h3>
+                    <p class="subtitle" style="margin-top:-5px;">
+                        RNSIT-related questions the kiosk couldn't confidently answer, sorted by how often
+                        visitors asked them. Answer one to instantly publish it — the kiosk will use it on
+                        the very next matching query, no restart needed.
+                    </p>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width: 5%">#</th>
+                                <th style="width: 40%">Question</th>
+                                <th style="width: 15%">Frequency</th>
+                                <th style="width: 15%">Last Asked</th>
+                                <th style="width: 25%">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {unanswered_rows if unanswered_rows else "<tr><td colspan='5' style='text-align:center;'>No pending unknown questions — nice and caught up! 🎉</td></tr>"}
+                        </tbody>
+                    </table>
+                </div>
+
+                <input type="radio" name="admin_tabs" id="tab_knowledge">
+                <label for="tab_knowledge"> ✅ Verified Knowledge ({len(knowledge_list)})</label>
+                <div class="tab-content">
+                    <h3>Admin-Verified Knowledge Entries (`knowledge_entries` collection)</h3>
+                    <p class="subtitle" style="margin-top:-5px;">
+                        Live, self-updating source of truth — every edit here replaces (never duplicates)
+                        the matching chunk in the vector store, so visitors never get a stale answer.
+                    </p>
+                    <button class="btn btn-edit" style="margin-bottom:14px;padding:8px 16px;" onclick="showCreateEntryForm()">+ Add New Knowledge Entry</button>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th style="width: 5%">#</th>
+                                <th style="width: 12%">Category</th>
+                                <th style="width: 25%">Question</th>
+                                <th style="width: 33%">Answer</th>
+                                <th style="width: 10%">Updated</th>
+                                <th style="width: 15%">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {knowledge_rows if knowledge_rows else "<tr><td colspan='6' style='text-align:center;'>No verified entries yet.</td></tr>"}
+                        </tbody>
+                    </table>
+                </div>
+
+                <input type="radio" name="admin_tabs" id="tab_rag_settings">
+                <label for="tab_rag_settings"> ⚙️ Routing Settings</label>
+                <div class="tab-content">
+                    <h3>Confidence-RAG Routing Thresholds</h3>
+                    <p class="subtitle" style="margin-top:-5px;">
+                        Tune the HIGH/MEDIUM/LOW confidence bands without touching code or restarting the
+                        server. Changes take effect on the next query (within ~30s, or immediately after
+                        you hit Save). Scores are 1 − cosine distance, so values run roughly 0 (unrelated)
+                        to 1 (near-identical).
+                    </p>
+                    <div style="max-width:520px;display:flex;flex-direction:column;gap:14px;margin-top:16px;">
+                        <label style="font-size:13px;color:#334155;">
+                            HIGH confidence threshold — answers directly if score is at or above this
+                            <input type="number" id="rs-high" step="0.01" min="0" max="1" value="{rag_settings.get('high_threshold')}"
+                                style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;margin-top:4px;">
+                        </label>
+                        <label style="font-size:13px;color:#334155;">
+                            MEDIUM confidence threshold — asks "Are you asking about X?" if score is at or above this (but below HIGH)
+                            <input type="number" id="rs-near" step="0.01" min="0" max="1" value="{rag_settings.get('near_threshold')}"
+                                style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;margin-top:4px;">
+                        </label>
+                        <label style="font-size:13px;color:#334155;">
+                            Scope-check lower bound — below this AND no keyword match ⇒ treated as out-of-scope
+                            <input type="number" id="rs-scope" step="0.01" min="0" max="1" value="{rag_settings.get('scope_threshold')}"
+                                style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;margin-top:4px;">
+                        </label>
+                        <label style="font-size:13px;color:#334155;">
+                            Ambiguity gap — max top-1/top-2 score difference still treated as "too close to call"
+                            <input type="number" id="rs-gap" step="0.01" min="0" max="1" value="{rag_settings.get('ambiguity_gap')}"
+                                style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;margin-top:4px;">
+                        </label>
+                        <label style="font-size:13px;color:#334155;">
+                            Text-similarity fallback threshold — used only when top-1/top-2 lack entity metadata
+                            <input type="number" id="rs-textsim" step="0.01" min="0" max="1" value="{rag_settings.get('text_similarity_threshold')}"
+                                style="width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;margin-top:4px;">
+                        </label>
+                        <div>
+                            <button class="btn btn-edit" onclick="saveRagSettings()">Save Settings</button>
+                        </div>
+                        <div style="font-size:12px;color:#94a3b8;">
+                            Last updated: {rag_settings.get('updated_at', 'never (using env/default values)')}
+                            {f"by {rag_settings.get('updated_by')}" if rag_settings.get('updated_by') else ""}
+                        </div>
+                    </div>
+                </div>
+
+                <input type="radio" name="admin_tabs" id="tab_calibration">
+                <label for="tab_calibration"> 📊 Calibration Log ({len(calibration_rows)})</label>
+                <div class="tab-content">
+                    <h3>Routing Decision Log</h3>
+                    <p class="subtitle" style="margin-top:-5px;">
+                        One row per routing decision — every HIGH/MEDIUM/LOW call the pipeline has made,
+                        plus a linked row when a MEDIUM confirmation or HIGH ambiguity question gets
+                        resolved on the next turn. Use this to actually calibrate the thresholds above
+                        against real traffic instead of guessing.
+                    </p>
+                    <a href="/api/admin/knowledge/calibration-log/download">
+                        <button class="btn btn-edit" style="margin-bottom:14px;padding:8px 16px;">⬇ Download Full CSV</button>
+                    </a>
+                    <div style="overflow-x:auto;">
+                    <table style="font-size:12px;">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th><th>Question</th><th>Top</th><th>2nd</th><th>Gap</th>
+                                <th>Top Entity</th><th>2nd Entity</th><th>Band</th><th>Route</th>
+                                <th>Event</th><th>Resolution</th><th>Source</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {calibration_rows_html if calibration_rows_html else "<tr><td colspan='12' style='text-align:center;'>No routing decisions logged yet — ask the kiosk a few questions first.</td></tr>"}
+                        </tbody>
+                    </table>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -1118,6 +1305,132 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
                         alert(result.message);
                         location.reload();
                     }}
+                }}
+            }}
+
+            // ── Admin Knowledge-Update Loop ─────────────────────────────
+            // Renders a small inline answer form in place of the Answer/
+            // Dismiss buttons for one unanswered question.
+            function showAnswerForm(questionId, questionText) {{
+                const cell = document.getElementById(`unanswered-actions-${{questionId}}`);
+                cell.innerHTML = `
+                    <div style="display:flex;flex-direction:column;gap:6px;min-width:260px;">
+                        <textarea id="answer-text-${{questionId}}" rows="3"
+                            placeholder="Verified answer for: ${{questionText.replace(/"/g, '&quot;')}}"
+                            style="padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;font-family:inherit;"></textarea>
+                        <div style="display:flex;gap:6px;">
+                            <input id="answer-category-${{questionId}}" placeholder="Category (e.g. Admissions)" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;">
+                            <input id="answer-entity-${{questionId}}" placeholder="Entity name (e.g. CSE Department)" style="flex:1;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;">
+                        </div>
+                        <div>
+                            <button class="btn btn-edit" onclick="submitAnswer('${{questionId}}')">Save &amp; Publish</button>
+                            <button class="btn" style="background:#f1f5f9;color:#475569;" onclick="location.reload()">Cancel</button>
+                        </div>
+                    </div>
+                `;
+            }}
+
+            async function submitAnswer(questionId) {{
+                const answer = document.getElementById(`answer-text-${{questionId}}`).value.trim();
+                if (!answer) {{ alert("Please enter an answer before publishing."); return; }}
+                const category = document.getElementById(`answer-category-${{questionId}}`).value.trim() || "General";
+                const entity_name = document.getElementById(`answer-entity-${{questionId}}`).value.trim();
+                const result = await makeRequest(`/api/admin/knowledge/unanswered/${{questionId}}/verify`, "POST", {{
+                    answer, category, entity_type: "", entity_name
+                }});
+                if (result) {{
+                    alert("Published — this answer is now live for future queries.");
+                    document.getElementById(`unanswered-${{questionId}}`)?.remove();
+                }}
+            }}
+
+            async function dismissUnanswered(questionId) {{
+                if (confirm("Dismiss this question without answering it? (It will stop showing up here, but will re-appear if a visitor asks it again.)")) {{
+                    const result = await makeRequest(`/api/admin/knowledge/unanswered/${{questionId}}`, "DELETE");
+                    if (result) {{
+                        document.getElementById(`unanswered-${{questionId}}`)?.remove();
+                    }}
+                }}
+            }}
+
+            // Verified Knowledge Entries — edit in place (replaces the old
+            // vector chunk, never leaves a stale duplicate behind).
+            function showEditEntryForm(entryId, question, answer, category, entityType, entityName) {{
+                const qCell = document.getElementById(`knowledge-q-${{entryId}}`);
+                const aCell = document.getElementById(`knowledge-a-${{entryId}}`);
+                const actionsCell = document.getElementById(`knowledge-actions-${{entryId}}`);
+                qCell.innerHTML = `<textarea id="edit-q-${{entryId}}" rows="2" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;">${{question}}</textarea>`;
+                aCell.innerHTML = `<textarea id="edit-a-${{entryId}}" rows="3" style="width:100%;padding:6px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;">${{answer}}</textarea>
+                    <input id="edit-cat-${{entryId}}" value="${{category}}" placeholder="Category" style="width:100%;margin-top:4px;padding:5px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;">
+                    <input id="edit-entity-${{entryId}}" value="${{entityName}}" placeholder="Entity name" style="width:100%;margin-top:4px;padding:5px;border:1px solid #cbd5e1;border-radius:4px;font-size:12px;">`;
+                actionsCell.innerHTML = `
+                    <button class="btn btn-edit" onclick="submitEditEntry('${{entryId}}')">Save</button>
+                    <button class="btn" style="background:#f1f5f9;color:#475569;" onclick="location.reload()">Cancel</button>
+                `;
+            }}
+
+            async function submitEditEntry(entryId) {{
+                const question = document.getElementById(`edit-q-${{entryId}}`).value.trim();
+                const answer = document.getElementById(`edit-a-${{entryId}}`).value.trim();
+                const category = document.getElementById(`edit-cat-${{entryId}}`).value.trim() || "General";
+                const entity_name = document.getElementById(`edit-entity-${{entryId}}`).value.trim();
+                if (!answer) {{ alert("Answer can't be empty."); return; }}
+                const result = await makeRequest(`/api/admin/knowledge/entries/${{entryId}}`, "PUT", {{
+                    question, answer, category, entity_name
+                }});
+                if (result) {{
+                    alert("Updated — the vector store entry has been replaced, not duplicated.");
+                    location.reload();
+                }}
+            }}
+
+            async function deleteKnowledgeEntry(entryId) {{
+                if (confirm("Delete this verified knowledge entry? It will be removed from the vector store too.")) {{
+                    const result = await makeRequest(`/api/admin/knowledge/entries/${{entryId}}`, "DELETE");
+                    if (result) {{
+                        document.getElementById(`knowledge-${{entryId}}`)?.remove();
+                    }}
+                }}
+            }}
+
+            // Add a brand-new knowledge entry (not sourced from an unanswered question)
+            function showCreateEntryForm() {{
+                const question = prompt("New question (what a visitor might ask):");
+                if (!question) return;
+                const answer = prompt("Verified answer:");
+                if (!answer) return;
+                const category = prompt("Category (e.g. Admissions, Hostel, Placements):", "General") || "General";
+                const entity_name = prompt("Entity name (optional — helps disambiguation, e.g. 'CSE Department'):", "") || "";
+                makeRequest("/api/admin/knowledge/entries", "POST", {{
+                    question, answer, category, entity_type: "", entity_name
+                }}).then(result => {{
+                    if (result) {{ alert("Knowledge entry created and published."); location.reload(); }}
+                }});
+            }}
+
+            // ── Confidence-RAG routing thresholds ───────────────────────
+            async function saveRagSettings() {{
+                const high = parseFloat(document.getElementById("rs-high").value);
+                const near = parseFloat(document.getElementById("rs-near").value);
+                const scope = parseFloat(document.getElementById("rs-scope").value);
+                const gap = parseFloat(document.getElementById("rs-gap").value);
+                const textsim = parseFloat(document.getElementById("rs-textsim").value);
+
+                if ([high, near, scope, gap, textsim].some(v => isNaN(v) || v < 0 || v > 1)) {{
+                    alert("All threshold values must be numbers between 0 and 1.");
+                    return;
+                }}
+                if (near >= high) {{
+                    alert("MEDIUM threshold must be lower than HIGH threshold.");
+                    return;
+                }}
+                const result = await makeRequest("/api/admin/knowledge/settings", "PUT", {{
+                    high_threshold: high, near_threshold: near, scope_threshold: scope,
+                    ambiguity_gap: gap, text_similarity_threshold: textsim,
+                }});
+                if (result) {{
+                    alert("Routing settings saved — effective immediately.");
+                    location.reload();
                 }}
             }}
         </script>
@@ -1404,18 +1717,11 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             return answer, "easter_egg", "CONTINUE"
 
     # ─── Change Name Request ────────────────────────────────────────────────
-    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
+    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul"
     name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"^(?:i am|iam|myself)\s+([a-zA-Z\s,.-]+)", q_normalized)
+                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:change|update|set|rename)\s+my\s+name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized)
 
-    if not name_change_match and len(q_normalized.split()) in (1, 2):
-        _words = q_normalized.split()
-        if all(w.isalpha() and len(w) >= 2 for w in _words):
-            _non_name = {"where", "what", "how", "when", "who", "which", "can", "tell", "fees", "admission", "hostel", "placement", "library", "department", "principal", "hod", "contact", "address", "course", "branch", "branches", "syllabus", "exam", "seat", "cutoff", "rnsit", "college", "campus", "building", "block", "canteen", "sports", "yes", "no", "guest", "skip", "continue", "ok", "okay", "bye", "thanks", "thank you", "hello", "hi", "hey", "help", "info", "details"}
-            if not any(w in _non_name for w in _words):
-                name_change_match = re.search(r"^([a-zA-Z\s]+)$", q_normalized)
     if name_change_match:
         new_name_raw = name_change_match.group(1).strip()
         if "," in new_name_raw:
@@ -1550,19 +1856,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     if not verify_input_safety(question):
         raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
 
-    q_clean = question.lower().strip()
-    q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
-
-    # Multi-word mis-hearings (e.g. "r n s fit") first, then single-word
-    # ones — both feed into q_normalized, which is what's actually sent
-    # to retrieval below (see the "corrected_question" note further down).
-    for wrong_phrase, right_phrase in PHRASE_CORRECTIONS.items():
-        q_clean = re.sub(rf"(?:^|\s){re.escape(wrong_phrase)}(?:$|\s)", f" {right_phrase} ", q_clean)
-    q_clean = q_clean.strip()
-
-    words           = q_clean.split()
-    corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
-    q_normalized    = " ".join(corrected_words)
+    q_normalized = normalize_query(question)
 
     sid          = active_session["session_id"] if active_session else "unknown"
     fid          = active_session.get("face_id") if active_session else None
@@ -1589,6 +1883,13 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     det = await _deterministic_route(q_normalized, sid, visitor_name)
     if det is not None:
         answer, source, session_action = det
+        print(f"USER QUERY: {question}")
+        print(f"NORMALIZED QUERY: {q_normalized}")
+        print(f"DETECTED INTENT: {source.upper()}")
+        print(f"DETECTED ENTITY: {source.upper()}")
+        print("ENTITY CONFIDENCE: 1.00")
+        print(f"RETRIEVAL RESULT: {answer[:120]}")
+        print(f"ANSWER SOURCE: {source}")
         return await _respond(answer, source=source, session_action=session_action)
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
@@ -1602,44 +1903,57 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── RNSIT_RAG / GENERAL_LLM / LIVE_INFO / UNSUPPORTED_EXTERNAL ─────────
-    # generate_rag_kiosk_response is the real pipeline: condense follow-up
-    # questions using recent history -> semantic search against RAGService
-    # -> threshold check -> ground the LOCAL LLM in the retrieved context (or
-    # route off-topic questions through _handle_offtopic) -> natural answer.
-    # This is the function that was previously built but never wired up to
-    # any live endpoint — /ask used to call the LLM-free query_rag_service
-    # instead, which is why answers kept working with the LLM disconnected.
+    # ─── Confidence-based RAG pipeline (HIGH/MEDIUM/LOW routing, ambiguity
+    # clarification, best-candidate confirmation, scope-aware unknown
+    # handling) — see backend/confidence_rag.py. Replaces the old direct
+    # call into generate_rag_kiosk_response, which had no confidence
+    # bands, no clarification step, and no unanswered-question tracking.
     recent_history = [
         {"speaker": m["speaker"], "text": m["text"]}
         for m in message_log[-6:]
         if m.get("index") != visitor_entry.get("index")
     ]
 
+    rag_state = active_session.get("rag_state", {}) if active_session else {}
+    route = "rag_llm"
     try:
-        # THE FIX: q_normalized already has DOMAINS_CORRECTIONS/PHRASE_
-        # CORRECTIONS applied (typos, and STT mis-hearings of "RNSIT"
-        # itself) but was previously only used for greeting/farewell/
-        # memory-recall matching — RAG retrieval was still getting the
-        # raw, uncorrected `question`, so a misheard "RNSFIT" never got
-        # normalized back to "RNSIT" before the embedding search ran.
-        answer = await generate_rag_kiosk_response(q_normalized, history=recent_history)
+        result = await confidence_rag_handle_query(
+            q_normalized, history=recent_history, session_state=rag_state,
+            session_id=sid, face_id=fid,
+        )
+        answer = result["answer"]
+        route = result["route"].lower()
 
-        if redis_client and answer:
+        if active_session is not None:
+            active_session["rag_state"] = result["session_state"]
+
+        # Only cache clean HIGH-confidence, non-clarification answers —
+        # caching a "Did you mean A or B?" or "Are you asking about X?"
+        # under the ORIGINAL question's key would serve that clarification
+        # question to every future visitor who asks the same thing.
+        if redis_client and answer and route.startswith("high_") and "ambiguous" not in route:
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
-                else:
-                    logger.info("[REDIS] Skipped caching a fallback/apology answer "
-                               "(would have poisoned this question for 1 hour): %r", answer[:80])
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
 
     except Exception as exc:
-        logger.error("[LLM PIPELINE] generate_rag_kiosk_response failed: %s", exc)
+        logger.error("[CONF-RAG PIPELINE] handle_query failed: %s", exc)
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="rag_llm")
+    # Session-context write-back (diagram: "AFTER EVERY TERMINAL RESPONSE") —
+    # best-effort; a failure here must never break the visitor-facing answer.
+    try:
+        await update_session_context(sid, {
+            "query": question, "answer": answer, "route": route,
+            "entity": (active_session.get("rag_state", {}) or {}).get("last_topic") if active_session else None,
+            "timestamp": datetime.now().isoformat(),
+        })
+    except Exception as exc:
+        logger.warning("[SESSION] context write-back failed: %s", exc)
+
+    return await _respond(answer, source=route)
 
 
 @app.get("/ask/stream")
@@ -1671,14 +1985,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
     if not verify_input_safety(question):
         raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
 
-    q_clean = question.lower().strip()
-    q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
-    for wrong_phrase, right_phrase in PHRASE_CORRECTIONS.items():
-        q_clean = re.sub(rf"(?:^|\s){re.escape(wrong_phrase)}(?:$|\s)", f" {right_phrase} ", q_clean)
-    q_clean = q_clean.strip()
-    words           = q_clean.split()
-    corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
-    q_normalized    = " ".join(corrected_words)
+    q_normalized = normalize_query(question)
 
     sid          = active_session["session_id"] if active_session else "unknown"
     fid          = active_session.get("face_id") if active_session else None
@@ -1700,9 +2007,16 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
         det = await _deterministic_route(q_normalized, sid, visitor_name)
         if det is not None:
             answer, source, session_action = det
+            print(f"USER QUERY: {question}")
+            print(f"NORMALIZED QUERY: {q_normalized}")
+            print(f"DETECTED INTENT: {source.upper()}")
+            print(f"DETECTED ENTITY: {source.upper()}")
+            print("ENTITY CONFIDENCE: 1.00")
+            print(f"RETRIEVAL RESULT: {answer[:120]}")
+            print(f"ANSWER SOURCE: {source}")
             yield f"data: {json.dumps({'sentence': answer})}\n\n"
             await _finish(answer, session_action)
-            yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': session_action})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': session_action, 'detected_entity': source.upper(), 'source': source})}\n\n"
             return
 
         # ── Redis cache — also a single instant chunk, same as /ask ──────
@@ -1719,36 +2033,65 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             except Exception as e:
                 logger.warning("Redis read error: %s", e)
 
-        # ── Real streaming path: RNSIT_RAG / off-topic / etc. ─────────────
+        # ── Confidence-based RAG pipeline (same routing as /ask — see
+        # backend/confidence_rag.py). HIGH-confidence, non-ambiguous
+        # answers stream sentence-by-sentence via handle_query_stream
+        # (real incremental LLM output, same as the old pipeline used to
+        # do). MEDIUM confirmations, HIGH ambiguity questions, and LOW
+        # scope-check responses are short, non-generated strings — those
+        # come back as a single chunk since there's nothing to stream.
         recent_history = [
             {"speaker": m["speaker"], "text": m["text"]}
             for m in message_log[-6:]
             if m.get("index") != visitor_entry.get("index")
         ]
 
-        parts: list[str] = []
+        rag_state = active_session.get("rag_state", {}) if active_session else {}
+        route = "rag_llm"
+        answer: str | None = None
+        answer_parts: list[str] = []
         try:
-            async for sentence in generate_rag_kiosk_response_stream(q_normalized, history=recent_history):
-                parts.append(sentence)
-                yield f"data: {json.dumps({'sentence': sentence})}\n\n"
-            answer = "".join(parts).strip()
-            if not answer:
-                answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
-                yield f"data: {json.dumps({'sentence': answer})}\n\n"
+            async for chunk in confidence_rag_handle_query_stream(
+                q_normalized, history=recent_history, session_state=rag_state,
+                session_id=sid, face_id=fid,
+            ):
+                route = chunk["route"].lower()
+                if chunk.get("partial"):
+                    # One sentence of a HIGH-confidence LLM answer as it's generated.
+                    answer_parts.append(chunk["answer"])
+                    yield f"data: {json.dumps({'sentence': chunk['answer']})}\n\n"
+                    continue
+                # Non-partial chunk = the complete answer for this turn
+                # (clarification/confirmation/scope-check/RAG-only
+                # fallback, OR the final marker after a streamed HIGH
+                # answer — either way it's the last thing we'll see).
+                if not answer_parts:
+                    yield f"data: {json.dumps({'sentence': chunk['answer']})}\n\n"
+                answer = chunk["answer"]
+                if active_session is not None and "session_state" in chunk:
+                    active_session["rag_state"] = chunk["session_state"]
+            if answer is None:
+                answer = "".join(answer_parts).strip() or "I'm having trouble processing that right now."
         except Exception as exc:
-            logger.error("[LLM PIPELINE] generate_rag_kiosk_response_stream failed: %s", exc)
+            logger.error("[CONF-RAG PIPELINE] handle_query_stream failed: %s", exc)
             answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
             yield f"data: {json.dumps({'sentence': answer})}\n\n"
 
-        if redis_client and answer:
+        if redis_client and answer and route.startswith("high_") and "ambiguous" not in route:
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
-                else:
-                    logger.info("[REDIS] Skipped caching a fallback/apology answer "
-                               "(would have poisoned this question for 1 hour): %r", answer[:80])
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
+
+        try:
+            await update_session_context(sid, {
+                "query": question, "answer": answer, "route": route,
+                "entity": (active_session.get("rag_state", {}) or {}).get("last_topic") if active_session else None,
+                "timestamp": datetime.now().isoformat(),
+            })
+        except Exception as exc:
+            logger.warning("[SESSION] context write-back failed: %s", exc)
 
         await _finish(answer, "CONTINUE")
         yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': 'CONTINUE'})}\n\n"

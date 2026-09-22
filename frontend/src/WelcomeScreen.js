@@ -39,6 +39,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
+  const lastAnswerRef = useRef('');              // stores the most recent full answer text for resume-on-interrupt
+  const wasInterruptedRef = useRef(false);       // true if TTS was barged-in before it finished — triggers "want to continue?" offer
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -147,12 +149,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }]);
   }, [setMessages]);
 
-  // Starts an EMPTY kiosk bubble and returns an appender that grows it one
-  // sentence at a time (used by sendToBackend + speakStream's onSentence so
-  // the bubble fills in exactly as fast as the voice speaks it).
-  const startProgressiveMessage = useCallback((speaker) => {
+  // Starts a kiosk bubble with optional initial text (e.g. first sentence)
+  // so text is displayed immediately when answer arrives, then grows as Nova speaks.
+  const startProgressiveMessage = useCallback((speaker, initialText = '') => {
+    const cleanedInitial = cleanText(initialText);
     setMessages(prev => [...prev, {
-      text: '', speaker,
+      text: cleanedInitial, speaker,
       timestamp: new Date().toLocaleTimeString()
     }]);
     return (sentence) => {
@@ -160,6 +162,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!prev.length) return prev;
         const next = prev.slice();
         const last = next[next.length - 1];
+        const cleanedSentence = cleanText(sentence);
+        if (last.text && (last.text === cleanedSentence || last.text.endsWith(cleanedSentence))) {
+          return prev;
+        }
         const sep = last.text ? ' ' : '';
         next[next.length - 1] = { ...last, text: cleanText(last.text + sep + sentence) };
         return next;
@@ -287,10 +293,24 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           return;
         }
         lastProcessedTextRef.current = { text: heard, time: now };
+        wasInterruptedRef.current = false;   // visitor spoke something — clear interrupt flag
         if (isMounted.current) setLiveText(heard);
         sendToBackend(heard);
       } else {
-        setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+        // Empty/too-short STT result after a barge-in interruption:
+        // offer to resume the answer rather than silently going to 'ready'.
+        if (wasInterruptedRef.current && lastAnswerRef.current) {
+          wasInterruptedRef.current = false;
+          const continuePrompt = 'It seems like you wanted to say something — would you like me to continue with the full answer?';
+          addMessage(continuePrompt, 'kiosk');
+          speak(continuePrompt);
+          // The visitor can then say "yes" / "continue" which will be caught
+          // by the resume intent check in sendToBackend on their next utterance.
+          // We pre-set wasInterruptedRef so the next "yes" also works:
+          wasInterruptedRef.current = true;
+        } else {
+          setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+        }
       }
     } catch (err) {
       console.error('[STT] Error:', err);
@@ -383,7 +403,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (!isMounted.current) return;
           if (isSpeaking.current) {
             if (greetingPlayingRef.current) return;
-            interruptSpeaking();
+            // Duck volume gently on sound onset — do NOT kill TTS audio immediately.
+            // If it's a misfire (echo/noise spike), onMisfire will restore volume.
+            // If it's real speech, onSpeechEnd below will hard-stop TTS.
+            duckSpeaking();
+            return;
           }
           isListening.current = true;
           setListening(true);
@@ -392,6 +416,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (streamRef.current) startWaveform(streamRef.current);
         },
         onSpeechEnd: (audio) => {
+          if (isSpeaking.current) {
+            if (lastAnswerRef.current && !farewellPlayingRef.current && !greetingPlayingRef.current) {
+              wasInterruptedRef.current = true;
+            }
+            interruptSpeaking();
+          }
           handleUtterance(audio);
         },
         onMisfire: () => {
@@ -404,6 +434,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
           }
         },
+
       });
       micRef.current = mic;
       if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
@@ -445,7 +476,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   //   - onDone fires once, when playback finishes (or is interrupted/falls
   //     back to the browser voice).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speakStream = useCallback(async (text, { onStart, onSentence, onDone } = {}) => {
+  const speakStream = useCallback(async (text, { onStart, onSentence, onDone, initialClipPromise } = {}) => {
     // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
     // (e.g. an acknowledgment like "let me check that" that hasn't finished
     // yet) before starting this one. Without this, two clips play at once —
@@ -489,23 +520,26 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     };
 
     // Fallback: robotic browser voice, only if backend TTS is unavailable.
-    // No per-sentence audio boundaries here, so the full text reveals at once
-    // (still correct: it's the moment THIS voice actually starts talking).
-    const browserSpeak = () => {
+    const browserSpeak = async () => {
       fireStart();
-      if (onSentence) { try { onSentence(text, 0); } catch (e) { } }
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = 'en-US';
-      utter.rate = 1.0;
-      utter.volume = 1;
-      utter.onend = finish;
-      utter.onerror = finish;
-      window.speechSynthesis.speak(utter);
+      for (let i = 0; i < sentences.length; i++) {
+        if (activeSpeakIdRef.current !== myId) break;
+        if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
+        console.log('TTS PLAYING:', sentences[i]);
+        await new Promise((resolveEnd) => {
+          const utter = new SpeechSynthesisUtterance(sentences[i]);
+          utter.lang = 'en-US';
+          utter.rate = 1.0;
+          utter.volume = 1;
+          utter.onend = () => resolveEnd();
+          utter.onerror = () => resolveEnd();
+          window.speechSynthesis.speak(utter);
+        });
+        console.log('TTS COMPLETED:', sentences[i]);
+      }
+      finish();
     };
 
-    // Primary: Kokoro voice, sentence-by-sentence pipeline —
-    // sentence N plays while sentence N+1 synthesizes, so first audio
-    // arrives after ONE sentence instead of the whole reply.
     const fetchClip = (s) =>
       fetch(BACKEND + '/tts', {
         method: 'POST',
@@ -513,144 +547,130 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         body: JSON.stringify({ text: s })
       }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
 
-    // Web Audio: decode (~10ms) + schedule on a running cursor = gapless.
+    // Web Audio setup
     if (!playCtxRef.current) {
       playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
     }
     const pctx = playCtxRef.current;
     if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
-    if (pctx.state === 'suspended') {
-      // Autoplay policy blocked us (no user gesture yet, e.g. the very
-      // first greeting). speechSynthesis is exempt — never stay silent.
-      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice. ' +
-        'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
-      browserSpeak();
-      return;
-    }
-    playCursorRef.current = pctx.currentTime;
+
     if (!ttsGainRef.current) {
       ttsGainRef.current = pctx.createGain();
       ttsGainRef.current.connect(pctx.destination);
     }
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
-    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
+    ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
 
-    // playClip resolves once the clip's audio has actually STARTED (not once
-    // it finishes) — the caller loop awaits it just long enough to fire
-    // onSentence in sync, then moves on to prefetch/schedule the next clip.
-    // Playback itself is scheduled back-to-back on playCursorRef regardless,
-    // so audio stays gapless even though we don't await full playback here.
-    const playClip = (b64, sentenceText, sentenceIndex) => new Promise(async (resolveStarted) => {
-      if (activeSpeakIdRef.current !== myId) return resolveStarted();   // interrupted before this clip started
-      try {
-        const bin = atob(b64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const buf = await pctx.decodeAudioData(bytes.buffer);
-        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
-        const node = pctx.createBufferSource();
-        node.buffer = buf;
-        node.connect(ttsGainRef.current);
-        activeNodesRef.current.push(node);
-        node.onended = () => {
-          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-        };
+    // Sentence splitting
+    const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
+      .map(s => s.trim()).filter(Boolean);
 
-        const at = Math.max(pctx.currentTime, playCursorRef.current);
-        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
-        node.start(at);
-        playCursorRef.current = at + buf.duration;
-
-        // Fire onStart/onSentence exactly when THIS clip's audio begins —
-        // if it's scheduled to start later than "now" (queued behind an
-        // earlier clip that's still playing), wait for that moment instead
-        // of firing immediately, so text and voice stay in lockstep.
-        const announce = () => {
-          fireStart();                                     // status + first-clip-only hook
-          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
-          resolveStarted();
-        };
-        if (delayMs > 0) setTimeout(announce, delayMs);
-        else announce();
-      } catch (e) {
-        resolveStarted();                       // any decode failure -> skip clip
+    const sentences = [];
+    if (raw.length) {
+      let first = raw[0];
+      if (first.length > 60) {
+        const cut = first.indexOf(',');
+        if (cut > 15) {
+          sentences.push(first.slice(0, cut + 1));
+          first = first.slice(cut + 1).trim();
+        }
       }
-    });
+      if (first) sentences.push(first);
+      let buf = '';
+      for (let i = 1; i < raw.length; i++) {
+        buf = buf ? buf + ' ' + raw[i] : raw[i];
+        if (buf.length >= 90) { sentences.push(buf); buf = ''; }
+      }
+      if (buf) sentences.push(buf);
+    }
+
+    if (sentences.length > 1 && sentences[0].length < 25) {
+      sentences[1] = sentences[0] + ' ' + sentences[1];
+      sentences.shift();
+    }
+
+    console.log('TTS QUEUE:', sentences);
+
+    if (pctx.state === 'suspended') {
+      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice. ' +
+        'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
+      await browserSpeak();
+      return;
+    }
 
     try {
-      const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
-        .map(s => s.trim()).filter(Boolean);
-
-      // Chunking for natural pacing:
-      //  - first chunk stays SHORT (fast time-to-first-audio)
-      //  - later sentences MERGE into ~2-sentence chunks so Kokoro speaks
-      //    across full stops itself with human-length pauses, instead of
-      //    one clip per sentence with a synthesis gap at every full stop
-      const sentences = [];
-      if (raw.length) {
-        let first = raw[0];
-        if (first.length > 60) {
-          const cut = first.indexOf(',');
-          if (cut > 15) {
-            sentences.push(first.slice(0, cut + 1));
-            first = first.slice(cut + 1).trim();
-          }
-        }
-        if (first) sentences.push(first);
-        let buf = '';
-        for (let i = 1; i < raw.length; i++) {
-          buf = buf ? buf + ' ' + raw[i] : raw[i];
-          if (buf.length >= 90) { sentences.push(buf); buf = ''; }
-        }
-        if (buf) sentences.push(buf);
-      }
-
-      // A tiny opener ("Hello!", "Sure.") as its own clip creates an
-      // audible seam right after it — merge it into the next chunk.
-      if (sentences.length > 1 && sentences[0].length < 25) {
-        sentences[1] = sentences[0] + ' ' + sentences[1];
-        sentences.shift();
-      }
-
-      // Prefetch two chunks ahead — playback almost never waits on synthesis.
-      // Each playClip() resolves as soon as ITS audio starts (see above), so
-      // this loop moves to fetching/queuing the next chunk immediately, while
-      // the actual audio for every chunk still plays back-to-back via the
-      // shared playCursorRef — sound stays gapless, text reveal stays synced.
-      let anyPlayed = false;
-      let lastClipPromise = Promise.resolve();
-      let p0 = fetchClip(sentences[0]);
-      let p1 = sentences.length > 1 ? fetchClip(sentences[1]) : null;
+      console.log('TTS START:', text);
+      fireStart();
+      // Sequential audio queue:
+      // Prefetch chunk N+1 in parallel while chunk N plays,
+      // but only start playing chunk N+1 once chunk N has completely finished.
+      let prefetchNext = initialClipPromise || (sentences.length > 0 ? fetchClip(sentences[0]) : null);
 
       for (let i = 0; i < sentences.length; i++) {
-        if (activeSpeakIdRef.current !== myId) break;   // interrupted — stop scheduling more chunks
-        const b64 = await p0;
-        p0 = p1;
-        p1 = i + 2 < sentences.length ? fetchClip(sentences[i + 2]) : null;
+        if (activeSpeakIdRef.current !== myId) break;
+
+        const currentSentence = sentences[i];
+        if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
+
+        const nextPrefetch = (i + 1 < sentences.length) ? fetchClip(sentences[i + 1]) : null;
+        const b64 = await prefetchNext;
+        prefetchNext = nextPrefetch;
+
+        if (activeSpeakIdRef.current !== myId) break;
+
+        console.log('TTS PLAYING:', currentSentence);
+        let playedSuccessfully = false;
+
         if (b64) {
-          anyPlayed = true;
-          lastClipPromise = playClip(b64, sentences[i], i);
-          await lastClipPromise;
+          try {
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
+            const buf = await pctx.decodeAudioData(bytes.buffer);
+
+            if (activeSpeakIdRef.current === myId) {
+              const node = pctx.createBufferSource();
+              node.buffer = buf;
+              node.connect(ttsGainRef.current);
+              activeNodesRef.current.push(node);
+
+              await new Promise((resolveEnd) => {
+                node.onended = () => {
+                  activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+                  resolveEnd();
+                };
+                node.start(0);
+              });
+              playedSuccessfully = true;
+            }
+          } catch (decodeErr) {
+            console.warn('[TTS] Web Audio playback failed for chunk, falling back to browser voice:', decodeErr);
+          }
         }
+
+        // Fallback recovery if backend TTS returned null or decode failed
+        if (!playedSuccessfully && activeSpeakIdRef.current === myId) {
+          console.log('[TTS] Browser voice fallback for:', currentSentence);
+          await new Promise((resolveEnd) => {
+            const utter = new SpeechSynthesisUtterance(currentSentence);
+            utter.lang = 'en-US';
+            utter.rate = 1.0;
+            utter.volume = 1;
+            utter.onend = () => resolveEnd();
+            utter.onerror = () => resolveEnd();
+            window.speechSynthesis.speak(utter);
+          });
+        }
+
+        console.log('TTS COMPLETED:', currentSentence);
       }
 
-      if (activeSpeakIdRef.current !== myId) return;    // interrupted — don't fall back to browser voice
-      if (!anyPlayed) { browserSpeak(); return; }
-
-      // Wait for the actual audio (not just the "started" signal) of the
-      // final scheduled clip before calling finish() — otherwise finish()
-      // (and startListening()) can fire while the last sentence is still
-      // being heard.
-      const lastEnd = playCursorRef.current;
-      const remainingMs = Math.max(0, (lastEnd - pctx.currentTime) * 1000);
-      await lastClipPromise;
-      if (remainingMs > 0) await new Promise(r => setTimeout(r, remainingMs));
       if (activeSpeakIdRef.current !== myId) return;
       finish();
     } catch (e) {
       if (activeSpeakIdRef.current !== myId) return;
-      console.error('[TTS] backend unavailable, using browser voice', e);
-      browserSpeak();
+      console.error('[TTS] Error in sequential queue, falling back to browser voice:', e);
+      await browserSpeak();
     }
   }, [startListening]);
 
@@ -698,6 +718,32 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       return;
     }
 
+    // ── Resume-interrupted-answer intent ───────────────────────────────
+    // If noise cut Nova off mid-answer and the visitor says "continue",
+    // "full answer", "repeat", etc. — replay the stored answer without
+    // hitting the backend again.
+    // Also catches "yes"/"yeah" when Nova already asked "Would you like me to continue?"
+    const resumeKeywords = /\b(continue|go on|full answer|complete|finish|what else|rest of|repeat that|say again|resume|give me the full|tell me more|carry on)\b/i.test(text.trim());
+    const resumeYes = wasInterruptedRef.current && /^(yes|yeah|yep|sure|ok|okay|please|go ahead|sure please)[.!?]*$/i.test(text.trim());
+    if ((resumeKeywords || resumeYes) && lastAnswerRef.current) {
+      wasInterruptedRef.current = false;   // reset — visitor acknowledged
+      const storedAnswer = lastAnswerRef.current;
+      console.log('ANSWER RECEIVED:', storedAnswer);
+      console.log('TEXT RENDER START:', storedAnswer);
+      addMessage(storedAnswer, 'kiosk');
+      await new Promise(resolve => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(resolve);
+        });
+      });
+      console.log('TEXT DOM RENDERED:', storedAnswer);
+      console.log('TTS START:', storedAnswer);
+      speakStream(storedAnswer, {
+        onDone: () => { wasInterruptedRef.current = false; },
+      });
+      return;
+    }
+
     // ── Mid-session bare "change my name" prompt (no name given yet) ──────
     // Explicit "change my name to X" / "call me X" patterns are handled by
     // the backend _deterministic_route via /ask below — do NOT early-return
@@ -709,12 +755,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
       || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
 
-    const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
-
-    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "My name is Akshata", "I am Akshata"):
-    if (!isQuestionText && !bareNameChange) {
+    // Fix 1: Only auto-rename when the utterance contains an EXPLICIT name-introduction phrase.
+    // Garbled noise, filler words, or partial questions must never trigger a rename.
+    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text);
+    if (isExplicitNameIntro && !bareNameChange) {
       const candidateName = extractVisitorName(text);
-      if (candidateName && candidateName.split(' ').length <= 3 && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you)$/i.test(candidateName)) {
+      if (candidateName && candidateName.length >= 2 && candidateName.split(' ').length <= 3
+          && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you|done|then|well|so|and|but|or|the|a|an)$/i.test(candidateName)) {
         setLocalName(candidateName);
         fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(candidateName), { method: 'POST' }).catch(() => {});
         const doneMsg = `Done! I have changed your name to ${candidateName}. How may I assist you today?`;
@@ -901,7 +948,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
     if (!isInstantCmd && text.split(' ').length >= 3) {
       const ack = acks[Math.floor(Math.random() * acks.length)];
-      speak(ack, () => setProcessingHint(ack));
+      console.log('THINKING AUDIO START:', ack);
+      speak(ack, () => setProcessingHint(ack), () => {
+        console.log('THINKING AUDIO COMPLETED:', ack);
+      });
     } else {
       setProcessingHint('Thinking...');
       statusRef.current = 'processing';
@@ -943,24 +993,52 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }
 
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
+      console.log('ANSWER RECEIVED:', answer);
+
+      // Start prefetching the first TTS chunk in parallel so synthesis overlaps with DOM paint
+      const fetchFirstClip = (ans) => {
+        const raw = (ans.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [ans]).map(s => s.trim()).filter(Boolean);
+        let first = raw.length ? raw[0] : ans;
+        if (first.length > 60) {
+          const cut = first.indexOf(',');
+          if (cut > 15) first = first.slice(0, cut + 1);
+        }
+        return fetch(BACKEND + '/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: first })
+        }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
+      };
+      const firstClipPromise = fetchFirstClip(answer);
+
+      // Store full answer so resume intent can replay it on interruption
+      lastAnswerRef.current = answer;
+      wasInterruptedRef.current = false;
       fetch(BACKEND + '/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
       });
 
-      // Clear processing hint when answer arrives
       setProcessingHint('');
+      awaitingAnswerRef.current = false;
 
-      let appendSentence = null;
-      speakStream(answer, {
-        onStart: () => {
-          awaitingAnswerRef.current = false;   // real answer is speaking now — resting state is 'ready' again
-          setProcessingHint('');
-          appendSentence = startProgressiveMessage('kiosk');
-        },
-        onSentence: (sentence) => { if (appendSentence) appendSentence(sentence); },
+      // 1. Render FULL answer text into the response box
+      console.log('TEXT RENDER START:', answer);
+      addMessage(answer, 'kiosk');
+
+      // 2. WAIT only for DOM/browser paint before starting answer TTS
+      await new Promise(resolve => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(resolve);
+        });
       });
+
+      console.log('TEXT DOM RENDERED:', answer);
+
+      // 3. Nova voice plays the answer strictly AFTER visible text exists on screen
+      await speakStream(answer, { initialClipPromise: firstClipPromise });
+
     } catch (e) {
       clearTimeout(askTimeout);
       awaitingAnswerRef.current = false;
@@ -969,9 +1047,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       const fallback = e.name === 'AbortError'
         ? "I'm sorry, that's taking longer than expected. Please try asking again."
         : 'Sorry, something went wrong. Please try again.';
-      speak(fallback, () => addMessage(fallback, 'kiosk'));
+      console.log('TEXT RENDER START:', fallback);
+      addMessage(fallback, 'kiosk');
+      await new Promise(resolve => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(resolve);
+        });
+      });
+      console.log('TEXT DOM RENDERED:', fallback);
+      speak(fallback);
     }
-  }, [session, addMessage, speakStream, startProgressiveMessage]);
+  }, [session, addMessage, speakStream]);
 
   // ── Helper parsing for name & guest choices ──
   // Words that must NEVER be treated as a visitor name regardless of context.

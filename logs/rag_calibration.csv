@@ -1,0 +1,238 @@
+decision_id,timestamp,session_id,question,top_score,second_score,score_gap,top_entity,second_entity,confidence_band,ambiguous,route,event_type,user_reply,resolution,answer_source
+b814e3c86b79,2026-09-18T11:11:20,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how many blocks are there in rns it college,0.6865,0.6732,0.0133,Is there a gym on campus?,How many placements in 2025?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+b814e3c86b79,2026-09-18T11:11:48,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant department like how many departments are there or blocks like it blocks cse block etc,,,,,,,,,resolution,i meant department like how many departments are there or blocks like it blocks cse block etc,abandoned,
+97b1b1600c1b,2026-09-18T11:11:49,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant department like how many departments are there or blocks like it blocks cse block etc,0.7625,0.7619,0.0006,CSE (Cyber Security),CSE (Data Science),HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+97b1b1600c1b,2026-09-18T11:13:02,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how many departments are there in rns it,,,,,,,,,resolution,can you tell me how many departments are there in rns it,abandoned,
+2410c430479a,2026-09-18T11:13:03,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how many departments are there in rns it,0.6742,0.6651,0.0091,What departments does RNSIT have?,What can you do,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+2410c430479a,2026-09-18T11:13:30,02ca2831-5db9-436c-8759-30b3d5a413e5,yeah what departments does rns hutti have,,,,,,,,,resolution,yeah what departments does rns hutti have,abandoned,
+75512fb48d29,2026-09-18T11:13:31,02ca2831-5db9-436c-8759-30b3d5a413e5,yeah what departments does rns hutti have,0.6943,0.6811,0.0132,What departments does RNSIT have?,What can you do,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+75512fb48d29,2026-09-18T11:13:54,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant how many department does rns it have tell me their names,,,,,,,,,resolution,i meant how many department does rns it have tell me their names,abandoned,
+9d2b421ace72,2026-09-18T11:13:55,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant how many department does rns it have tell me their names,0.6797,0.6699,0.0098,What can you do,Who is the HOD of AI ML?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+9d2b421ace72,2026-09-18T11:14:46,02ca2831-5db9-436c-8759-30b3d5a413e5,okay tell me who is the principal,,,,,,,,,resolution,okay tell me who is the principal,abandoned,
+d9555df664d3,2026-09-18T11:14:46,02ca2831-5db9-436c-8759-30b3d5a413e5,okay tell me who is the principal,0.6569,0.6270,0.0299,Who is the Principal of RNSIT?,What can you do,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+2918877e8e0a,2026-09-18T12:17:42,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal,0.6612,0.6413,0.0199,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+2918877e8e0a,2026-09-18T12:18:58,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal,,,,,,,,,resolution,who is the principal,abandoned,
+a10d56cea715,2026-09-18T12:18:58,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal,0.6612,0.6413,0.0199,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+a10d56cea715,2026-09-18T12:19:52,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal,,,,,,,,,resolution,who is the principal,abandoned,
+d107e74bdd6e,2026-09-18T12:19:52,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal,0.6612,0.6413,0.0199,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+d107e74bdd6e,2026-09-18T12:20:54,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the chairman of rns it,,,,,,,,,resolution,who is the chairman of rns it,abandoned,
+70aefeec19b8,2026-09-18T12:20:56,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the chairman of rns it,0.7766,0.7063,0.0703,Who is the Chairman of RNSIT?,Who is the Principal of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+4db96ffa6dad,2026-09-18T12:34:33,02ca2831-5db9-436c-8759-30b3d5a413e5,voice ready kharti kharra can you tell me what are the facilities provided by rns it,0.6986,0.6625,0.0361,What can you do,Is there a gym on campus?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+4db96ffa6dad,2026-09-18T12:34:50,02ca2831-5db9-436c-8759-30b3d5a413e5,no i meant to ask like what are the facilities provided by rns it,,,,,,,,,resolution,no i meant to ask like what are the facilities provided by rns it,abandoned,
+fdb78341c38c,2026-09-18T12:34:51,02ca2831-5db9-436c-8759-30b3d5a413e5,no i meant to ask like what are the facilities provided by rns it,0.7483,0.7440,0.0043,What can you do,Is there a gym on campus?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+fdb78341c38c,2026-09-18T12:36:08,02ca2831-5db9-436c-8759-30b3d5a413e5,i wanted to ask what is the admission criteria for joining rns it please can you tell me that,,,,,,,,,resolution,i wanted to ask what is the admission criteria for joining rns it please can you tell me that,abandoned,
+2315d6161d32,2026-09-18T12:36:08,02ca2831-5db9-436c-8759-30b3d5a413e5,i wanted to ask what is the admission criteria for joining rns it please can you tell me that,0.7311,0.7240,0.0071,Scholarships,What can you do,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+2315d6161d32,2026-09-18T12:36:21,02ca2831-5db9-436c-8759-30b3d5a413e5,yeah i meant scholarships,,,,,,,,,resolution,yeah i meant scholarships,disambiguated_a,LOCAL
+e9959e4e0854,2026-09-18T12:36:58,02ca2831-5db9-436c-8759-30b3d5a413e5,then what are the documents required for admission,0.7747,0.6881,0.0866,Documents Required,Admission Process,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+45222e3b22a1,2026-09-18T12:38:03,02ca2831-5db9-436c-8759-30b3d5a413e5,ise hostel in rns it,0.7585,0.7255,0.0330,Hostels,Information Science and Engineering,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+dcdcb408cfc2,2026-09-18T12:48:15,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal of rns i think,0.7332,0.6802,0.0530,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+dcdcb408cfc2,2026-09-18T12:48:36,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal of rns it,,,,,,,,,resolution,who is the principal of rns it,abandoned,
+28434ec05472,2026-09-18T12:48:36,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal of rns it,0.7520,0.6949,0.0571,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+28434ec05472,2026-09-18T12:48:54,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the hod of aiml department,,,,,,,,,resolution,who is the hod of aiml department,abandoned,
+9d6e28dde75e,2026-09-18T12:48:54,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the hod of aiml department,0.7414,0.7115,0.0299,Who is the HOD of AI ML?,CSE (AI and ML),HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+3da8801c4295,2026-09-18T12:49:12,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the hod of cse department,0.8387,0.7027,0.1360,Who is the HOD of CSE?,Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+6a2ef9cf7523,2026-09-18T12:49:53,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the director of rns it,0.7257,0.6590,0.0667,Who is the Director of RNSIT?,Who is the Chairman of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2ad744329f2a,2026-09-18T12:50:51,02ca2831-5db9-436c-8759-30b3d5a413e5,how many departments are there in rns it,0.6844,0.6495,0.0349,What departments does RNSIT have?,How many companies recruit from RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+2ad744329f2a,2026-09-18T12:51:09,02ca2831-5db9-436c-8759-30b3d5a413e5,departments does rns heti have,,,,,,,,,resolution,departments does rns heti have,abandoned,
+de6d78ab45f7,2026-09-18T12:51:10,02ca2831-5db9-436c-8759-30b3d5a413e5,departments does rns heti have,0.6831,0.6635,0.0196,What departments does RNSIT have?,Who is the HOD of AI ML?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+de6d78ab45f7,2026-09-18T12:51:29,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant how many departments does rns it have,,,,,,,,,resolution,i meant how many departments does rns it have,abandoned,
+4694198a565a,2026-09-18T12:51:29,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant how many departments does rns it have,0.6629,0.6522,0.0107,Is there a gym on campus?,What departments does RNSIT have?,HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+a283787ee575,2026-09-18T12:52:10,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me which company that groups from rns it,0.7025,0.6984,0.0041,How many companies recruit from RNSIT?,Placements Overview,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+a283787ee575,2026-09-18T12:54:23,02ca2831-5db9-436c-8759-30b3d5a413e5,hello can you tell me the names of the recruiting companies from rns it,,,,,,,,,resolution,hello can you tell me the names of the recruiting companies from rns it,abandoned,
+bddb5d9a3acf,2026-09-18T12:54:23,02ca2831-5db9-436c-8759-30b3d5a413e5,hello can you tell me the names of the recruiting companies from rns it,0.7910,0.7787,0.0123,Placements Overview,How many companies recruit from RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+bddb5d9a3acf,2026-09-18T12:54:45,02ca2831-5db9-436c-8759-30b3d5a413e5,companies recruit from rns it i meant that,,,,,,,,,resolution,companies recruit from rns it i meant that,abandoned,
+2014b0be162e,2026-09-18T12:54:45,02ca2831-5db9-436c-8759-30b3d5a413e5,companies recruit from rns it i meant that,0.7252,0.7158,0.0094,How many companies recruit from RNSIT?,Placements Overview,HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+916434e037f6,2026-09-18T13:20:01,unknown,Who is the principal of RNS IT?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+19dd677a3601,2026-09-18T13:20:06,unknown,Who is the principal of RNSIT?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+b3b480bfc364,2026-09-18T13:20:11,unknown,Who is the HOD of AIML department?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+9966d6e4f525,2026-09-18T13:20:15,unknown,Who is the HOD of AI ML?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+d06552fbfc75,2026-09-18T13:20:20,unknown,Who is the HOD of CSE department?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+8cae2d34ed5c,2026-09-18T13:20:24,unknown,How many departments does RNS IT have?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+67ba34e3be8c,2026-09-18T13:20:29,unknown,Which companies recruit from RNS IT?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+9d81b1c5f459,2026-09-18T13:21:38,unknown,Who is the principal of RNS IT?,0.7614,0.7068,0.0546,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+587d0c7dfd02,2026-09-18T13:21:40,unknown,Who is the principal of RNSIT?,0.8718,0.7842,0.0876,Who is the Principal of RNSIT?,Who is the Chairman of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+e5b93ff7c978,2026-09-18T13:21:40,unknown,Who is the HOD of AIML department?,0.7419,0.7205,0.0214,Who is the HOD of AI ML?,CSE (AI and ML),HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+e7cd8c2b1adc,2026-09-18T13:21:41,unknown,Who is the HOD of AI ML?,0.8226,0.6726,0.1500,Who is the HOD of AI ML?,CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+904d390d5f3f,2026-09-18T13:21:42,unknown,Who is the HOD of CSE department?,0.8447,0.7133,0.1314,Who is the HOD of CSE?,Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+237a29897d05,2026-09-18T13:21:42,unknown,How many departments does RNS IT have?,0.6805,0.6631,0.0174,What departments does RNSIT have?,Is there a gym on campus?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+85cf579562d9,2026-09-18T13:21:42,unknown,Which companies recruit from RNS IT?,0.7847,0.7649,0.0198,Placements Overview,How many companies recruit from RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+3341d987b739,2026-09-18T13:31:25,unknown,Who is the principal of RNSIT?,0.8718,0.7842,0.0876,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+f524887e12a7,2026-09-18T13:31:25,unknown,Who is the principal of RNS IT?,0.7614,0.7068,0.0546,Principal,Group Chairman,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+e2a8f5632b02,2026-09-18T13:31:26,unknown,Who is the HOD of AIML?,0.7240,0.6578,0.0662,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+be18e8c2c4ae,2026-09-18T13:31:27,unknown,Who is the HOD of AI ML?,0.8226,0.6862,0.1364,CSE (AI and ML),CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+bb1aa1c6d70d,2026-09-18T13:31:28,unknown,Who is the HOD of CSE?,0.8402,0.6800,0.1602,Computer Science and Engineering,CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+aa9279c0f127,2026-09-18T13:31:28,unknown,How many departments does RNSIT have?,0.7739,0.7296,0.0443,Departments Overview,Placements Overview,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+c948837274d8,2026-09-18T13:31:29,unknown,How many departments does RNS IT have?,0.6805,0.6631,0.0174,Departments Overview,Is there a gym on campus?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+8537b71cf3af,2026-09-18T13:31:31,unknown,Which companies recruit from RNSIT?,0.8593,0.8408,0.0185,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+c04025b3e910,2026-09-18T13:31:33,unknown,Which companies recruit from RNS IT?,0.7847,0.7649,0.0198,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+dfd080c6734d,2026-09-18T13:31:33,unknown,Who won the World Cup in 2022?,0.5755,0.5642,0.0113,Sports,Canteen,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+5135957ac2d3,2026-09-18T13:34:50,unknown,Who is the principal of RNSIT?,0.8578,0.7718,0.0860,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+eaa03b348e36,2026-09-18T13:34:51,unknown,Who is the principal of RNS IT?,0.8578,0.7718,0.0860,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+b9e27661bc46,2026-09-18T13:34:52,unknown,Who is the HOD of AIML?,0.7251,0.6561,0.0690,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+bf707b0ebce5,2026-09-18T13:34:53,unknown,Who is the HOD of AI ML?,0.7251,0.6561,0.0690,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+addc98e26941,2026-09-18T13:34:54,unknown,Who is the HOD of CSE?,0.8347,0.6793,0.1554,Computer Science and Engineering,CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2d02db60f2c3,2026-09-18T13:34:55,unknown,How many departments does RNSIT have?,0.7687,0.7333,0.0354,Departments Overview,Placements Overview,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+3918e8182c8e,2026-09-18T13:34:55,unknown,How many departments does RNS IT have?,0.7687,0.7333,0.0354,Departments Overview,Placements Overview,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+f1b5353eef42,2026-09-18T13:34:57,unknown,Which companies recruit from RNSIT?,0.8699,0.8539,0.0160,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+9c7134726bde,2026-09-18T13:34:59,unknown,Which companies recruit from RNS IT?,0.8699,0.8539,0.0160,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2a59e5485c8a,2026-09-18T13:34:59,unknown,Who won the World Cup in 2022?,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+9e3b6ae2ee3c,2026-09-18T13:36:20,unknown,Who is the principal of RNSIT?,0.8578,0.7718,0.0860,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+230bd35ef9a7,2026-09-18T13:36:22,unknown,Who is the principal of RNS IT?,0.8578,0.7718,0.0860,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+4b0e1f9ee714,2026-09-18T13:36:23,unknown,Who is the HOD of AIML?,0.7251,0.6561,0.0690,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+9f5d6667d1a3,2026-09-18T13:36:24,unknown,Who is the HOD of AI ML?,0.7251,0.6561,0.0690,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2ce1907876ed,2026-09-18T13:36:25,unknown,Who is the HOD of CSE?,0.8347,0.6793,0.1554,Computer Science and Engineering,CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+0e11992af9f2,2026-09-18T13:36:27,unknown,How many departments does RNSIT have?,0.8095,0.7687,0.0408,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+ef759d6057c7,2026-09-18T13:36:29,unknown,How many departments does RNS IT have?,0.8095,0.7687,0.0408,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+290a075f5e4d,2026-09-18T13:36:31,unknown,Which companies recruit from RNSIT?,0.8699,0.8539,0.0160,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+98942b329677,2026-09-18T13:36:33,unknown,Which companies recruit from RNS IT?,0.8699,0.8539,0.0160,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2b955b710dcc,2026-09-18T13:36:33,unknown,Who won the World Cup in 2022?,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+50629518280e,2026-09-18T14:50:10,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal,0.6612,0.6413,0.0199,Principal,Group Chairman,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+50629518280e,2026-09-18T14:50:33,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the principal of rns institute,,,,,,,,,resolution,who is the principal of rns institute,disambiguated_a,LOCAL
+bcfdf5f9936a,2026-09-18T14:51:44,02ca2831-5db9-436c-8759-30b3d5a413e5,okay who is the director of rnsit,0.8196,0.7629,0.0567,Director,Group Chairman,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+bcfdf5f9936a,2026-09-18T14:53:12,02ca2831-5db9-436c-8759-30b3d5a413e5,okay can you tell me who is the chairman of rnsit,,,,,,,,,resolution,okay can you tell me who is the chairman of rnsit,abandoned,
+c644a79616ee,2026-09-18T14:53:13,02ca2831-5db9-436c-8759-30b3d5a413e5,okay can you tell me who is the chairman of rnsit,0.8584,0.7875,0.0709,Group Chairman,Principal,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+96c884bd2517,2026-09-18T14:53:43,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal of rnsit then,0.8652,0.7895,0.0757,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+c79835e66de2,2026-09-18T14:54:07,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the director of rnsit,0.8517,0.8030,0.0487,Director,Principal,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+c79835e66de2,2026-09-18T14:54:28,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant director can you tell me who is the director of rnsit,,,,,,,,,resolution,i meant director can you tell me who is the director of rnsit,disambiguated_a,LOCAL
+d0e82ab5a702,2026-09-18T14:54:56,02ca2831-5db9-436c-8759-30b3d5a413e5,okay okay can you tell me who is the hod of aiml department,0.7819,0.7104,0.0715,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+5252307bf8a9,2026-09-18T14:55:25,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the facilities of rnsit like what all facilities are given by this college,0.7835,0.7649,0.0186,Is there a gym on campus?,What is the website of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+5252307bf8a9,2026-09-18T14:55:44,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant facilities like what all facilities does rnsit provide,,,,,,,,,resolution,i meant facilities like what all facilities does rnsit provide,abandoned,
+440d3dc729fa,2026-09-18T14:55:45,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant facilities like what all facilities does rnsit provide,0.7625,0.7250,0.0375,Is there a gym on campus?,What is the website of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+440d3dc729fa,2026-09-18T14:56:03,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how many departments are there in rns cycle,,,,,,,,,resolution,can you tell me how many departments are there in rns cycle,abandoned,
+e87debbc72e3,2026-09-18T14:56:04,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how many departments are there in rns cycle,0.7092,0.6607,0.0485,Departments Overview,Placements Overview,HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+9e13ca342fff,2026-09-18T14:56:22,02ca2831-5db9-436c-8759-30b3d5a413e5,how many departments are there in rnsit,0.8173,0.7627,0.0546,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+a259c326a73e,2026-09-18T14:56:57,02ca2831-5db9-436c-8759-30b3d5a413e5,can you name the undergraduate engineering branches what is the name of the department,0.6892,0.6618,0.0274,Electrical and Electronics Engineering,Mechanical Engineering,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+a259c326a73e,2026-09-18T14:57:21,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant what all my engineering are there like cse like that,,,,,,,,,resolution,i meant what all my engineering are there like cse like that,abandoned,
+53dc800b3408,2026-09-18T14:57:21,02ca2831-5db9-436c-8759-30b3d5a413e5,i meant what all my engineering are there like cse like that,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+1d96ac6b31f7,2026-09-18T15:08:21,unknown,"Can you tell me the facilities of RNS IT, like what all facilities are given by this college?",0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+c6d2d44dcc8e,2026-09-18T15:09:58,unknown,"Can you tell me the facilities of RNS IT, like what all facilities are given by this college?",0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+6ff2bf9014e7,2026-09-18T15:11:31,unknown,"Can you tell me the facilities of RNS IT, like what all facilities are given by this college?",0.8559,0.7835,0.0724,Campus Facilities Overview,Is there a gym on campus?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+f7247c9028b8,2026-09-18T15:21:51,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what all the facilities provided by rnsit,0.8420,0.7659,0.0761,Campus Facilities Overview,What is the website of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+d42b2f92e0d0,2026-09-18T15:22:17,02ca2831-5db9-436c-8759-30b3d5a413e5,continue continue,0.7893,0.7296,0.0597,Campus Facilities Overview,Is there a gym on campus?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+d42b2f92e0d0,2026-09-18T15:22:42,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the admission criteria for joining this college,,,,,,,,,resolution,can you tell me the admission criteria for joining this college,abandoned,
+7197025736e9,2026-09-18T15:22:42,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the admission criteria for joining this college,0.6849,0.6662,0.0187,Admission Process,Admission Route — BE UNDERGRADUATE,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+7197025736e9,2026-09-18T15:23:03,02ca2831-5db9-436c-8759-30b3d5a413e5,admission process,,,,,,,,,resolution,admission process,disambiguated_a,LOCAL
+a10326d54e47,2026-09-18T15:23:49,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the management fee for getting admission in cse department,0.6999,0.6749,0.0250,What is the intake for the CSE department?,Computer Science and Engineering,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+a10326d54e47,2026-09-18T15:24:13,02ca2831-5db9-436c-8759-30b3d5a413e5,im in the management fee structure,,,,,,,,,resolution,im in the management fee structure,abandoned,
+f8216d20a0ad,2026-09-18T15:24:13,02ca2831-5db9-436c-8759-30b3d5a413e5,im in the management fee structure,0.6188,0.5738,0.0450,Admission Process,Hostels,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+f8216d20a0ad,2026-09-18T15:24:43,02ca2831-5db9-436c-8759-30b3d5a413e5,can you,,,,,,,,,resolution,can you,abandoned,
+bb29556a30a7,2026-09-18T15:24:45,02ca2831-5db9-436c-8759-30b3d5a413e5,can you,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+2d08f6bec94c,2026-09-18T15:24:57,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the recruiting companies for rnsit,0.8485,0.8175,0.0310,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+78e323cf5d4e,2026-09-18T15:25:24,02ca2831-5db9-436c-8759-30b3d5a413e5,what about the internship,0.6396,0.6285,0.0111,Counselling,Electrical and Electronics Engineering,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+78e323cf5d4e,2026-09-18T15:25:34,02ca2831-5db9-436c-8759-30b3d5a413e5,the,,,,,,,,,resolution,the,abandoned,
+371804d614b7,2026-09-18T15:25:36,02ca2831-5db9-436c-8759-30b3d5a413e5,the,0.7356,0.7053,0.0303,Electrical and Electronics Engineering,Electronics and Communication Engineering,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+371804d614b7,2026-09-18T15:26:10,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the cet code for this rnsit college,,,,,,,,,resolution,what is the cet code for this rnsit college,abandoned,
+9f1254f6dc5f,2026-09-18T15:26:12,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the cet code for this rnsit college,0.8687,0.7560,0.1127,What is the CET code for RNSIT?,What is the COMEDK code for RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+c58ceb8a25ff,2026-09-18T15:27:16,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the common care rank for rnsit,0.7026,0.7000,0.0026,Placements Overview,General Enquiry,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+c58ceb8a25ff,2026-09-18T15:27:38,02ca2831-5db9-436c-8759-30b3d5a413e5,what was the highest package in 2025,,,,,,,,,resolution,what was the highest package in 2025,abandoned,
+2f7b2679c8ab,2026-09-18T15:27:39,02ca2831-5db9-436c-8759-30b3d5a413e5,what was the highest package in 2025,0.7771,0.7769,0.0002,Placement Stats 2025,Placement Stats 2024,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+2f7b2679c8ab,2026-09-18T15:28:00,02ca2831-5db9-436c-8759-30b3d5a413e5,placement starts 2025,,,,,,,,,resolution,placement starts 2025,abandoned,
+a220b564757f,2026-09-18T15:28:02,02ca2831-5db9-436c-8759-30b3d5a413e5,placement starts 2025,0.7561,0.7548,0.0013,Placement Stats 2025,Placement Stats 2024,HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+c258f07a122f,2026-09-18T15:54:00,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what was the highest package of placement in 2025,0.8346,0.8341,0.0005,Placement Stats 2025,Placement Stats 2024,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+c258f07a122f,2026-09-18T15:54:42,02ca2831-5db9-436c-8759-30b3d5a413e5,then can you tell me about the management fee of rnsit,,,,,,,,,resolution,then can you tell me about the management fee of rnsit,abandoned,
+147f6cd8749e,2026-09-18T15:54:42,02ca2831-5db9-436c-8759-30b3d5a413e5,then can you tell me about the management fee of rnsit,0.7553,0.7279,0.0274,Fees,Admission Process,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+147f6cd8749e,2026-09-18T15:54:58,02ca2831-5db9-436c-8759-30b3d5a413e5,please,,,,,,,,,resolution,please,abandoned,
+6184d955aa87,2026-09-18T15:54:59,02ca2831-5db9-436c-8759-30b3d5a413e5,please,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+f32cbce37da0,2026-09-18T15:55:45,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the management fee of rnsit,0.7855,0.7178,0.0677,Fees,Admission Process,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+1a68ff82b2df,2026-09-18T15:56:34,02ca2831-5db9-436c-8759-30b3d5a413e5,usn cie ce see attendance hostel library,0.7253,0.6675,0.0578,Hostels,Canteen,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+1a68ff82b2df,2026-09-18T15:56:41,02ca2831-5db9-436c-8759-30b3d5a413e5,we have a process for the,,,,,,,,,resolution,we have a process for the,abandoned,
+b4427a7aa844,2026-09-18T15:56:42,02ca2831-5db9-436c-8759-30b3d5a413e5,we have a process for the,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+10c8462b5380,2026-09-21T10:39:50,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the management phase of rns institute,0.6721,0.6499,0.0222,Group Chairman,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+fb694a2c42c8,2026-09-21T10:40:20,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the management phase of rnsit,0.6904,0.6845,0.0059,When was RNSIT established?,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+dc6a1ffe8d6f,2026-09-21T10:40:48,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the documents required for cutting admission in rns institute,0.7734,0.6794,0.0940,Documents Required,Scholarships,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+b886949ecdcc,2026-09-21T10:42:01,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the facilities provided by rnsit,0.8450,0.7572,0.0878,Campus Facilities Overview,What is the website of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+1803483051de,2026-09-21T10:43:18,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal then,0.6706,0.6193,0.0513,Principal,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+4d4059dd8596,2026-09-21T10:43:43,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the director of hod in the cycle,0.6462,0.6314,0.0148,CSE (AI and ML),Computer Science and Engineering,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+4d4059dd8596,2026-09-21T10:44:24,02ca2831-5db9-436c-8759-30b3d5a413e5,of cse ai emml department who is the hod,,,,,,,,,resolution,of cse ai emml department who is the hod,abandoned,
+96354e783214,2026-09-21T10:44:24,02ca2831-5db9-436c-8759-30b3d5a413e5,of cse ai emml department who is the hod,0.7781,0.7538,0.0243,Computer Science and Engineering,CSE (AI and ML),HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+96354e783214,2026-09-21T10:44:47,02ca2831-5db9-436c-8759-30b3d5a413e5,aiml,,,,,,,,,resolution,aiml,abandoned,
+9d1bad572a1a,2026-09-21T10:44:48,02ca2831-5db9-436c-8759-30b3d5a413e5,aiml,0.7412,0.7070,0.0342,Artificial Intelligence and Data Science,CSE (AI and ML),HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+8377b8186674,2026-09-21T10:44:59,02ca2831-5db9-436c-8759-30b3d5a413e5,your example was the one before us,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+6d23f3b5bae3,2026-09-21T10:45:10,02ca2831-5db9-436c-8759-30b3d5a413e5,im not a master of technology im a master of science,0.6790,0.6775,0.0015,Mechanical Engineering,Master of Computer Applications,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+7d2cdd51746b,2026-09-21T12:43:08,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the college timings of rnsit,0.7762,0.7694,0.0068,What are the library timings?,Admissions Status,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+3f9987c34106,2026-09-21T12:43:38,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the marriage fee of rns institute,0.7037,0.6975,0.0062,Fees,Fees,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+9af21772b2ed,2026-09-21T12:43:57,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the intake of cse department,0.8782,0.8118,0.0664,What is the intake for the CSE department?,Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+1c57e1b921a7,2026-09-21T12:44:18,02ca2831-5db9-436c-8759-30b3d5a413e5,who is the hod of aiml department,0.7414,0.6776,0.0638,CSE (AI and ML),Computer Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+4a44ce546f5a,2026-09-21T12:44:39,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the hello,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+2f8e741db28b,2026-09-21T12:44:50,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the hod of cse department,0.8622,0.7529,0.1093,Computer Science and Engineering,CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+38e2261563df,2026-09-21T12:46:24,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the departments of rnsit,0.7761,0.7660,0.0101,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+fd761969425e,2026-09-21T12:47:39,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the location of rns id,0.7165,0.6881,0.0284,Where is RNSIT located?,What is the website of RNSIT?,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+fd761969425e,2026-09-21T12:47:57,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the location of rnsit,,,,,,,,,resolution,what is the location of rnsit,abandoned,
+7be0a8c1a79b,2026-09-21T12:47:59,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the location of rnsit,0.8583,0.7838,0.0745,Where is RNSIT located?,What is the website of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+12b96f4305cf,2026-09-21T12:48:35,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the contact number of principal,0.6840,0.6614,0.0226,Principal,Principal,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+6d76bea381de,2026-09-21T12:49:08,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what all the recruitment companies come in rns institute,0.7870,0.7784,0.0086,Placements Overview,Placements Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+d73673ecb38d,2026-09-21T12:49:42,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the highest package in 2025,0.7739,0.7683,0.0056,Placement Stats 2024,Placement Stats 2025,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+d73673ecb38d,2026-09-21T12:49:56,02ca2831-5db9-436c-8759-30b3d5a413e5,yes it is,,,,,,,,,resolution,yes it is,abandoned,
+a6e4e12c7f6f,2026-09-21T12:49:57,02ca2831-5db9-436c-8759-30b3d5a413e5,yes it is,0.7254,0.7007,0.0247,Placement Stats 2024,Placements Overview,HIGH,True,HIGH_AMBIGUOUS,decision,,pending,
+a6e4e12c7f6f,2026-09-21T12:50:17,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the highest package in 2025,,,,,,,,,resolution,can you tell me what is the highest package in 2025,abandoned,
+db70af610a63,2026-09-21T12:50:17,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the highest package in 2025,0.7739,0.7683,0.0056,Placement Stats 2024,Placement Stats 2025,HIGH,True,HIGH_CLARIFY_LIMIT,decision,,clarify_limit_reached,
+250a885ae854,2026-09-21T12:50:56,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the management fee of rnsit,0.8555,0.8320,0.0235,Fees,Fees,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+d4563ed2e3b3,2026-09-21T14:56:10,unknown,Where is the library?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+ff8fbe581f0a,2026-09-21T14:56:12,unknown,Where can I find the library?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+bd39939ff3af,2026-09-21T14:56:15,unknown,Tell me the library location,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+33ce91ef0144,2026-09-21T14:56:17,unknown,Library location?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+29a6c22bc12b,2026-09-21T14:56:19,unknown,Who is the HOD of CSE?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+c76615f8b0c7,2026-09-21T14:56:21,unknown,Who heads the computer science department?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+323eea2bf8b6,2026-09-21T14:56:24,unknown,CSE department HOD?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+73669a8c7e15,2026-09-21T14:56:26,unknown,Where is the canteen?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+d353ebe744b3,2026-09-21T14:56:28,unknown,Who is the principal?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+6136ae32b0f7,2026-09-21T14:56:31,unknown,What are the college working hours?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+8f07dedf58ba,2026-09-21T15:06:33,unknown,Where is the library?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+c85e4559192b,2026-09-21T15:06:33,unknown,Where can I find the library?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+801d193ffb4d,2026-09-21T15:06:33,unknown,Tell me the library location,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+6b318fc4fa1e,2026-09-21T15:06:33,unknown,Library location?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+a66ce995e767,2026-09-21T15:06:33,unknown,Who is the HOD of CSE?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+51712181bc23,2026-09-21T15:06:33,unknown,Who heads the computer science department?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+26f0261e4b85,2026-09-21T15:06:33,unknown,CSE department HOD?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+6a6bd6832b4b,2026-09-21T15:06:33,unknown,Where is the canteen?,1.0000,,,Canteen,,HIGH,False,HIGH_ENTITY_CANTEEN,decision,,answered,entity_kb
+5df613c8b451,2026-09-21T15:06:33,unknown,Who is the principal?,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+e521d1ffbc9a,2026-09-21T15:06:33,unknown,What are the college working hours?,1.0000,,,Working Hours & Timings,,HIGH,False,HIGH_ENTITY_WORKING_HOURS,decision,,answered,entity_kb
+4de3e0ad3b3c,2026-09-21T15:06:33,unknown,Tell me about Aperture,1.0000,,,Cultural Fest,,HIGH,False,HIGH_ENTITY_CULTURAL_FEST,decision,,answered,entity_kb
+0039c42722cd,2026-09-21T15:06:33,unknown,Is there a gym?,1.0000,,,Gymnasium,,HIGH,False,HIGH_ENTITY_GYM,decision,,answered,entity_kb
+482111bbbfb4,2026-09-21T15:06:33,unknown,What is the COMEDK code?,1.0000,,,COMEDK Code,,HIGH,False,HIGH_ENTITY_COMEDK_CODE,decision,,answered,entity_kb
+eab63c62431c,2026-09-21T15:06:33,unknown,What is the highest package in 2025?,1.0000,,,Placement Stats 2025,,HIGH,False,HIGH_ENTITY_PLACEMENTS_2025,decision,,answered,entity_kb
+ac31b45fbd07,2026-09-21T15:06:33,unknown,How to contact admissions?,1.0000,,,Admissions Contact,,HIGH,False,HIGH_ENTITY_ADMISSIONS_CONTACT,decision,,answered,entity_kb
+7bd68b923459,2026-09-21T15:25:28,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what are the documents required for getting admission in rnsit,1.0000,,,Documents Required,,HIGH,False,HIGH_ENTITY_ADMISSIONS_DOCUMENTS,decision,,answered,entity_kb
+a00d954f4ff2,2026-09-21T15:26:35,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what all the facilities provided by rnsit,0.8420,0.8420,0.0000,Campus Facilities Overview,Campus Facilities Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+a7105b480f45,2026-09-21T15:27:21,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the highest placement package in 2025,1.0000,,,Placement Stats 2025,,HIGH,False,HIGH_ENTITY_PLACEMENTS_2025,decision,,answered,entity_kb
+f20bf3a7169e,2026-09-21T15:27:58,02ca2831-5db9-436c-8759-30b3d5a413e5,how many blocks are there in rns institute,0.6579,0.6579,0.0000,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+bb27adbf3b3e,2026-09-21T15:28:22,02ca2831-5db9-436c-8759-30b3d5a413e5,how many departments are there in rns institute,1.0000,,,Departments Overview,,HIGH,False,HIGH_ENTITY_DEPARTMENTS_OVERVIEW,decision,,answered,entity_kb
+564cae9b3772,2026-09-21T15:29:08,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the management fee in rns institute,1.0000,,,Management Quota Fees,,HIGH,False,HIGH_ENTITY_MANAGEMENT_FEES,decision,,answered,entity_kb
+ddeb6762a2d1,2026-09-21T15:30:00,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the college working hours of rnsit,1.0000,,,Working Hours & Timings,,HIGH,False,HIGH_ENTITY_WORKING_HOURS,decision,,answered,entity_kb
+7c0b3c204d77,2026-09-21T15:30:48,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the procedure to get admission in this college,0.7630,0.7517,0.0113,Admission Process,Admission Process,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+5e8e3a2e63b7,2026-09-21T15:31:49,02ca2831-5db9-436c-8759-30b3d5a413e5,so can you tell me about rns how is it is it a good college,0.6796,0.6796,0.0000,Does the college provide transport?,Does the college provide transport?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+35d027679e48,2026-09-21T15:32:17,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the weather today,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+6d0b119f72c1,2026-09-22T12:02:00,unknown,Where is the library?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+f16624974d98,2026-09-22T12:02:00,unknown,Who is the CSE HOD?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+3cb5b9b1637d,2026-09-22T12:02:09,unknown,Who is the president of the USA?,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+d259fbc35da0,2026-09-22T12:04:39,unknown,Where is the library?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+dca8fff3f7a4,2026-09-22T12:04:39,unknown,Where can I find the library?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+6f58ab8985d1,2026-09-22T12:04:39,unknown,Tell me the library location,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+7a37b64b42ca,2026-09-22T12:04:39,unknown,Library location?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+909e13d2f94b,2026-09-22T12:04:39,unknown,Who is the HOD of CSE?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+595ae6d73142,2026-09-22T12:04:39,unknown,Who heads the computer science department?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+3dbd39acd437,2026-09-22T12:04:39,unknown,CSE department HOD?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+7723a5d8cfd1,2026-09-22T12:04:39,unknown,Where is the canteen?,1.0000,,,Canteen,,HIGH,False,HIGH_ENTITY_CANTEEN,decision,,answered,entity_kb
+92a0e2a3c9c8,2026-09-22T12:04:39,unknown,Who is the principal?,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+a525184d11f3,2026-09-22T12:04:39,unknown,What are the college working hours?,1.0000,,,Working Hours & Timings,,HIGH,False,HIGH_ENTITY_WORKING_HOURS,decision,,answered,entity_kb
+e2954966f9ed,2026-09-22T12:04:39,unknown,Tell me about Aperture,1.0000,,,Cultural Fest,,HIGH,False,HIGH_ENTITY_CULTURAL_FEST,decision,,answered,entity_kb
+90bf62af4ae5,2026-09-22T12:04:39,unknown,Is there a gym?,1.0000,,,Gymnasium,,HIGH,False,HIGH_ENTITY_GYM,decision,,answered,entity_kb
+4cdf52155273,2026-09-22T12:04:39,unknown,What is the COMEDK code?,1.0000,,,COMEDK Code,,HIGH,False,HIGH_ENTITY_COMEDK_CODE,decision,,answered,entity_kb
+479a5b776c5d,2026-09-22T12:04:39,unknown,What is the highest package in 2025?,1.0000,,,Placement Stats 2025,,HIGH,False,HIGH_ENTITY_PLACEMENTS_2025,decision,,answered,entity_kb
+fd3210461203,2026-09-22T12:04:39,unknown,How to contact admissions?,1.0000,,,Admissions Contact,,HIGH,False,HIGH_ENTITY_ADMISSIONS_CONTACT,decision,,answered,entity_kb
+923a079bc619,2026-09-22T12:06:26,unknown,Where is the library?,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+6ac13e4a5265,2026-09-22T12:06:26,unknown,Who is the CSE HOD?,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+cdd5af775ea6,2026-09-22T12:06:26,unknown,How many departments are there?,1.0000,,,Departments Overview,,HIGH,False,HIGH_ENTITY_DEPARTMENTS_OVERVIEW,decision,,answered,entity_kb
+0b5b18a4fb84,2026-09-22T12:06:39,unknown,Who is the president of the USA?,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+5bd285264f20,2026-09-22T12:30:38,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal of rnsit,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+4d44480918f9,2026-09-22T12:31:55,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what is the college working hours,1.0000,,,Working Hours & Timings,,HIGH,False,HIGH_ENTITY_WORKING_HOURS,decision,,answered,entity_kb
+b7169755cb40,2026-09-22T12:32:16,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what are the library time is,1.0000,,,Central Library,,HIGH,False,HIGH_ENTITY_LIBRARY,decision,,answered,entity_kb
+9b108dd7220f,2026-09-22T12:32:29,02ca2831-5db9-436c-8759-30b3d5a413e5,rns institute of technology bengaluru cse ce ce,0.7380,0.7380,0.0000,Admission Route — BE UNDERGRADUATE,Admission Route — BE UNDERGRADUATE,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2dbd269c01a8,2026-09-22T12:33:06,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how can i get admission in this college,0.6959,0.6771,0.0188,Admission Process,Admission Process,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+5444b3107e57,2026-09-22T12:33:56,02ca2831-5db9-436c-8759-30b3d5a413e5,okay is that jim in rnsit,0.6514,0.6514,0.0000,What is the website of RNSIT?,What is the website of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+eded9d8eb57e,2026-09-22T12:34:09,02ca2831-5db9-436c-8759-30b3d5a413e5,um,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+5fdb1ee8c47f,2026-09-22T12:49:09,02ca2831-5db9-436c-8759-30b3d5a413e5,is there a gym in our college,1.0000,,,Gymnasium,,HIGH,False,HIGH_ENTITY_GYM,decision,,answered,entity_kb
+d9c75b82fb29,2026-09-22T12:49:46,02ca2831-5db9-436c-8759-30b3d5a413e5,ise aaron sc it good college,0.6668,0.6668,0.0000,Academics — Clubs,Academics — Clubs,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+dcbf966e47ea,2026-09-22T12:50:16,02ca2831-5db9-436c-8759-30b3d5a413e5,is rns at tia good college,0.6288,0.6288,0.0000,What are the student clubs at RNSIT?,What are the student clubs at RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2d5c20c06cfc,2026-09-22T12:50:25,02ca2831-5db9-436c-8759-30b3d5a413e5,isrns it algod college,0.7028,0.7028,0.0000,Information Science and Engineering,Information Science and Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+dc1dd6ce861f,2026-09-22T12:52:01,02ca2831-5db9-436c-8759-30b3d5a413e5,what do you do,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
