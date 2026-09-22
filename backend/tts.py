@@ -9,13 +9,71 @@ it is NOT the default and never will be unless set explicitly.
 """
 import os
 import io
+import time
+import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import soundfile as sf
 from dotenv import load_dotenv
 
+logger = logging.getLogger("RNSIT_Kiosk.TTS")
+
 load_dotenv()
+
+# ── Dedicated single-thread executor for TTS ──────────────────────────────
+# Root cause of "still slow after warmup" even with _kokoro_lock in place:
+# _kokoro_lock only stops two syntheses running AT THE SAME TIME — it does
+# nothing about WHICH thread each one runs on. main.py's /tts endpoint calls
+# `asyncio.to_thread()`, which hands work to the event loop's default
+# executor, a POOL of several worker threads — not one fixed thread.
+# PyTorch/OpenMP lazily spins up its internal thread pool the first time any
+# torch op runs on a given OS thread, and THAT spin-up (not the tiny
+# inference itself) is what costs hundreds of ms to 1-2s. `_warmup()` used
+# to run on its own dedicated `threading.Thread()`, so it only ever warmed
+# THAT one thread — live requests kept landing on whichever pool thread
+# happened to be free and re-paid the cold-start cost every time, lock or
+# no lock. Routing warmup AND every real request through this single
+# dedicated thread means torch's thread pool is spun up exactly once, on
+# the one thread that ever runs inference — see text_to_speech_on_worker()
+# below and main.py's /tts endpoint.
+TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-worker")
+
+
+def _init_torch_threads():
+    """Pin torch's thread count on the TTS worker thread.
+
+    NOTE ON THE DEFAULT: with TTS_EXECUTOR having exactly one worker, only
+    ONE synthesis call ever runs at a time now — there's no more "two
+    syntheses fighting each other for cores" scenario within TTS itself to
+    guard against (that's what the original cap of 2 was defending
+    against). The only remaining reason to cap this at all is leaving CPU
+    headroom for STT (faster_whisper) and the RAG embedding model, which
+    run concurrently on their own threads/processes — see the same log
+    window showing faster_whisper and sentence-transformers calls
+    interleaved with TTS synthesis. If profiling shows Kokoro itself is the
+    bottleneck (multi-second synthesis for short text, well after warmup —
+    i.e. NOT a cold-start effect), try raising TTS_TORCH_THREADS toward
+    your actual core count and re-measure; there's no longer an internal
+    reason to keep it this low.
+    """
+    try:
+        import torch
+        torch.set_num_threads(int(os.getenv("TTS_TORCH_THREADS", "2")))
+        try:
+            torch.set_num_interop_threads(1)
+        except RuntimeError:
+            # Can only be called once per process and only before any
+            # interop op has run — ignore if it's too late.
+            pass
+    except ImportError:
+        pass
+
+
+# Apply the thread settings once, right away, on the dedicated TTS thread —
+# before Kokoro (and its underlying torch ops) ever run on it.
+TTS_EXECUTOR.submit(_init_torch_threads)
 
 TTS_VOICE = os.getenv("TTS_VOICE", "af_bella")
 TTS_SPEED = float(os.getenv("TTS_SPEED", "1.05"))
@@ -96,9 +154,22 @@ def _trim_silence(audio: np.ndarray, sr: int) -> np.ndarray:
     return audio
 
 
+# Serialize calls into the shared Kokoro pipeline instance. Kokoro's
+# inference is CPU-bound (PyTorch); running two syntheses at once on the
+# same process doesn't parallelize on limited kiosk hardware, it just makes
+# BOTH calls slower (GIL + CPU contention). This mattered in practice:
+# the frontend fires an unawaited "thinking" filler phrase (e.g. "Sure, let
+# me check that for you.") right as the real answer arrives, so its TTS call
+# and the real answer's first-chunk TTS call would land back-to-back and
+# contend for the same CPU. Serializing them keeps each call's latency
+# predictable instead of both stalling by seconds under contention.
+_kokoro_lock = threading.Lock()
+
+
 def _synthesize_kokoro(text: str) -> bytes:
-    pipe = _get_pipe()
-    chunks = [audio for _, _, audio in pipe(text, voice=TTS_VOICE, speed=TTS_SPEED)]
+    with _kokoro_lock:
+        pipe = _get_pipe()
+        chunks = [audio for _, _, audio in pipe(text, voice=TTS_VOICE, speed=TTS_SPEED)]
     if not chunks:
         return b""
     audio = _trim_silence(np.concatenate(chunks), 24000)
@@ -147,6 +218,8 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
     key = (text.strip(), TTS_ENGINE, voice_tag, TTS_SPEED)
     cached = _TTS_CACHE.get(key)
     if cached is not None:
+        logger.info(f"[TTS-TIMING] cache HIT ({len(text)} chars): '{text[:40]}...'"
+                    if len(text) > 40 else f"[TTS-TIMING] cache HIT: '{text}'")
         return cached
 
     engine = TTS_ENGINE
@@ -156,8 +229,12 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
     def _run(eng):
         return _synthesize_melo(text) if eng == "melotts" else _synthesize_kokoro(text)
 
+    t0 = time.monotonic()
     try:
         wav = _run(engine)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+        logger.info(f"[TTS-TIMING] cache MISS, synthesized in {elapsed_ms:.0f}ms "
+                    f"({engine}, {len(text)} chars): '{text[:40]}'")
     except Exception as e:
         print(f"[TTS] {engine} failed: {e} — trying the other engine")
         other = "kokoro" if engine == "melotts" else "melotts"
@@ -172,6 +249,16 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
     if wav and len(_TTS_CACHE) < _TTS_CACHE_MAX:
         _TTS_CACHE[key] = wav
     return wav or b""
+
+
+def text_to_speech_on_worker(text: str, language: str = "en") -> bytes:
+    """Run text_to_speech() on the dedicated TTS_EXECUTOR thread and block
+    until it's done. main.py's /tts endpoint calls this (via
+    run_in_executor) instead of asyncio.to_thread(text_to_speech, ...), so
+    real requests land on the exact same warmed thread _warmup() uses below
+    — that's the fix, see the TTS_EXECUTOR comment above. _kokoro_lock still
+    protects against any future change that adds more TTS_EXECUTOR workers."""
+    return TTS_EXECUTOR.submit(text_to_speech, text, language).result()
 
 
 # ── Warm the active engine at startup + pre-cache fixed phrases ──────────
@@ -212,7 +299,11 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
             # never start.
             PREWARM_DONE.set()
 
-    threading.Thread(target=_warmup, daemon=True).start()
+    # Warmup now runs on TTS_EXECUTOR — the SAME dedicated thread every real
+    # /tts request runs on (see main.py) — instead of its own separate,
+    # never-reused thread. That mismatch was the actual root cause of
+    # "still slow after warmup"; _kokoro_lock alone couldn't fix it.
+    TTS_EXECUTOR.submit(_warmup)
 else:
     print("[TTS] No engine available at all — browser TTS fallback only.")
     PREWARM_DONE.set()

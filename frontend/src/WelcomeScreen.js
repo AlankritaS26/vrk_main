@@ -476,7 +476,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   //   - onDone fires once, when playback finishes (or is interrupted/falls
   //     back to the browser voice).
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const speakStream = useCallback(async (text, { onStart, onSentence, onDone, initialClipPromise } = {}) => {
+  const speakStream = useCallback(async (text, { onStart, onSentence, onDone, initialClipPromise, timingBase } = {}) => {
     // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
     // (e.g. an acknowledgment like "let me check that" that hasn't finished
     // yet) before starting this one. Without this, two clips play at once —
@@ -639,6 +639,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
                   resolveEnd();
                 };
+                if (i === 0 && timingBase != null) {
+                  const tAudioPlayStart = performance.now();
+                  console.log(`[LATENCY] AUDIO_PLAY_START t=${tAudioPlayStart.toFixed(1)}ms (+${(tAudioPlayStart - timingBase).toFixed(1)}ms since answer received)`);
+                }
                 node.start(0);
               });
               playedSuccessfully = true;
@@ -936,9 +940,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     // right away while the actual answer is still being fetched, so there's
     // never dead air with a spinner. Kept short so it doesn't collide with
     // the real answer. Skipped for very short/greeting-like inputs.
+    // NOTE: these must match backend/tts.py's _PREWARM list byte-for-byte
+    // (including punctuation) or the prewarm cache silently misses and the
+    // filler phrase has to be synthesized live — right as the real answer's
+    // first TTS chunk is also being requested, so the two compete for the
+    // same CPU-bound Kokoro pipeline. ("Good question - one moment." was an
+    // em dash here vs. a hyphen in tts.py — that one always missed the cache.)
     const acks = [
       'Sure, let me check that for you.',
-      'Good question — one moment.',
+      'Good question - one moment.',
       'Let me look that up for you.',
       'Of course, just a second.',
       'Right, let me find that.',
@@ -993,23 +1003,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }
 
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
-      console.log('ANSWER RECEIVED:', answer);
+      const tAnswerReceived = performance.now();
+      console.log(`[LATENCY] ANSWER_RECEIVED t=${tAnswerReceived.toFixed(1)}ms`, answer);
 
-      // Start prefetching the first TTS chunk in parallel so synthesis overlaps with DOM paint
-      const fetchFirstClip = (ans) => {
+      // Extracts just the first sentence/clause — this is all the first TTS
+      // request needs to send; the rest is chunked+prefetched inside speakStream.
+      const firstChunkText = (ans) => {
         const raw = (ans.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [ans]).map(s => s.trim()).filter(Boolean);
         let first = raw.length ? raw[0] : ans;
         if (first.length > 60) {
           const cut = first.indexOf(',');
           if (cut > 15) first = first.slice(0, cut + 1);
         }
-        return fetch(BACKEND + '/tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: first })
-        }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
+        return first;
       };
-      const firstClipPromise = fetchFirstClip(answer);
 
       // Store full answer so resume intent can replay it on interruption
       lastAnswerRef.current = answer;
@@ -1023,21 +1030,40 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       setProcessingHint('');
       awaitingAnswerRef.current = false;
 
-      // 1. Render FULL answer text into the response box
+      // 1. Render FULL answer text into the response box (never sentence-by-sentence)
       console.log('TEXT RENDER START:', answer);
       addMessage(answer, 'kiosk');
 
-      // 2. WAIT only for DOM/browser paint before starting answer TTS
+      // 2. WAIT only for DOM/browser paint before starting answer TTS.
+      //    Nothing TTS-related happens before this point — no prefetch, no
+      //    request — so the first TTS call can never race or contend with
+      //    the paint itself.
       await new Promise(resolve => {
         requestAnimationFrame(() => {
           requestAnimationFrame(resolve);
         });
       });
 
+      const tDomPainted = performance.now();
+      console.log(`[LATENCY] TEXT_DOM_PAINTED t=${tDomPainted.toFixed(1)}ms (+${(tDomPainted - tAnswerReceived).toFixed(1)}ms since answer)`);
+
+      // 3. Fire the FIRST TTS request immediately after paint — not before.
+      const tTtsReqStart = performance.now();
+      console.log(`[LATENCY] TTS_REQUEST_START t=${tTtsReqStart.toFixed(1)}ms (+${(tTtsReqStart - tDomPainted).toFixed(1)}ms since paint)`);
+      const firstClipPromise = fetch(BACKEND + '/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: firstChunkText(answer) })
+      }).then(r => r.json()).then(d => {
+        const tTtsResponse = performance.now();
+        console.log(`[LATENCY] TTS_RESPONSE t=${tTtsResponse.toFixed(1)}ms (+${(tTtsResponse - tTtsReqStart).toFixed(1)}ms since request)`);
+        return d.audio || null;
+      }).catch(() => null);
+
       console.log('TEXT DOM RENDERED:', answer);
 
-      // 3. Nova voice plays the answer strictly AFTER visible text exists on screen
-      await speakStream(answer, { initialClipPromise: firstClipPromise });
+      // 4. Nova voice plays the answer strictly AFTER visible text exists on screen
+      await speakStream(answer, { initialClipPromise: firstClipPromise, timingBase: tAnswerReceived });
 
     } catch (e) {
       clearTimeout(askTimeout);

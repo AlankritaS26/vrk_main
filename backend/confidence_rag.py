@@ -51,7 +51,7 @@ import logging
 from typing import Any
 
 from backend.query_correction import normalize_query
-from backend.entity_mapping import detect_entity
+from backend.entity_mapping import detect_entity, VERIFIED_ENTITIES
 from backend.llm import (
     retrieve_relevant_context,
     chat_completion_with_fallback,
@@ -144,6 +144,28 @@ DOMAIN_KEYWORDS = {
 def _is_in_domain_keyword(question: str) -> bool:
     words = set(re.findall(r"[a-z]+", (question or "").lower()))
     return bool(words & DOMAIN_KEYWORDS)
+
+
+# Fallback text used only if VERIFIED_ENTITIES["COLLEGE_OVERVIEW"] is ever
+# missing/unbuilt (e.g. college_info.json unreadable at startup) — keeps
+# broad-overview queries answerable instead of erroring out.
+_COLLEGE_OVERVIEW_FALLBACK = (
+    "RNS Institute of Technology (RNSIT) was established in 2001 by Dr. R. N. Shetty. "
+    "It is an autonomous private engineering college affiliated to Visvesvaraya Technological University (VTU) "
+    "located in Channasandra, Bengaluru. The campus features 9 departments, modern laboratories, a central library, "
+    "sports grounds, active student clubs, and excellent placement opportunities."
+)
+
+
+def _get_college_overview_fact() -> str:
+    """Single source of truth for the RNSIT_GENERAL / broad-overview answer.
+
+    Pulls from entity_mapping.VERIFIED_ENTITIES["COLLEGE_OVERVIEW"], which is
+    sourced from college_info.json, instead of a hand-duplicated string here
+    that could drift out of sync with it.
+    """
+    entry = VERIFIED_ENTITIES.get("COLLEGE_OVERVIEW") or {}
+    return entry.get("answer") or _COLLEGE_OVERVIEW_FALLBACK
 
 
 # ── Small helpers ────────────────────────────────────────────────────
@@ -835,16 +857,14 @@ async def handle_query(question: str, history: list | None = None,
     )
 
     if is_broad_rnsit:
-        overview_fact = (
-            "RNS Institute of Technology (RNSIT) was established in 2001 by Dr. R. N. Shetty. "
-            "It is an autonomous private engineering college affiliated to Visvesvaraya Technological University (VTU) "
-            "located in Channasandra, Bengaluru. The campus features 9 departments, modern laboratories, a central library, "
-            "sports grounds, active student clubs, and excellent placement opportunities."
-        )
-        if overview_fact not in (context_text or ""):
-            context_text = f"{overview_fact}\n\n{context_text}" if context_text else overview_fact
-        
-        answer, gen_tier = await _generate_answer(question, context_text, history)
+        # Use ONLY the verified overview fact as context — deliberately do
+        # NOT concatenate the raw top-k semantic-search results here. For a
+        # short generic query like "tell me something about RNS IT", noisy
+        # unrelated FAQ hits (e.g. the "website of RNSIT" FAQ) score
+        # deceptively close and were confusing the LLM into surfacing them
+        # instead of the actual overview. See _get_college_overview_fact().
+        overview_fact = _get_college_overview_fact()
+        answer, gen_tier = await _generate_answer(question, overview_fact, history)
         if "i don't have that detail" in answer.lower():
             answer = overview_fact
         state["pending"] = None
@@ -1026,16 +1046,11 @@ async def handle_query_stream(question: str, history: list | None = None,
     print("ANSWER SOURCE: general_rag")
 
     if is_broad_rnsit:
-        overview_fact = (
-            "RNS Institute of Technology (RNSIT) was established in 2001 by Dr. R. N. Shetty. "
-            "It is an autonomous private engineering college affiliated to Visvesvaraya Technological University (VTU) "
-            "located in Channasandra, Bengaluru. The campus features 9 departments, modern laboratories, a central library, "
-            "sports grounds, active student clubs, and excellent placement opportunities."
-        )
-        if overview_fact not in (context_text or ""):
-            context_text = f"{overview_fact}\n\n{context_text}" if context_text else overview_fact
-        
-        answer, gen_tier = await _generate_answer(question, context_text, history)
+        # Same fix as handle_query(): use ONLY the verified overview fact as
+        # context, no raw top-k results mixed in, so noisy near-scoring FAQ
+        # hits (e.g. "website of RNSIT") can't leak into the answer.
+        overview_fact = _get_college_overview_fact()
+        answer, gen_tier = await _generate_answer(question, overview_fact, history)
         if "i don't have that detail" in answer.lower():
             answer = overview_fact
         state["pending"] = None

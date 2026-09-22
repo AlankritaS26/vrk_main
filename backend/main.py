@@ -1,4 +1,4 @@
-"""
+﻿"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (from repository root):
@@ -21,7 +21,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import List
 from contextlib import asynccontextmanager
-
+import time
 import redis
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -56,7 +56,8 @@ from backend.llm import (
     extract_topic_label,
 )
 from backend.stt import transcribe_audio, transcribe_pcm
-from backend.tts import text_to_speech
+from backend.tts import text_to_speech, text_to_speech_on_worker
+import backend.tts as tts_module   # for PREWARM_DONE in /health, below
 
 try:
     from backend.detection import run_pipeline as _run_pipeline
@@ -648,8 +649,19 @@ def _log_message(text: str, speaker: str) -> dict:
 # ==========================================
 @app.get("/health")
 def health():
-    """Liveness probe for the launcher and future monitoring."""
-    return {"status": "healthy"}
+    """Liveness probe for the launcher and future monitoring.
+
+    `warmed` reflects tts.PREWARM_DONE — the launcher can poll this and hold
+    off opening the kiosk UI / starting face detection until TTS warmup has
+    actually finished. Previously this endpoint always reported healthy
+    immediately, so a real visitor could show up while _warmup() was still
+    mid-sequence and get queued behind the rest of it on TTS_EXECUTOR's
+    single worker thread (see tts.py) — that's what produced a 17s /tts
+    round-trip for a "Welcome back" greeting during startup. `status` stays
+    "healthy" unconditionally so existing callers that only check for a 200
+    aren't affected; only `warmed` is new.
+    """
+    return {"status": "healthy", "warmed": tts_module.PREWARM_DONE.is_set()}
 
 
 @app.get("/")
@@ -1623,7 +1635,7 @@ async def are_you_there_endpoint():
 
 
 @app.get("/session/current")
-def get_current_session():
+async def get_current_session():
     global _last_activity_ts
     if active_session:
         _last_activity_ts = datetime.now().timestamp()
@@ -2232,12 +2244,25 @@ async def detect_websocket(ws: WebSocket):
 @app.post("/tts")
 async def tts_endpoint(request: Request):
     """Text → base64 WAV (Kokoro). Empty audio → frontend falls back to browser voice."""
+    t_recv = time.monotonic()
     try:
         body = await request.json()
         text = (body.get("text") or "").strip()
         if not text:
             return {"audio": None}
-        wav = await asyncio.to_thread(text_to_speech, text)
+        # Route through TTS_EXECUTOR's single dedicated thread (not the
+        # default asyncio.to_thread pool) so this lands on the exact same
+        # thread tts.py's warmup already warmed. See tts.py's TTS_EXECUTOR
+        # comment — that thread mismatch, not lack of a lock, was the root
+        # cause of "still slow after warmup". _kokoro_lock in tts.py stays
+        # in place as a safety net if TTS_EXECUTOR's worker count ever
+        # changes, but on a single worker it's never actually contended.
+        wav = await asyncio.get_event_loop().run_in_executor(
+            None, text_to_speech_on_worker, text
+        )
+        elapsed_ms = (time.monotonic() - t_recv) * 1000
+        logger.info(f"[TTS-TIMING] /tts request handled in {elapsed_ms:.0f}ms "
+                    f"({len(text)} chars): '{text[:40]}'")
         return {"audio": base64.b64encode(wav).decode("utf-8") if wav else None}
     except Exception as e:
         logger.error(f"[TTS] Endpoint error: {e}")
