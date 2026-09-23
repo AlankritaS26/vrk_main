@@ -7,12 +7,14 @@ import './index.css';
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 const WS_BACKEND = BACKEND.replace(/^http/, 'ws');
 
+
 // Polling intervals — fast only when idle (waiting for face recognition),
 // slow heartbeat during an active session (WebSocket handles real-time ends).
 const IDLE_POLL_MS = 750;   // snappy idle→welcome transition
 const ACTIVE_POLL_MS = 12000;   // ~12 s fallback; WS fires vrk-session-ended first
 
 export default function App() {
+
   const [screen, setScreen] = useState('idle');
   const [session, setSession] = useState(null);
   const [lastSession, setLastSession] = useState(null);

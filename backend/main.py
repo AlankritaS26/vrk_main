@@ -34,6 +34,11 @@ import httpx
 
 load_dotenv()
 
+# Companion token TTL (minutes) — read once here so companion.py can import it
+COMPANION_TOKEN_TTL_MINUTES: int = int(os.getenv("COMPANION_TOKEN_TTL_MINUTES", "20"))
+# Escalation timeout (seconds)
+ESCALATION_TIMEOUT_SECONDS: int = int(os.getenv("ESCALATION_TIMEOUT_SECONDS", "60"))
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -49,6 +54,7 @@ from backend.database import (
     delete_face_by_name, update_face_name_with_alias, update_session_user_name,
     sessions_collection, faces_collection, interactions_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
+    escalations_collection,
 )
 from backend.llm import (
     initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
@@ -83,6 +89,7 @@ def run_pipeline(frame_data):
     return _run_pipeline(frame_data)
 
 os.environ.setdefault("BACKEND_URL", "http://127.0.0.1:8001")
+BACKEND_URL: str = os.environ["BACKEND_URL"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -169,6 +176,8 @@ active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 _last_activity_ts: float = 0.0
+# Per-session low-confidence answer counter (for escalation trigger)
+_low_confidence_count: int = 0
 
 
 # ==========================================
@@ -331,6 +340,24 @@ EASTER_EGGS = {
     ],
     "good night": [
         "Good night! It was lovely chatting with you — take care.",
+    ],
+    "where is the qr code": [
+        "The QR code is displayed right on the top left of the screen! Scan it with your phone's camera to take this conversation summary and college brochures with you.",
+    ],
+    "where is qr": [
+        "You can find the QR code right on the top left of the screen. Scan it with your phone camera to view your session summary and download campus brochures.",
+    ],
+    "show qr code": [
+        "The QR code is active on the top left of the screen! Point your smartphone camera at it to take your visit recap and brochures with you.",
+    ],
+    "how to get brochure": [
+        "You can scan the QR code on the top left of the screen with your smartphone camera to download our official department brochures directly.",
+    ],
+    "give me brochure": [
+        "Just scan the QR code on the top left of the screen with your smartphone to download our official brochures directly to your phone!",
+    ],
+    "can i get this on my phone": [
+        "Yes! Scan the QR code displayed on the top left of the screen with your phone camera to take your visit recap and college brochures with you.",
     ],
 }
 
@@ -599,23 +626,22 @@ app = FastAPI(title="RNSIT Digital Receptionist", lifespan=lifespan)
 origins_raw = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [origin.strip() for origin in origins_raw.split(",") if origin.strip()]
 
-# 2. Add the middleware with the processed list
-if not ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=".*",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# 2. Add the middleware - always allowing local dev and kiosk ports
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Mount feature routers ────────────────────────────────────────────────────
+from backend.companion import router as companion_router
+from backend.escalation import router as escalation_router, staff_dashboard
+app.include_router(companion_router)
+app.include_router(escalation_router)
+app.add_api_route("/staff", staff_dashboard, response_class=HTMLResponse, methods=["GET"], tags=["escalation"])
 
 
 # ==========================================
@@ -1157,6 +1183,29 @@ def build_greeting(name: str, is_returning: bool, resumed: bool,
             f"and finding your way around campus. How may I assist you today?")
 
 
+async def _issue_companion_token_async(session_id: str) -> None:
+    """Background task: issue a companion token and broadcast the QR URL."""
+    try:
+        from backend.companion import _issue_token, COMPANION_BASE_URL
+        snap = {
+            "session_id": session_id,
+            "user_name":  (active_session or {}).get("user_name", "Guest"),
+            "face_id":    (active_session or {}).get("face_id", ""),
+            "issued_at":  datetime.now().isoformat(),
+        }
+        token = _issue_token(snap)
+        url = f"{COMPANION_BASE_URL}/companion/{token}"
+        await manager.broadcast({
+            "type":    "companion_qr",
+            "url":     url,
+            "token":   token,
+            "expires_in_seconds": COMPANION_TOKEN_TTL_MINUTES * 60,
+        })
+        logger.info("[COMPANION] QR token issued and broadcast for session=%s", session_id[:8])
+    except Exception as e:
+        logger.warning("[COMPANION] Token issuance failed: %s", e)
+
+
 async def resume_or_create_session(face_id: str, user_name: str,
                                    is_returning: bool, visit_count: int,
                                    trigger: str = "camera") -> dict:
@@ -1267,9 +1316,10 @@ async def start_session(
             "session":    active_session,
         }
 
-    active_session    = new_sess
-    message_log       = []
-    _last_activity_ts = datetime.now().timestamp()
+    active_session      = new_sess
+    message_log         = []
+    _last_activity_ts   = datetime.now().timestamp()
+    _low_confidence_count = 0  # reset escalation counter on new session
 
     # NOTE: resume_or_create_session() already persisted this session.
     await manager.broadcast({
@@ -1277,16 +1327,29 @@ async def start_session(
         "session": active_session,
         "tts_text": active_session.get("greeting", ""),
     })
+
+    # Issue companion QR token and broadcast URL to the kiosk frontend
+    asyncio.create_task(_issue_companion_token_async(final_session_id))
+
     return {"status": "success", "session_id": final_session_id, "session": active_session}
 
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
-    global active_session, _last_activity_ts
+    global active_session, _last_activity_ts, _low_confidence_count
     sid = session_id or (active_session["session_id"] if active_session else None)
-    
-    active_session    = None
-    _last_activity_ts = 0.0
+
+    # Clean up companion tokens for this session
+    if sid:
+        try:
+            from backend.companion import _invalidate_session_tokens
+            _invalidate_session_tokens(sid)
+        except Exception as _ce:
+            logger.warning("[SESSION] Companion token cleanup failed: %s", _ce)
+
+    active_session      = None
+    _last_activity_ts   = 0.0
+    _low_confidence_count = 0
     await manager.broadcast({"type": "session_end", "session_id": sid})
     return {"status": "success"}
 
@@ -1387,6 +1450,33 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
     """
     global active_session, _last_activity_ts
 
+    # ─── Explicit human-handover intent → escalate before RAG ──────────────
+    # Import lazily to avoid circular import at module load time
+    try:
+        from backend.escalation import _detect_human_intent, _trigger_escalation
+        if _detect_human_intent(q_normalized):
+            # Build transcript from current message_log for staff context
+            transcript = [
+                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+                for m in message_log[-10:]
+            ]
+            asyncio.create_task(_trigger_escalation(
+                session_id=sid,
+                face_id=active_session.get("face_id") if active_session else None,
+                user_name=visitor_name,
+                reason="user_request",
+                transcript=transcript,
+            ))
+            logger.info("[ROUTE] ESCALATION (deterministic) — '%s'", q_normalized)
+            return (
+                "I'm connecting you to a staff member at the front desk right now. "
+                "Please wait a moment — someone will be with you shortly.",
+                "escalation",
+                "CONTINUE",
+            )
+    except Exception as _esc_err:
+        logger.warning("[ROUTE] Escalation intent check failed: %s", _esc_err)
+
     # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
     if _matches_short_phrase(q_normalized, GREETING_PHRASES):
         answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
@@ -1405,23 +1495,41 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
 
     # ─── Change Name Request ────────────────────────────────────────────────
     # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
+    INVALID_NAME_STARTS = (
+        "a student", "student", "a visitor", "visitor", "a parent", "parent",
+        "looking for", "interested in", "here for", "going to", "from",
+        "trying to", "asking", "calling", "an engineering", "ordering",
+    )
+    INVALID_NAME_WORDS = {
+        "all", "right", "alright", "sure", "fine", "cool", "done", "wait", "stop",
+        "cancel", "yeah", "yep", "nope", "got", "good", "morning", "evening",
+        "afternoon", "night", "understood", "talk", "speak", "staff", "human",
+        "person", "student", "university", "bengaluru", "bangalore", "task", "nature",
+    }
+
     name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
                         re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
                         re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
                         re.search(r"^(?:i am|iam|myself)\s+([a-zA-Z\s,.-]+)", q_normalized)
 
+    if name_change_match:
+        test_raw = name_change_match.group(1).strip().lower()
+        if any(test_raw.startswith(prefix) for prefix in INVALID_NAME_STARTS):
+            name_change_match = None
+
     if not name_change_match and len(q_normalized.split()) in (1, 2):
         _words = q_normalized.split()
         if all(w.isalpha() and len(w) >= 2 for w in _words):
-            _non_name = {"where", "what", "how", "when", "who", "which", "can", "tell", "fees", "admission", "hostel", "placement", "library", "department", "principal", "hod", "contact", "address", "course", "branch", "branches", "syllabus", "exam", "seat", "cutoff", "rnsit", "college", "campus", "building", "block", "canteen", "sports", "yes", "no", "guest", "skip", "continue", "ok", "okay", "bye", "thanks", "thank you", "hello", "hi", "hey", "help", "info", "details"}
+            _non_name = {"where", "what", "how", "when", "who", "which", "can", "tell", "fees", "admission", "hostel", "placement", "library", "department", "principal", "hod", "contact", "address", "course", "branch", "branches", "syllabus", "exam", "seat", "cutoff", "rnsit", "college", "campus", "building", "block", "canteen", "sports", "yes", "no", "guest", "skip", "continue", "ok", "okay", "bye", "thanks", "thank you", "hello", "hi", "hey", "help", "info", "details", *INVALID_NAME_WORDS}
             if not any(w in _non_name for w in _words):
                 name_change_match = re.search(r"^([a-zA-Z\s]+)$", q_normalized)
+
     if name_change_match:
         new_name_raw = name_change_match.group(1).strip()
         if "," in new_name_raw:
             new_name_raw = new_name_raw.split(",")[0].strip()
         new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
-        if new_name_words:
+        if new_name_words and len(new_name_words) <= 3 and not any(w.lower() in INVALID_NAME_WORDS for w in new_name_words):
             new_name = " ".join(new_name_words)
             if active_session:
                 active_session["user_name"] = new_name
@@ -1470,6 +1578,67 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
        re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
         answer = "Sure! You can say \"change my name to [Your Name]\" anytime, and I'll update it for you."
         return answer, "name_change_help", "CONTINUE"
+
+    # ─── Stop / Cancel escalation or cancel staff request ──────────────────
+    STOP_PHRASES = (
+        "stop", "cancel", "cancel staff", "no staff", "stop connecting",
+        "dont connect", "don't connect", "never mind", "nevermind",
+        "go back", "back to nova", "continue with nova", "i don't need staff",
+        "i dont need staff", "no human", "continue with bot", "cancel request",
+        "no thanks", "stop it", "abort",
+    )
+    is_stop = any(q_normalized == sp or q_normalized.startswith(sp + " ") or q_normalized.endswith(" " + sp) for sp in STOP_PHRASES)
+    if is_stop:
+        from backend.escalation import _get_escalation_state, cancel_escalation
+        esc_state = _get_escalation_state(sid) if sid else None
+        if esc_state and esc_state.get("status") in ("STAFF_NOTIFIED", "STAFF_CONNECTED"):
+            await cancel_escalation(sid, reason="visitor_cancelled")
+            answer = "Cancelled! Nova will continue assisting you right here. What would you like to know?"
+            logger.info("[ROUTE] ESCALATION_CANCEL (deterministic) — session=%s", sid[:8])
+            return answer, "escalation_cancel", "CONTINUE"
+        elif q_normalized in ("stop", "cancel", "stop it", "abort"):
+            answer = "Sure, I'm here! What would you like to know about RNSIT?"
+            logger.info("[ROUTE] STOP_COMMAND (deterministic) — session=%s", sid[:8])
+            return answer, "stop_command", "CONTINUE"
+
+    # ─── Voice-only Escalation (Pre-RAG Deterministic Handover) ─────────────
+    # Intercept human staff requests and sensitive emergencies BEFORE RAG/LLM
+    # so we never return "I don't have that detail" when the visitor asks for staff!
+    from backend.escalation import _detect_human_intent, _detect_sensitive, _trigger_escalation
+
+    if _detect_sensitive(q_normalized):
+        esc_transcript = [
+            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+            for m in message_log[-10:]
+        ]
+        fid = active_session.get("face_id") if active_session else None
+        await _trigger_escalation(
+            session_id=sid,
+            face_id=fid,
+            user_name=visitor_name,
+            reason="sensitive_topic",
+            transcript=esc_transcript,
+        )
+        answer = "I am alerting campus security and front desk staff immediately to assist you. Please wait right here."
+        logger.info("[ROUTE] SENSITIVE_ESCALATION (deterministic) — session=%s", sid[:8])
+        return answer, "escalation_sensitive", "CONTINUE"
+
+    if _detect_human_intent(q_normalized):
+        esc_transcript = [
+            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+            for m in message_log[-10:]
+        ]
+        fid = active_session.get("face_id") if active_session else None
+        await _trigger_escalation(
+            session_id=sid,
+            face_id=fid,
+            user_name=visitor_name,
+            reason="user_request",
+            transcript=esc_transcript,
+        )
+        answer = "I am connecting you to our front desk staff right now. Please hold on a moment while I alert them to assist you directly at this kiosk. If you want to continue with me instead, simply say 'stop' at any time."
+        logger.info("[ROUTE] HUMAN_ESCALATION (deterministic) — session=%s", sid[:8])
+        return answer, "escalation_request", "CONTINUE"
 
     # ─── Thank you / bye / natural sign-off → end session immediately ───────
     if _is_farewell(q_normalized):
@@ -1639,6 +1808,35 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         logger.error("[LLM PIPELINE] generate_rag_kiosk_response failed: %s", exc)
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
+    # ── Escalation check: low-confidence / sensitive topic detection ──────────
+    global _low_confidence_count
+    answer_is_low_confidence = not _is_cacheable(answer)
+    if answer_is_low_confidence:
+        _low_confidence_count += 1
+    else:
+        _low_confidence_count = max(0, _low_confidence_count - 1)  # decay on good answer
+
+    try:
+        from backend.escalation import maybe_escalate, _detect_sensitive
+        # Build transcript for escalation context
+        esc_transcript = [
+            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+            for m in message_log[-10:]
+        ]
+        escalated = await maybe_escalate(
+            question=question,
+            answer=answer,
+            session_id=sid,
+            face_id=fid,
+            user_name=visitor_name,
+            low_confidence_count=_low_confidence_count,
+            transcript=esc_transcript,
+        )
+        if escalated:
+            answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
+    except Exception as _esc_err:
+        logger.warning("[ASK] Escalation check failed: %s", _esc_err)
+
     return await _respond(answer, source="rag_llm")
 
 
@@ -1749,6 +1947,32 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
                                "(would have poisoned this question for 1 hour): %r", answer[:80])
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
+
+        # ── Escalation check for streaming path ───────────────────────────────
+        global _low_confidence_count
+        if not _is_cacheable(answer):
+            _low_confidence_count += 1
+        else:
+            _low_confidence_count = max(0, _low_confidence_count - 1)
+        try:
+            from backend.escalation import maybe_escalate
+            esc_transcript = [
+                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+                for m in message_log[-10:]
+            ]
+            escalated = await maybe_escalate(
+                question=question,
+                answer=answer,
+                session_id=sid,
+                face_id=fid,
+                user_name=visitor_name,
+                low_confidence_count=_low_confidence_count,
+                transcript=esc_transcript,
+            )
+            if escalated:
+                answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
+        except Exception as _esc_err:
+            logger.warning("[STREAM] Escalation check failed: %s", _esc_err)
 
         await _finish(answer, "CONTINUE")
         yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': 'CONTINUE'})}\n\n"
@@ -1960,14 +2184,18 @@ async def greet_visitor(payload: GreetVisitorPayload):
     )
     final_session_id = active_session["session_id"]
     message_log = []
-    _last_activity_ts = datetime.now().timestamp()
+    _last_activity_ts   = datetime.now().timestamp()
+    _low_confidence_count = 0  # reset escalation counter
 
     await manager.broadcast({
         "type": "session_start",
         "session": active_session,
         "tts_text": active_session["greeting"],
     })
-    
+
+    # Issue companion QR token
+    asyncio.create_task(_issue_companion_token_async(final_session_id))
+
     logger.info(f"[GREET SUCCESS] Session established for user context: '{payload.name}'")
     return {"status": "recognized", "session_id": final_session_id, "session": active_session}
 

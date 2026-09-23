@@ -90,6 +90,54 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
 
+  // ── QR Companion & Escalation States ──
+  const [companionToken, setCompanionToken] = useState(null);
+  const [companionUrl, setCompanionUrl] = useState('');
+  const [showCompanionModal, setShowCompanionModal] = useState(false);
+  const [escalationState, setEscalationState] = useState(null); // null | 'pending' | 'connected' | 'timeout'
+  const [escalationMsg, setEscalationMsg] = useState('');
+
+  useEffect(() => {
+    if (!session?.session_id) {
+      setCompanionToken(null);
+      setCompanionUrl('');
+      return;
+    }
+    fetch(BACKEND + '/companion/token', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d?.token) {
+          setCompanionToken(d.token);
+          setCompanionUrl(d.url);
+        }
+      })
+      .catch(() => {});
+  }, [session?.session_id]);
+
+  const handleRequestEscalation = async () => {
+    try {
+      setEscalationState('pending');
+      setEscalationMsg('Connecting you to front desk staff…');
+      await fetch(BACKEND + '/escalation/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'user_request' }),
+      });
+    } catch (err) {
+      console.error('[ESCALATION] Request failed:', err);
+    }
+  };
+
+  const handleCancelEscalation = async () => {
+    setEscalationState(null);
+    const sid = session?.session_id;
+    if (sid) {
+      try {
+        await fetch(`${BACKEND}/escalation/cancel/${sid}`, { method: 'POST' });
+      } catch (e) { /* silent */ }
+    }
+  };
+
   // The backend composes the greeting (it knows resume-vs-new and the
   // institute intro line); these local strings are only a fallback.
   const greeting = session?.greeting || (isReturning
@@ -482,9 +530,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (onStart) { onStart(); onStart = null; }
     };
 
-    // Fallback: robotic browser voice, only if backend TTS is unavailable.
-    // No per-sentence audio boundaries here, so the full text reveals at once
-    // (still correct: it's the moment THIS voice actually starts talking).
+    // Fallback: browser TTS, only if backend Kokoro is unavailable.
+    // Explicitly picks a loaded English voice so the utterance never queues
+    // silently on Windows (speechSynthesis.speak without a loaded voice can
+    // hang forever, never firing onend). A 12-second hard timeout guarantees
+    // finish() is always called so the mic is never left paused.
     const browserSpeak = () => {
       fireStart();
       if (onSentence) { try { onSentence(text, 0); } catch (e) { } }
@@ -492,8 +542,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       utter.lang = 'en-US';
       utter.rate = 1.0;
       utter.volume = 1;
-      utter.onend = finish;
-      utter.onerror = finish;
+      // Prefer a loaded English voice so speak() doesn't queue silently
+      const voices = window.speechSynthesis.getVoices();
+      const enVoice = voices.find(v => v.lang.startsWith('en') && !v.localService === false)
+        || voices.find(v => v.lang.startsWith('en'))
+        || voices[0];
+      if (enVoice) utter.voice = enVoice;
+      let bsDone = false;
+      const bsFinish = () => { if (!bsDone) { bsDone = true; finish(); } };
+      // 12-second hard cap — utterance must finish by then or we move on
+      const bsTimer = setTimeout(() => { window.speechSynthesis.cancel(); bsFinish(); }, 12000);
+      utter.onend = () => { clearTimeout(bsTimer); bsFinish(); };
+      utter.onerror = () => { clearTimeout(bsTimer); bsFinish(); };
+      window.speechSynthesis.cancel();   // clear any stale queued utterances first
       window.speechSynthesis.speak(utter);
     };
 
@@ -657,14 +718,26 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   // Promise-returning wrapper: resolves once THIS utterance has fully
   // finished playing. Pauses the mic during prompts to prevent speaker echo.
+  // Safety: a 15-second hard timeout always resumes the mic even if TTS
+  // hangs or SpeechSynthesis never fires onend (e.g. Kokoro slow to load,
+  // browser voice unavailable). Without this the mic stays paused forever.
   const speakAndWait = useCallback((text, onStart) => (
     new Promise((resolve) => {
-      micRef.current?.pause();
-      speak(text, onStart, () => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
         if (isMounted.current && micRef.current) {
           micRef.current.resume();
         }
         resolve();
+      };
+      micRef.current?.pause();
+      // Hard timeout — always resume listening even if TTS never finishes
+      const safetyTimer = setTimeout(done, 15000);
+      speak(text, onStart, () => {
+        clearTimeout(safetyTimer);
+        done();
       });
     })
   ), [speak]);
@@ -676,6 +749,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
+
+    if (escalationState && /\b(?:stop|cancel|never mind|nevermind|back|continue|dont connect|no staff)\b/i.test(text)) {
+      setEscalationState(null);
+    }
 
     // ── Check if visitor is affirming a pending name confirmation ──────
     const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
@@ -1445,6 +1522,21 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             if (updatedName && updatedName !== 'Guest' && updatedName !== 'Unknown') {
               setLocalName(updatedName);
             }
+          } else if (msg.type === 'companion_qr') {
+            if (msg.token) setCompanionToken(msg.token);
+            if (msg.url) setCompanionUrl(msg.url);
+          } else if (msg.type === 'escalation_pending') {
+            setEscalationState('pending');
+            setEscalationMsg(msg.message || 'Connecting you to front desk staff…');
+          } else if (msg.type === 'escalation_connected') {
+            setEscalationState('connected');
+            setEscalationMsg(msg.message || 'A staff member has connected!');
+          } else if (msg.type === 'escalation_timeout') {
+            setEscalationState('timeout');
+            setEscalationMsg(msg.message || 'No staff available right now. Nova will continue helping you.');
+            setTimeout(() => setEscalationState(null), 6000);
+          } else if (msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') {
+            setEscalationState(null);
           }
         } catch (_) { }
       };
@@ -1748,6 +1840,37 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             </div>
           )}
 
+          {/* ── Always-Visible Hands-Free QR Companion Card ── */}
+          {companionToken && (
+            <div style={{
+              position: 'absolute', top: '16px', left: '16px', zIndex: 10,
+              background: 'rgba(255, 255, 255, 0.92)', backdropFilter: 'blur(12px)',
+              borderRadius: '16px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: '12px',
+              boxShadow: '0 8px 24px rgba(26, 35, 126, 0.12)', border: '1.5px solid rgba(224, 228, 255, 0.95)',
+              animation: 'fadeIn 0.5s ease'
+            }}>
+              <img
+                src={`${BACKEND}/companion/qr/${companionToken}`}
+                alt="Companion QR"
+                style={{ width: '70px', height: '70px', borderRadius: '10px', border: '1px solid #c7cbe8', background: '#fff', padding: '3px', objectFit: 'contain' }}
+              />
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                  <span style={{ fontSize: '13px' }}>📱</span>
+                  <span style={{ fontSize: '11.5px', fontWeight: '800', color: '#1a237e', textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                    Phone Companion
+                  </span>
+                </div>
+                <div style={{ fontSize: '11px', color: '#1e293b', fontWeight: '700', marginTop: '3px' }}>
+                  Scan with smartphone
+                </div>
+                <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px', lineHeight: '1.3', maxWidth: '140px' }}>
+                  Take <strong>Visit Summary</strong> &amp; <strong>PDF Brochures</strong> with you
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* ── Nova SVG character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
             <NovaCharacter st={status} />
@@ -1948,6 +2071,193 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       </div>
 
+      {/* ── ESCALATION MODAL / OVERLAY ── */}
+      {escalationState && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 100,
+          background: 'rgba(15, 23, 42, 0.75)', backdropFilter: 'blur(8px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
+        }}>
+          <div style={{
+            background: '#ffffff', borderRadius: '20px', maxWidth: '440px', width: '100%',
+            padding: '32px 28px', textAlign: 'center', boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
+            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
+          }}>
+            {escalationState === 'pending' && (
+              <>
+                <div style={{
+                  width: '64px', height: '64px', margin: '0 auto 18px', borderRadius: '50%',
+                  border: '4px solid #e0e7ff', borderTopColor: '#4338ca',
+                  animation: 'spin 1s linear infinite',
+                }} />
+                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#1e1b4b', marginBottom: '8px' }}>
+                  Connecting to Front Desk
+                </h2>
+                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
+                  {escalationMsg || 'A front desk reception team member has been alerted to assist you directly at this kiosk.'}
+                </p>
+                <div style={{
+                  background: 'linear-gradient(135deg, #eef2ff, #f0fdf4)',
+                  borderRadius: '14px', padding: '14px 16px', marginBottom: '16px',
+                  border: '1px solid #c7d2fe', textAlign: 'left',
+                }}>
+                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#4338ca', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
+                    📞 Front Desk &amp; Campus Helpline
+                  </div>
+                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#1e1b4b', marginBottom: '3px' }}>
+                    +91 80286 11880 / 81 / 82
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#3730a3' }}>
+                    Admissions Helpline: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
+                  </div>
+                </div>
+                <div style={{
+                  background: '#f0f9ff', borderRadius: '12px', padding: '12px 16px',
+                  fontSize: '13px', color: '#0369a1', border: '1px solid #bae6fd',
+                  fontWeight: '600',
+                }}>
+                  🎤 Say <strong>"Stop"</strong> anytime to return to Nova
+                </div>
+              </>
+            )}
+
+            {escalationState === 'connected' && (
+              <>
+                <div style={{ fontSize: '56px', marginBottom: '16px' }}>🤝</div>
+                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#065f46', marginBottom: '8px' }}>
+                  Staff Member Connected!
+                </h2>
+                <p style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', marginBottom: '20px' }}>
+                  {escalationMsg || 'A front desk team member is now assisting you.'}
+                </p>
+                <div style={{
+                  background: '#f0fdf4', borderRadius: '12px', padding: '12px 16px',
+                  fontSize: '13px', color: '#15803d', border: '1px solid #bbf7d0',
+                  fontWeight: '600',
+                }}>
+                  🎤 Say <strong>&ldquo;Stop&rdquo;</strong> to return to Nova
+                </div>
+              </>
+            )}
+
+            {escalationState === 'timeout' && (
+              <>
+                <div style={{ fontSize: '56px', marginBottom: '16px' }}>⏳</div>
+                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#92400e', marginBottom: '8px' }}>
+                  Staff Currently Occupied
+                </h2>
+                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
+                  {escalationMsg || 'Front desk staff members are currently assisting other visitors. Nova will gladly continue answering your questions!'}
+                </p>
+                <div style={{
+                  background: 'linear-gradient(135deg, #fef3c7, #fffbeb)',
+                  borderRadius: '14px', padding: '14px 16px', marginBottom: '18px',
+                  border: '1px solid #fde68a', textAlign: 'left',
+                }}>
+                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
+                    📞 Direct Contact Numbers
+                  </div>
+                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#78350f', marginBottom: '3px' }}>
+                    +91 80286 11880 / 81 / 82
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#92400e' }}>
+                    Admissions Desk: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
+                  </div>
+                </div>
+                <div style={{
+                  background: '#fffbeb', borderRadius: '12px', padding: '10px 16px',
+                  fontSize: '13px', color: '#92400e', border: '1px solid #fde68a',
+                  fontWeight: '600',
+                }}>
+                  🎤 Say anything to continue with Nova
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── QR COMPANION MODAL ── */}
+      {showCompanionModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 90,
+          background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(8px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
+        }}>
+          <div style={{
+            background: '#ffffff', borderRadius: '24px', maxWidth: '440px', width: '100%',
+            padding: '30px', textAlign: 'center', boxShadow: '0 25px 60px rgba(0,0,0,0.3)',
+            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '24px' }}>📱</span>
+                <span style={{ fontSize: '17px', fontWeight: '800', color: '#1a237e' }}>Phone Companion</span>
+              </div>
+              <button
+                onClick={() => setShowCompanionModal(false)}
+                style={{
+                  border: 'none', background: '#f1f5f9', borderRadius: '50%', width: '32px', height: '32px',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                  color: '#64748b', fontSize: '16px', fontWeight: '700',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <p style={{ fontSize: '13px', color: '#64748b', lineHeight: '1.5', marginBottom: '20px' }}>
+              Scan this QR code with your phone camera to take your conversation recap, useful links, and official brochures with you.
+            </p>
+
+            {companionToken ? (
+              <div style={{
+                display: 'inline-block', padding: '12px', background: '#f8fafc',
+                borderRadius: '16px', border: '1.5px solid #e2e8f0', marginBottom: '16px',
+              }}>
+                <img
+                  src={`${BACKEND}/companion/qr/${companionToken}`}
+                  alt="Companion QR Code"
+                  style={{ width: '190px', height: '190px', display: 'block', borderRadius: '8px' }}
+                />
+              </div>
+            ) : (
+              <div style={{
+                height: '190px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: '#f8fafc', borderRadius: '16px', color: '#94a3b8', fontSize: '14px', marginBottom: '16px',
+              }}>
+                Generating QR code…
+              </div>
+            )}
+
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '6px', background: '#f1f5f9',
+              borderRadius: '12px', padding: '12px', textAlign: 'left', fontSize: '11px', color: '#475569',
+              marginBottom: '20px',
+            }}>
+              <div>✅ <strong>Session Summary:</strong> Instant recap of topics discussed</div>
+              <div>📄 <strong>Official Brochure:</strong> Direct PDF download on your device</div>
+              <div>⏱️ <strong>Session Window:</strong> Valid for 20 minutes</div>
+            </div>
+
+            {companionUrl && (
+              <a
+                href={companionUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  display: 'block', width: '100%', padding: '11px 0', borderRadius: '12px',
+                  background: '#1a237e', color: '#fff', textDecoration: 'none',
+                  fontSize: '13px', fontWeight: '700', textAlign: 'center',
+                }}
+              >
+                Open Companion Link Directly
+              </a>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── FLOATING CAMERA PIP ── */}
       <div style={{
         position: 'fixed', bottom: '16px', right: '16px', width: '80px', height: '80px',
@@ -1968,6 +2278,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         /* ── message bubble spring-in ── */
         .msg-in { animation: msgIn 0.2s cubic-bezier(0.18,0.89,0.32,1.28) both; }
         @keyframes msgIn { from{opacity:0;transform:translateY(5px) scale(0.97)} to{opacity:1;transform:none} }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
         /* ── typing dots ── */
         .td { display:inline-block; width:7px; height:7px; border-radius:50%; background:#c5cae9;
