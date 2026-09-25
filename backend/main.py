@@ -676,7 +676,9 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
+        manager.disconnect(ws)
+    except Exception:
         manager.disconnect(ws)
 
 
@@ -2046,15 +2048,17 @@ async def stt_websocket_endpoint(ws: WebSocket):
       browser -> binary frame : one COMPLETE utterance (16 kHz mono int16 PCM)
       backend -> JSON frame   : {text, confidence, language, latency_ms}
     """
-    await ws.accept()
-    logger.info("[WS/STT] Kiosk connected")
     try:
+        await ws.accept()
+        logger.info("[WS/STT] Kiosk connected")
         while True:
             pcm_bytes = await ws.receive_bytes()
             result = await asyncio.to_thread(transcribe_pcm, pcm_bytes, "en")
             await ws.send_json(result)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         logger.info("[WS/STT] Kiosk disconnected")
+    except Exception as e:
+        logger.info(f"[WS/STT] Kiosk disconnected: {e}")
 
 
 @app.websocket("/ws/detect")
@@ -2071,9 +2075,9 @@ async def detect_websocket(ws: WebSocket):
     an optional "yes" gesture. It never affects detection.py's own state
     machine.
     """
-    await ws.accept()
-    logger.info("[WS/DETECT] Browser camera connected")
     try:
+        await ws.accept()
+        logger.info("[WS/DETECT] Browser camera connected")
         while True:
             raw = await ws.receive_text()
             try:
@@ -2104,10 +2108,14 @@ async def detect_websocket(ws: WebSocket):
                     "blink":        bool(getattr(result, "blink", False)),
                     "double_blink": bool(getattr(result, "double_blink", False)),
                 })
+            except (WebSocketDisconnect, RuntimeError):
+                break
             except Exception as frame_err:
                 logger.warning(f"[WS/DETECT] Frame processing error: {frame_err}")
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         logger.info("[WS/DETECT] Browser camera disconnected")
+    except Exception as e:
+        logger.info(f"[WS/DETECT] Browser camera disconnected: {e}")
 
 
 @app.post("/tts")
