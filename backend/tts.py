@@ -12,6 +12,8 @@ import io
 import time
 import logging
 import threading
+import cProfile
+import pstats
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -41,32 +43,52 @@ load_dotenv()
 TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-worker")
 
 
-def _init_torch_threads():
-    """Pin torch's thread count on the TTS worker thread.
+def _default_tts_threads() -> int:
+    """Torch intra-op thread cap for the TTS worker.
 
-    NOTE ON THE DEFAULT: with TTS_EXECUTOR having exactly one worker, only
-    ONE synthesis call ever runs at a time now — there's no more "two
-    syntheses fighting each other for cores" scenario within TTS itself to
-    guard against (that's what the original cap of 2 was defending
-    against). The only remaining reason to cap this at all is leaving CPU
-    headroom for STT (faster_whisper) and the RAG embedding model, which
-    run concurrently on their own threads/processes — see the same log
-    window showing faster_whisper and sentence-transformers calls
-    interleaved with TTS synthesis. If profiling shows Kokoro itself is the
-    bottleneck (multi-second synthesis for short text, well after warmup —
-    i.e. NOT a cold-start effect), try raising TTS_TORCH_THREADS toward
-    your actual core count and re-measure; there's no longer an internal
-    reason to keep it this low.
+    Set to 12 per explicit direction after reviewing bench_tts.py's thread
+    sweep on the actual kiosk hardware (12 cores): threads=12 measured
+    fastest (3641.5ms mean). The sweep itself was noisy — 2 through 14
+    threads mostly overlapped within stdev — so this is a judgment call on
+    top of that data, not a clean statistical win; recorded here as a
+    deliberate choice rather than re-derived automatically, so a future
+    edit doesn't quietly change it back. TTS_TORCH_THREADS still overrides
+    this explicitly if you want to test another value.
     """
+    return 12
+
+
+def _init_torch_threads():
+    """Pin torch's thread count on the TTS worker thread. See
+    _default_tts_threads() above for the thread-count reasoning (12,
+    per explicit direction from the bench_tts.py results) —
+    TTS_TORCH_THREADS still overrides it explicitly if needed."""
     try:
         import torch
-        torch.set_num_threads(int(os.getenv("TTS_TORCH_THREADS", "2")))
+        threads = int(os.getenv("TTS_TORCH_THREADS", str(_default_tts_threads())))
+        torch.set_num_threads(threads)
         try:
             torch.set_num_interop_threads(1)
         except RuntimeError:
             # Can only be called once per process and only before any
             # interop op has run — ignore if it's too late.
             pass
+        # flush_denormal(True) was tried here and REVERTED. Hypothesis was
+        # that Kokoro's conv-heavy vocoder hits the classic CPU denormal
+        # slowdown (near-zero float values falling back to slow microcode
+        # paths) — a real, well-documented effect on SOME hardware/model
+        # combos. bench_tts.py's direct A/B on THIS machine (Ryzen-class
+        # AVX2, no AVX512) showed the opposite: off=3421ms vs on=3673ms,
+        # i.e. no improvement (if anything slightly worse, within noise).
+        # Per "don't keep an optimization that isn't measurably better":
+        # left at PyTorch's own default (off) rather than kept on a
+        # plausible-sounding guess that didn't hold up when measured.
+        # Visible confirmation of what's actually engaged — needed to tell
+        # "thread cap is still the bottleneck" apart from "thread cap was
+        # already raised, the remaining cost is genuinely inference" when
+        # reading [TTS-PROFILE] timings below.
+        logger.info("[TTS-PROFILE] torch threads pinned: %d (cpu_count=%s)",
+                    threads, os.cpu_count())
     except ImportError:
         pass
 
@@ -167,15 +189,131 @@ _kokoro_lock = threading.Lock()
 
 
 def _synthesize_kokoro(text: str) -> bytes:
+    # Stage-level timing — kept cheap (a handful of time.monotonic() calls)
+    # so it can stay on in production and actually show, per call, whether
+    # a slow /tts is lock contention, phonemization+inference (the model
+    # itself), or post-processing/encoding, instead of only ever seeing one
+    # opaque total. pipe(text, ...) is a generator that does phonemization
+    # and vocoder inference together per chunk — Kokoro doesn't expose
+    # those as separate steps — so "phonemize+infer" below is that combined
+    # cost, which is normally the dominant one.
+    t0 = time.monotonic()
+    with _kokoro_lock:
+        t_lock = time.monotonic()
+        pipe = _get_pipe()
+        t_pipe = time.monotonic()
+        chunks = [audio for _, _, audio in pipe(text, voice=TTS_VOICE, speed=TTS_SPEED)]
+        t_infer = time.monotonic()
+    if not chunks:
+        return b""
+    audio = _trim_silence(np.concatenate(chunks), 24000)
+    t_trim = time.monotonic()
+    buf = io.BytesIO()
+    sf.write(buf, audio, 24000, format="WAV")
+    t_encode = time.monotonic()
+    # INFO, not DEBUG: main.py's logging.basicConfig(level=logging.INFO)
+    # meant this line was silently dropped before it ever reached a handler
+    # — the "profiling isn't showing up" symptom. It's cheap (a handful of
+    # time.monotonic() calls, no extra work), so it's fine to leave at INFO
+    # rather than require a log-level change to see it.
+    logger.info(
+        "[TTS-PROFILE] lock_wait=%.0fms pipe_init=%.0fms phonemize+infer=%.0fms "
+        "trim=%.0fms encode=%.0fms total=%.0fms (%d chars): '%s'",
+        (t_lock - t0) * 1000, (t_pipe - t_lock) * 1000,
+        (t_infer - t_pipe) * 1000, (t_trim - t_infer) * 1000,
+        (t_encode - t_trim) * 1000, (t_encode - t0) * 1000, len(text),
+        text[:40],
+    )
+    return buf.getvalue()
+
+
+def _log_runtime_diagnostics(pipe):
+    """One-time dump of exactly what's actually running: torch device,
+    dtype, thread counts, CPU backend config, and the Kokoro model/voice
+    config — requested so we can rule out "silently running fp64" or "not
+    actually seeing the thread cap we set" etc. before reasoning about
+    where the per-call time goes. Best-effort: KPipeline's internals
+    aren't officially documented across versions, so every introspection
+    attempt is guarded and falls back to an honest "unknown" rather than
+    guessing. This is pure introspection — it changes nothing about how
+    inference runs, so unlike the thread-count/compile/dtype experiments
+    it doesn't need A/B benchmarking to justify being here."""
+    try:
+        import torch
+        threads, interop = torch.get_num_threads(), torch.get_num_interop_threads()
+        try:
+            mkldnn_ok = torch.backends.mkldnn.is_available()
+        except Exception:
+            mkldnn_ok = "n/a"
+        try:
+            mkl_ok = torch.backends.mkl.is_available()
+        except Exception:
+            mkl_ok = "n/a"
+        try:
+            cpu_cap = torch.backends.cpu.get_cpu_capability()
+        except Exception:
+            cpu_cap = "n/a (older torch build)"
+        logger.info(
+            "[TTS-PROFILE] cpu backend: torch=%s mkldnn=%s mkl=%s cpu_capability=%s "
+            "OMP_NUM_THREADS=%s MKL_NUM_THREADS=%s",
+            torch.__version__, mkldnn_ok, mkl_ok, cpu_cap,
+            os.getenv("OMP_NUM_THREADS", "<unset>"), os.getenv("MKL_NUM_THREADS", "<unset>"),
+        )
+    except ImportError:
+        threads = interop = "torch unavailable"
+
+    device = dtype = "unknown"
+    model_obj = getattr(pipe, "model", None)
+    if model_obj is not None:
+        try:
+            p = next(model_obj.parameters())
+            device, dtype = str(p.device), str(p.dtype)
+        except Exception as e:
+            device = dtype = f"introspection failed: {e}"
+
+    logger.info(
+        "[TTS-PROFILE] runtime: torch_threads=%s torch_interop_threads=%s "
+        "model_device=%s model_dtype=%s voice=%s speed=%s lang_code=a engine=%s",
+        threads, interop, device, dtype, TTS_VOICE, TTS_SPEED, TTS_ENGINE,
+    )
+
+
+def _synthesize_kokoro_profiled(text: str) -> bytes:
+    """Same work as _synthesize_kokoro(), but with the phonemize+infer span
+    wrapped in cProfile instead of one opaque timer, so we can see WHICH
+    function inside it actually costs the time — G2P/phonemization,
+    tokenization, KModel.forward, the decoder/vocoder, or something
+    unexpected like the voice pack being reloaded from disk every call —
+    without having to guess at kokoro's internal method names in advance
+    (they aren't part of its public API and vary across versions).
+    TEMPORARY diagnostic per request: used by the startup repeat-call test
+    below, and per-request when TTS_DEEP_PROFILE=1. cProfile adds real
+    per-Python-call-boundary overhead, so it's opt-in for live traffic
+    (see _TTS_DEEP_PROFILE) rather than always-on like the cheap timing in
+    _synthesize_kokoro()."""
+    profiler = cProfile.Profile()
     with _kokoro_lock:
         pipe = _get_pipe()
+        profiler.enable()
         chunks = [audio for _, _, audio in pipe(text, voice=TTS_VOICE, speed=TTS_SPEED)]
+        profiler.disable()
+    stream = io.StringIO()
+    pstats.Stats(profiler, stream=stream).sort_stats("cumulative").print_stats(15)
+    logger.info("[TTS-PROFILE] deep breakdown (%d chars) '%s':\n%s",
+                len(text), text[:40], stream.getvalue())
     if not chunks:
         return b""
     audio = _trim_silence(np.concatenate(chunks), 24000)
     buf = io.BytesIO()
     sf.write(buf, audio, 24000, format="WAV")
     return buf.getvalue()
+
+
+# Opt-in per-request deep profiling (see _synthesize_kokoro_profiled above).
+# Off by default — this is for turning on temporarily against live traffic
+# if the startup repeat-call test below isn't enough to reproduce the
+# pattern seen in production.
+_TTS_DEEP_PROFILE = os.getenv("TTS_DEEP_PROFILE", "0") == "1"
 
 
 def _synthesize_melo(text: str) -> bytes:
@@ -227,7 +365,9 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
         return b""
 
     def _run(eng):
-        return _synthesize_melo(text) if eng == "melotts" else _synthesize_kokoro(text)
+        if eng == "melotts":
+            return _synthesize_melo(text)
+        return _synthesize_kokoro_profiled(text) if _TTS_DEEP_PROFILE else _synthesize_kokoro(text)
 
     t0 = time.monotonic()
     try:
@@ -291,6 +431,42 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
                 except Exception:
                     pass
             print(f"[TTS] {TTS_ENGINE} warmed up and pre-cached {len(_PREWARM)} phrases.")
+
+            # ── Repeat-call diagnostic ────────────────────────────────────
+            # Same text synthesized twice back to back, BOTH after the
+            # warmup above (so neither run pays cold-start cost) — this is
+            # what tells apart "the multi-second cost is a one-time
+            # per-process expense" (run2 much faster than run1) from
+            # "it's genuinely paid on every call" (run1 ≈ run2, meaning the
+            # cost is real inference work, not warmup). Also dumps a
+            # cProfile breakdown of each run and the runtime config
+            # (device/dtype/threads) once, so the exact expensive function
+            # is visible rather than inferred. Uses a fixed sentence in the
+            # same length range (~70 chars) as the slow calls actually
+            # observed in production logs.
+            if KOKORO_AVAILABLE and TTS_ENGINE == "kokoro":
+                try:
+                    _log_runtime_diagnostics(_get_pipe())
+                    _repeat_text = ("The college working hours are 9:20 AM "
+                                     "to 5:00 PM on all working days.")
+                    t_r1 = time.monotonic()
+                    _synthesize_kokoro_profiled(_repeat_text)
+                    d_r1 = (time.monotonic() - t_r1) * 1000
+                    t_r2 = time.monotonic()
+                    _synthesize_kokoro_profiled(_repeat_text)
+                    d_r2 = (time.monotonic() - t_r2) * 1000
+                    verdict = ("run1 much slower than run2 -> looks like residual "
+                               "cold-start/warmup cost, not steady-state inference"
+                               if d_r1 > d_r2 * 1.5 else
+                               "run1 ~= run2 -> cost is paid on every call; this is "
+                               "genuine per-call inference cost, not a warmup gap")
+                    logger.info(
+                        "[TTS-PROFILE] repeat-call test (%d chars): run1=%.0fms "
+                        "run2=%.0fms delta=%.0fms -> %s",
+                        len(_repeat_text), d_r1, d_r2, d_r1 - d_r2, verdict,
+                    )
+                except Exception as e:
+                    logger.warning("[TTS-PROFILE] repeat-call test failed: %s", e)
         except Exception as e:
             print(f"[TTS] Warmup failed: {e}")
         finally:

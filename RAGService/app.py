@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 import config
 from file_parser import parse_file, extract_full_text, SUPPORTED_EXTENSIONS
 from rag_store import RAGStore, RAGCollection
+from embeddings import get_embedding_provider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ragservice")
@@ -51,6 +52,40 @@ def get_store() -> RAGStore:
     if _store is None:
         _store = RAGStore()
     return _store
+
+
+@app.on_event("startup")
+def _warm_embedding_model():
+    """
+    Loads the embedding model (SentenceTransformer/BGE, see embeddings.py's
+    LocalBGEEmbedding._load) once, here, at process startup — instead of
+    lazily on whatever request happens to call embed_query()/embed_documents()
+    first. Previously that was always the first real user query, which paid
+    the full model load (HF Hub metadata fetch + downloading/reading model
+    weights, several seconds — visible as a burst of huggingface.co HTTP
+    calls in the logs at query time) as part of that visitor's response
+    latency. LocalBGEEmbedding._model is a class-level attribute, so this
+    warms the exact same cached instance every real embed call reuses —
+    nothing else changes about how embeddings are produced.
+
+    Runs as a FastAPI startup event, so uvicorn won't start accepting
+    connections (including /health) until this finishes — run.py's
+    wait_for_rag() already budgets up to 120s for RAGService's first boot,
+    so this fits inside the existing contract rather than needing a new one.
+    Wrapped in try/except so a warmup failure (e.g. no network access to
+    Hugging Face on a machine's very first-ever boot) can't crash the whole
+    service — embeddings.py's lazy-load still covers that case as a
+    fallback, just with the original cold-start cost paid by that first
+    query instead.
+    """
+    try:
+        provider = get_embedding_provider()
+        provider.embed_query("warmup")
+        log.info("[RAGService] Embedding model (%s) warmed up at startup.",
+                 provider.provider_name)
+    except Exception as e:
+        log.warning("[RAGService] Embedding model warmup failed — will lazy-load "
+                    "on the first real query instead: %s", e)
 
 
 # ── Request / Response schemas ─────────────────────────────────────────

@@ -1330,8 +1330,7 @@ async def generate_rag_kiosk_response_stream(question: str, history: list = None
         f"{context_text}\n\n"
         "CRITICAL RESPONSE CONSTRAINTS:\n"
         "1. NEVER start your answers with greetings or self-introductions (do NOT say 'Hello Nova', 'Hello! I am Nova', 'Hi, Nova here', etc.). Answer the visitor's question directly and concisely.\n"
-        "2. Rely only on the facts provided above. If the context does not contain the answer, "
-        "say: 'I don't have that detail — please visit the Admin Block or call our admissions desk.'\n"
+        "2. Ground your answer in the facts provided above. If asked for comparisons, advice, or broad questions (e.g. 'which department is good?'), synthesize the available facts objectively. Do NOT casually say 'I don't have that detail' when relevant campus facts are available. Only if the facts above are completely silent about the question should you say: 'I don't have that detail — please visit the Admin Block or call our admissions desk.'\n"
         "3. Keep responses snappy and punchy (2-3 sentences maximum). Avoid long paragraphs.\n"
         "4. Do not answer out-of-domain questions (politics, celebrities, general trivia). "
         "Guide them back to college topics.\n"
@@ -1483,6 +1482,39 @@ async def _try_fetch_weather(question: str) -> str | None:
     except Exception as e:
         logger.warning("[LIVE_INFO] Weather fetch failed: %s", e)
         return None
+
+
+async def get_weather_greeting_phrase() -> str:
+    """
+    Returns a short, pleasant weather description for personalized greetings
+    (e.g., 'It's a bright and sunny day at RNSIT.') using the existing
+    Open-Meteo integration. Falls back gracefully if network times out.
+    """
+    try:
+        client = get_shared_client()
+        resp = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={"latitude": 12.9081, "longitude": 77.5218,
+                    "current_weather": "true", "timezone": "Asia/Kolkata"},
+            timeout=httpx.Timeout(4.0, connect=2.0),
+        )
+        if resp.status_code == 200:
+            cw = resp.json().get("current_weather", {})
+            code = cw.get("weathercode")
+            if code is not None:
+                if code in (0, 1):
+                    return "It's a bright and sunny day at RNSIT."
+                elif code in (2, 3):
+                    return "It's a pleasant, cloudy day at RNSIT."
+                elif code in (45, 48):
+                    return "It's a cool and misty day at RNSIT."
+                elif code in (51, 53, 55, 61, 63, 65, 80, 81, 82):
+                    return "It's a breezy, rainy day at RNSIT."
+                elif code in (95, 96, 99):
+                    return "We're having some stormy weather at RNSIT today."
+    except Exception as e:
+        logger.warning("[WEATHER] Weather greeting fetch failed: %s", e)
+    return "It's a pleasant day at RNSIT."
 
 
 async def _try_fetch_traffic(question: str) -> str | None:

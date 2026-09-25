@@ -51,7 +51,7 @@ import logging
 from typing import Any
 
 from backend.query_correction import normalize_query
-from backend.entity_mapping import detect_entity, VERIFIED_ENTITIES
+from backend.entity_mapping import detect_entity, VERIFIED_ENTITIES, get_kb_data
 from backend.llm import (
     retrieve_relevant_context,
     chat_completion_with_fallback,
@@ -166,6 +166,56 @@ def _get_college_overview_fact() -> str:
     """
     entry = VERIFIED_ENTITIES.get("COLLEGE_OVERVIEW") or {}
     return entry.get("answer") or _COLLEGE_OVERVIEW_FALLBACK
+
+
+def is_broad_department_query(query: str) -> bool:
+    """True if query asks broadly about departments, branch comparisons, or choosing a branch."""
+    q = (query or "").lower().strip()
+    if not q:
+        return False
+    patterns = (
+        r"\bwhich\s+(?:department|dept|branch|course)\s+(?:is\s+)?(?:good|better|best|preferred)\b",
+        r"\bwhich\s+(?:department|dept|branch|course)\s+should\s+i\s+choose\b",
+        r"\bwhich\s+(?:department|dept|branch|course)\s+to\s+choose\b",
+        r"\bwhich\s+(?:department|dept|branch|course)\s+is\s+best\s+for\s+me\b",
+        r"\bwhich\s+(?:department|dept|branch|course)\s+(?:is\s+)?better\s+for\s+(?:software|coding|placements?|hardware|core)\b",
+        r"\bwhich\s+(?:department|dept|branch|course)\s+has\s+(?:good|better|best|high)\s+placements?\b",
+        r"\bwhat\s+departments?\s+(?:does\s+rnsit\s+have|are\s+there|exist|are\s+available|offered)\b",
+        r"\b(?:list\s+of\s+|all\s+)?departments?\s+(?:list|overview)?\b",
+        r"\b(?:all\s+)?branches\s+offered\b",
+        r"\b(?:is|are)\s+(?:cse|ise|ece|eee|aiml|aids|mech|civil)\s+(?:a\s+)?good\b",
+        r"\bcompare\s+(?:the\s+)?departments?\b",
+        r"\bwhich\s+branch\s+is\s+(?:good|better|best)\b",
+        r"\bwhich\s+department\s+is\s+(?:good|better|best)\b",
+    )
+    for pat in patterns:
+        if re.search(pat, q):
+            return True
+    if any(k in q for k in ("department", "departments", "branch", "branches")):
+        if any(w in q for w in ("good", "better", "best", "choose", "suggest", "recommend", "compare", "preferred", "scope")):
+            return True
+    return False
+
+
+def _get_broad_departments_fact() -> str:
+    """Builds a rich, factual overview of RNSIT departments and streams for broad synthesis."""
+    try:
+        kb = get_kb_data() or {}
+        placements = kb.get("placements", {})
+        total_cos = placements.get("total_companies", "200+")
+        highest = placements.get("stats", {}).get("2025", {}).get("highest_ctc_lpa", "26.1")
+        avg = placements.get("stats", {}).get("2025", {}).get("average_ctc_lpa", "6.5")
+    except Exception:
+        total_cos, highest, avg = "200+", "26.1", "6.5"
+
+    return (
+        "RNSIT Departments and Academic Offerings:\n"
+        "- Software & Computing Branches: Computer Science & Engineering (CSE - annual intake 720, located in CSE Block, HOD Dr. Kiran Y.C., VTU PhD research center), Information Science & Engineering (ISE, located in CSE Block), Artificial Intelligence & Machine Learning (AIML, HOD Dr. Andhe Pallavi), Artificial Intelligence & Data Science (AIDS), CSE Data Science, and CSE Cyber Security. These branches focus on software development, algorithms, artificial intelligence, and computing systems.\n"
+        "- Electronics & Electrical Branches: Electronics & Communication Engineering (ECE - located in Main Campus with PhD research center) and Electrical & Electronics Engineering (EEE - state-of-the-art labs). These branches focus on embedded systems, telecommunications, VLSI, and electrical systems.\n"
+        "- Core Engineering Branches: Mechanical Engineering (located in Mechanical Block, houses the Toyota Center of Excellence and PhD center) and Civil Engineering (located in Civil Block with recognized PhD research center).\n"
+        "- Postgraduate Programs: Master of Computer Applications (MCA) and Master of Business Administration (MBA).\n"
+        f"- Placements Across Departments: Over {total_cos} companies recruit from RNSIT (highest CTC {highest} LPA, average CTC {avg} LPA) including recruiters like Adobe, Amazon, Cisco, Cognizant, Infosys, and IBM. Campus-wide placement training and opportunities are available across engineering disciplines."
+    )
 
 
 # ── Small helpers ────────────────────────────────────────────────────
@@ -285,16 +335,74 @@ _SYSTEM_PROMPT_TMPL = (
     "You are Nova, the official AI Digital Receptionist for RNS Institute "
     "of Technology (RNSIT), Bengaluru. Your workspace is a public campus "
     "kiosk; keep your tone welcoming, polite, and professional.\n\n"
-    "Use ONLY the verified campus facts below to answer — do not use any "
-    "outside knowledge, and do not guess.\n\n"
+    "Use the verified campus facts below to answer the visitor's question:\n\n"
     "Facts:\n{context}\n\n"
-    "CONSTRAINTS:\n"
+    "CRITICAL CONSTRAINTS:\n"
     "1. Never start with a greeting or self-introduction — answer directly.\n"
-    "2. Keep the answer to 2-3 sentences maximum.\n"
-    "3. If the facts above don't actually answer the question, say so "
-    "honestly ('I don't have that detail on hand') instead of guessing.\n"
-    "4. Never output literal 'Q:' / 'A:' labels."
+    "2. Keep the answer concise (2-3 sentences maximum).\n"
+    "3. Ground your response in the facts provided above. Synthesize the facts naturally to address the question.\n"
+    "4. For broad, subjective, or comparison questions (e.g. 'Which department is good?', 'Which branch should I choose?', 'Which department is better for software?'): "
+    "summarize the relevant options from the facts (for example, software/computing branches like CSE/ISE vs electronics like ECE/EEE or core engineering) "
+    "and ask what area or career path they are interested in so you can help them compare. Do NOT claim one department is objectively 'best' unless the facts explicitly say so.\n"
+    "5. CRITICAL: Never casually say 'I don't have that detail on hand', 'I don't know', or 'I don't have information' when relevant facts are present in the context above. Synthesize the best grounded answer possible.\n"
+    "6. Only if the provided facts contain zero relevant information about the question should you say: 'I don't have that detail on hand — please check with the Admin Block.'\n"
+    "7. Never output literal 'Q:' / 'A:' labels."
 )
+
+
+def _naturalize_rag_only_fallback(context_text: str, max_chars: int = 450) -> str:
+    """
+    Tier-3 (RAG-only, no LLM available) fallback formatter — used only when
+    BOTH LLM tiers (local Qwen + Gemini) have failed and there's no model
+    left to phrase an answer, so this has to work from the raw retrieved
+    context alone. Fixes two production bugs that were both living in this
+    one spot (duplicated at both call sites below):
+
+    1. Previously prefixed the answer with the literal internal phrase
+       "Based on what I have on file: ..." — an implementation detail that
+       leaked straight to the visitor. Removed; this returns the cleaned
+       fact text directly, as Nova would actually say it.
+
+    2. Previously took ONLY the first "\\n\\n"-separated chunk of
+       context_text (`context_text.split("\\n\\n")[0]`). context_text is the
+       concatenation of the top-K retrieved chunks (see
+       retrieve_relevant_context in llm.py), ordered by score — so for a
+       broad query like "what facilities does the college provide?", a
+       single specific facility (e.g. "Canteen") could get returned ALONE
+       even when a proper aggregate chunk ("Campus Facilities Overview")
+       was ALSO present in context_text, just not ranked first. This now
+       walks every retrieved chunk (each cleaned of its "Q:"/"A:" and
+       "Facility:" labels), dedupes, and aggregates as many as fit under
+       max_chars — so a broad/category question is represented properly
+       instead of being truncated to whichever chunk happened to rank
+       first.
+    """
+    if not context_text:
+        return ""
+
+    seen: set[str] = set()
+    cleaned_chunks: list[str] = []
+    for raw_chunk in context_text.split("\n\n"):
+        cleaned = _QA_LABEL_RE_LLM.sub("", raw_chunk).strip()
+        cleaned = _FACILITY_LABEL_RE_LLM.sub("", cleaned).strip()
+        if not cleaned:
+            continue
+        key = cleaned.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned_chunks.append(cleaned)
+
+    out = ""
+    for chunk in cleaned_chunks:
+        candidate = f"{out} {chunk}".strip() if out else chunk
+        if out and len(candidate) > max_chars:
+            break
+        out = candidate
+        if len(out) > max_chars:
+            out = out[:max_chars].rsplit(" ", 1)[0].strip()
+            break
+    return out
 
 
 async def _generate_answer(question: str, context_text: str, history: list | None) -> tuple[str, str]:
@@ -313,14 +421,18 @@ async def _generate_answer(question: str, context_text: str, history: list | Non
         text, tier, _model = await chat_completion_with_fallback(
             messages, temperature=0.2, max_tokens=180
         )
-        return _clean_repetitive_greeting((text or "").strip()), tier.upper()
+        cleaned = _clean_repetitive_greeting((text or "").strip())
+        # Critical Fallback Rule: if context exists, do not let LLM casually refuse
+        if context_text and len(context_text.strip()) > 30 and any(ref in cleaned.lower() for ref in ("i don't have that detail", "i don't know", "i do not know", "i don't have information")):
+            fallback_synth = _naturalize_rag_only_fallback(context_text)
+            if fallback_synth:
+                cleaned = fallback_synth
+        return cleaned, tier.upper()
     except Exception as e:
         logger.error("[CONF-RAG] Local+Gemini both failed, using RAG-only nearest context: %s", e)
-        fallback = _QA_LABEL_RE_LLM.sub("", context_text or "").strip()
-        fallback = _FACILITY_LABEL_RE_LLM.sub("", fallback).strip()
-        fallback = fallback.split("\n\n")[0][:400].strip()
+        fallback = _naturalize_rag_only_fallback(context_text)
         if fallback:
-            return f"Based on what I have on file: {fallback}", "RAG_ONLY"
+            return fallback, "RAG_ONLY"
         return (
             "I'm having trouble reaching my knowledge base right now — "
             "please check with the Admin Block.",
@@ -397,6 +509,13 @@ async def _handle_high(question: str, context_text: str, raw_results: list[dict]
                 if a_matched and not b_matched:
                     logger.info("[CONF-RAG] Ambiguity overridden: question explicitly matches top candidate '%s' over '%s'",
                                 entity_a or label_a, entity_b or label_b)
+                    ambiguous = False
+
+            # Comparison query override: queries asking to compare or choose between branches/departments
+            # are not ambiguous ambiguities; they should be synthesized together by the LLM.
+            if ambiguous:
+                comparison_words = ("compare", "difference", "between", "versus", " vs ", " or ", "which")
+                if any(w in question.lower() for w in comparison_words):
                     ambiguous = False
 
 
@@ -785,6 +904,11 @@ async def handle_query(question: str, history: list | None = None,
         logger.info("[CONF-RAG] RETRIEVAL RESULT: %s", detected.verified_answer[:120])
         logger.info("[CONF-RAG] ANSWER SOURCE: entity_kb")
 
+        # QUESTION + RETRIEVED CONTEXT -> LLM synthesis
+        answer, gen_tier = await _generate_answer(question, detected.verified_answer, history)
+        if not answer or any(p in answer.lower() for p in ("i don't have that detail", "i don't know", "i do not know", "i don't have information")):
+            answer = detected.verified_answer
+
         await log_decision(
             session_id=session_id, question=question,
             top_score=1.0, second_score=None,
@@ -796,7 +920,7 @@ async def handle_query(question: str, history: list | None = None,
         state["clarify_streak"] = 0
         state["last_topic"] = detected.canonical_name
         return {
-            "answer": detected.verified_answer,
+            "answer": answer,
             "route": f"HIGH_ENTITY_{detected.entity_id}",
             "session_action": "CONTINUE",
             "session_state": state,
@@ -835,7 +959,12 @@ async def handle_query(question: str, history: list | None = None,
     broad_overview_phrases = (
         "about rnsit", "something about rnsit", "about college", "tell me about rnsit",
         "about the college", "college overview", "what is rnsit", "tell me something about rnsit",
-        "tell me about rns", "about campus", "tell me about this college"
+        "tell me about rns", "about campus", "tell me about this college",
+        "about rns institute", "about r n s", "give me an overview", "overview of rnsit",
+        "overview of rns", "what is rns institute", "what is rns", "about this institute",
+        "about this college", "what does rnsit", "what does rns institute",
+        "introduce rnsit", "introduce rns", "know about rnsit", "know about this college",
+        "information about rnsit", "info about rnsit", "general info about rnsit",
     )
     is_broad_rnsit = any(p in question_clean for p in broad_overview_phrases)
 
@@ -857,12 +986,6 @@ async def handle_query(question: str, history: list | None = None,
     )
 
     if is_broad_rnsit:
-        # Use ONLY the verified overview fact as context — deliberately do
-        # NOT concatenate the raw top-k semantic-search results here. For a
-        # short generic query like "tell me something about RNS IT", noisy
-        # unrelated FAQ hits (e.g. the "website of RNSIT" FAQ) score
-        # deceptively close and were confusing the LLM into surfacing them
-        # instead of the actual overview. See _get_college_overview_fact().
         overview_fact = _get_college_overview_fact()
         answer, gen_tier = await _generate_answer(question, overview_fact, history)
         if "i don't have that detail" in answer.lower():
@@ -876,6 +999,40 @@ async def handle_query(question: str, history: list | None = None,
             "session_action": "CONTINUE",
             "session_state": state,
             "source": "general_rag",
+        }
+
+    # Broad Department query handling (e.g. "Which department is good?", "Which branch should I choose?"):
+    if is_broad_department_query(question_clean) or is_broad_department_query(question):
+        broad_dept_context = _get_broad_departments_fact()
+        print(f"USER QUERY: {question}")
+        print(f"NORMALIZED QUERY: {question_clean}")
+        print("DETECTED INTENT: BROAD_DEPARTMENT")
+        print("DETECTED ENTITY: DEPARTMENTS_OVERVIEW")
+        print("ENTITY CONFIDENCE: 1.00")
+        print(f"RETRIEVAL RESULT: {broad_dept_context[:120]}")
+        print("ANSWER SOURCE: broad_department_rag")
+
+        logger.info("[CONF-RAG] USER QUERY: %s", question)
+        logger.info("[CONF-RAG] DETECTED INTENT: BROAD_DEPARTMENT")
+        logger.info("[CONF-RAG] ANSWER SOURCE: broad_department_rag")
+
+        answer, gen_tier = await _generate_answer(question, broad_dept_context, history)
+        if not answer or any(ref in answer.lower() for ref in ("i don't have that detail", "i don't know", "i do not know")):
+            answer = (
+                "RNSIT has several departments across software, electronics, and core engineering. "
+                "If you're interested in software and computing, CSE or ISE may be relevant, while ECE and EEE focus more on electronics and electrical fields. "
+                "If you tell me what area you're interested in, I can help you compare them."
+            )
+
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        state["last_topic"] = "Departments Overview"
+        return {
+            "answer": answer,
+            "route": f"HIGH_BROAD_DEPT_{gen_tier}",
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": f"broad_dept_{gen_tier.lower()}",
         }
 
     if not raw_results:
@@ -996,13 +1153,58 @@ async def handle_query_stream(question: str, history: list | None = None,
         print(f"RETRIEVAL RESULT: {detected.verified_answer[:120]}")
         print("ANSWER SOURCE: entity_kb")
 
-        yield {"sentence": detected.verified_answer, "partial": False}
+        # QUESTION + RETRIEVED CONTEXT -> LLM streaming synthesis
+        system_prompt = _SYSTEM_PROMPT_TMPL.format(context=detected.verified_answer)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in (history or [])[-4:]:
+            speaker, text = parse_history_message(msg)
+            if speaker and text:
+                role = "user" if speaker.lower() in ("visitor", "user") else "assistant"
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": question})
+
+        parts: list[str] = []
+        first_sentence_sent = False
+        tier_seen = "local"
+        try:
+            buf = ""
+            async for delta, tier, _model in chat_completion_with_fallback_stream(
+                messages, temperature=0.2, max_tokens=180
+            ):
+                tier_seen = tier
+                buf += delta
+                ready, buf = _pop_complete_sentences(buf)
+                for s in ready:
+                    if not first_sentence_sent:
+                        s = _clean_repetitive_greeting(s)
+                        first_sentence_sent = True
+                    if s:
+                        parts.append(s)
+                        yield {"answer": s, "route": f"HIGH_ENTITY_{detected.entity_id}",
+                               "session_action": "CONTINUE", "partial": True}
+            if buf.strip():
+                b = buf.strip()
+                if not first_sentence_sent:
+                    b = _clean_repetitive_greeting(b)
+                if b:
+                    parts.append(b)
+                    yield {"answer": b, "route": f"HIGH_ENTITY_{detected.entity_id}",
+                           "session_action": "CONTINUE", "partial": True}
+            full_ans = "".join(parts).strip()
+            if not full_ans or any(p in full_ans.lower() for p in ("i don't have that detail", "i don't know", "i do not know", "i don't have information")):
+                full_ans = detected.verified_answer
+                if not parts:
+                    yield {"answer": full_ans, "route": f"HIGH_ENTITY_{detected.entity_id}", "partial": False}
+        except Exception:
+            full_ans = detected.verified_answer
+            yield {"sentence": full_ans, "partial": False}
+
         state["pending"] = None
         state["clarify_streak"] = 0
         state["last_topic"] = detected.canonical_name
         yield {
             "done": True,
-            "answer": detected.verified_answer,
+            "answer": full_ans,
             "session_action": "CONTINUE",
             "session_state": state,
             "detected_entity": detected.entity_id,
@@ -1033,7 +1235,12 @@ async def handle_query_stream(question: str, history: list | None = None,
     broad_overview_phrases = (
         "about rnsit", "something about rnsit", "about college", "tell me about rnsit",
         "about the college", "college overview", "what is rnsit", "tell me something about rnsit",
-        "tell me about rns", "about campus", "tell me about this college"
+        "tell me about rns", "about campus", "tell me about this college",
+        "about rns institute", "about r n s", "give me an overview", "overview of rnsit",
+        "overview of rns", "what is rns institute", "what is rns", "about this institute",
+        "about this college", "what does rnsit", "what does rns institute",
+        "introduce rnsit", "introduce rns", "know about rnsit", "know about this college",
+        "information about rnsit", "info about rnsit", "general info about rnsit",
     )
     is_broad_rnsit = any(p in question_clean for p in broad_overview_phrases)
 
@@ -1046,9 +1253,6 @@ async def handle_query_stream(question: str, history: list | None = None,
     print("ANSWER SOURCE: general_rag")
 
     if is_broad_rnsit:
-        # Same fix as handle_query(): use ONLY the verified overview fact as
-        # context, no raw top-k results mixed in, so noisy near-scoring FAQ
-        # hits (e.g. "website of RNSIT") can't leak into the answer.
         overview_fact = _get_college_overview_fact()
         answer, gen_tier = await _generate_answer(question, overview_fact, history)
         if "i don't have that detail" in answer.lower():
@@ -1064,6 +1268,79 @@ async def handle_query_stream(question: str, history: list | None = None,
             "session_state": state,
             "source": "general_rag",
         }
+        return
+
+    # Broad Department query handling (streaming):
+    if is_broad_department_query(question_clean) or is_broad_department_query(question):
+        broad_dept_context = _get_broad_departments_fact()
+        print(f"USER QUERY: {question}")
+        print(f"NORMALIZED QUERY: {question_clean}")
+        print("DETECTED INTENT: BROAD_DEPARTMENT")
+        print("DETECTED ENTITY: DEPARTMENTS_OVERVIEW")
+        print("ENTITY CONFIDENCE: 1.00")
+        print(f"RETRIEVAL RESULT: {broad_dept_context[:120]}")
+        print("ANSWER SOURCE: broad_department_rag")
+
+        logger.info("[CONF-RAG] USER QUERY: %s", question)
+        logger.info("[CONF-RAG] DETECTED INTENT: BROAD_DEPARTMENT")
+        logger.info("[CONF-RAG] ANSWER SOURCE: broad_department_rag")
+
+        system_prompt = _SYSTEM_PROMPT_TMPL.format(context=broad_dept_context)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in (history or [])[-4:]:
+            speaker, text = parse_history_message(msg)
+            if speaker and text:
+                role = "user" if speaker.lower() in ("visitor", "user") else "assistant"
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": question})
+
+        parts: list[str] = []
+        first_sentence_sent = False
+        tier_seen = "local"
+        try:
+            buf = ""
+            async for delta, tier, _model in chat_completion_with_fallback_stream(
+                messages, temperature=0.2, max_tokens=180
+            ):
+                tier_seen = tier
+                buf += delta
+                ready, buf = _pop_complete_sentences(buf)
+                for s in ready:
+                    if not first_sentence_sent:
+                        s = _clean_repetitive_greeting(s)
+                        first_sentence_sent = True
+                    if s:
+                        parts.append(s)
+                        yield {"answer": s, "route": f"HIGH_BROAD_DEPT_{tier_seen.upper()}",
+                               "session_action": "CONTINUE", "partial": True}
+            if buf.strip():
+                b = buf.strip()
+                if not first_sentence_sent:
+                    b = _clean_repetitive_greeting(b)
+                if b:
+                    parts.append(b)
+                    yield {"answer": b, "route": f"HIGH_BROAD_DEPT_{tier_seen.upper()}",
+                           "session_action": "CONTINUE", "partial": True}
+        except Exception as e:
+            logger.error("[CONF-RAG-STREAM] Broad dept generation failed, using fallback: %s", e)
+            final_fallback = (
+                "RNSIT has several departments across software, electronics, and core engineering. "
+                "If you're interested in software and computing, CSE or ISE may be relevant, while ECE and EEE focus more on electronics and electrical fields. "
+                "If you tell me what area you're interested in, I can help you compare them."
+            )
+            state["pending"] = None
+            state["clarify_streak"] = 0
+            state["last_topic"] = "Departments Overview"
+            yield {"answer": final_fallback, "route": "HIGH_BROAD_DEPT_FALLBACK",
+                   "session_action": "CONTINUE", "session_state": state}
+            return
+
+        full_answer = "".join(parts).strip()
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        state["last_topic"] = "Departments Overview"
+        yield {"answer": full_answer, "route": f"HIGH_BROAD_DEPT_{tier_seen.upper()}",
+               "session_action": "CONTINUE", "session_state": state, "final": True}
         return
 
     if not raw_results:
@@ -1106,7 +1383,10 @@ async def handle_query_stream(question: str, history: list | None = None,
                 b_matched = _matches_query_keywords(question, entity_b or label_b)
                 if a_matched and not b_matched:
                     ambiguous = False
-        if ambiguous:
+            if ambiguous:
+                comparison_words = ("compare", "difference", "between", "versus", " vs ", " or ", "which")
+                if any(w in question.lower() for w in comparison_words):
+                    ambiguous = False
             clarify_streak = state.get("clarify_streak", 0)
             if clarify_streak >= MAX_CLARIFY_STREAK:
                 logger.warning("[CONF-RAG-STREAM] Clarify streak limit (%d) hit — "
@@ -1183,11 +1463,11 @@ async def handle_query_stream(question: str, history: list | None = None,
                        "session_action": "CONTINUE", "partial": True}
     except Exception as e:
         logger.error("[CONF-RAG-STREAM] Local+Gemini both failed, RAG-only fallback: %s", e)
-        fallback = _QA_LABEL_RE_LLM.sub("", context_text or "").strip()
-        fallback = _FACILITY_LABEL_RE_LLM.sub("", fallback).strip().split("\n\n")[0][:400].strip()
-        final_answer = (f"Based on what I have on file: {fallback}" if fallback else
-                         "I'm having trouble reaching my knowledge base right now — "
-                         "please check with the Admin Block.")
+        fallback = _naturalize_rag_only_fallback(context_text)
+        final_answer = fallback if fallback else (
+            "I'm having trouble reaching my knowledge base right now — "
+            "please check with the Admin Block."
+        )
         await log_decision(
             session_id=session_id, question=question,
             top_score=best_score, second_score=second_score,

@@ -257,3 +257,60 @@ d7aaa33e8e80,2026-09-22T15:56:49,02ca2831-5db9-436c-8759-30b3d5a413e5,is rnsit a
 907ae1df9883,2026-09-22T15:59:38,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal of rns institute,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
 daf9cf3f310f,2026-09-22T16:00:18,02ca2831-5db9-436c-8759-30b3d5a413e5,usn sc,0.6817,0.6817,0.0000,Sports,Sports,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
 29ecb2f4a6ac,2026-09-22T16:00:29,02ca2831-5db9-436c-8759-30b3d5a413e5,im not sure what the name of the student is,0.6529,0.6529,0.0000,Is there a gym on campus?,Is there a gym on campus?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+46de5043b0b3,2026-09-22T16:30:39,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+4744d8a6e23f,2026-09-22T16:31:01,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the hod of cse department,1.0000,,,HOD of Computer Science and Engineering,,HIGH,False,HIGH_ENTITY_CSE_HOD,decision,,answered,entity_kb
+fdb8b1c95a45,2026-09-22T16:31:13,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the timings of the college,1.0000,,,Working Hours & Timings,,HIGH,False,HIGH_ENTITY_WORKING_HOURS,decision,,answered,entity_kb
+69cf4c872029,2026-09-23T10:39:26,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal of rnsit,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+6630b41b2074,2026-09-23T10:39:56,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the hod of aiml department,1.0000,,,HOD of AI and ML,,HIGH,False,HIGH_ENTITY_AIML_HOD,decision,,answered,entity_kb
+327f84704519,2026-09-23T10:40:31,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me the facilities provided by rnsit,0.8405,0.8405,0.0000,Campus Facilities Overview,Campus Facilities Overview,HIGH,False,HIGH_GEMINI,decision,,answered,GEMINI
+0b9803a07942,2026-09-23T10:57:35,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me a joke,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+fa00e2b4f2f3,2026-09-23T10:58:58,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the director of rnsit,1.0000,,,Director,,HIGH,False,HIGH_ENTITY_DIRECTOR,decision,,answered,entity_kb
+71ac674d4097,2026-09-23T11:08:42,02ca2831-5db9-436c-8759-30b3d5a413e5,who i do,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+f15dfaa0c73e,2026-09-23T11:09:26,02ca2831-5db9-436c-8759-30b3d5a413e5,what will do you work for,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+b185b3dc6b61,2026-09-23T11:09:52,02ca2831-5db9-436c-8759-30b3d5a413e5,i knew that it would be an admission process to getting admission in this college,1.0000,,,Admission Process & Modes,,HIGH,False,HIGH_ENTITY_ADMISSIONS_PROCESS,decision,,answered,entity_kb
+03587df400b9,2026-09-23T11:39:43,02ca2831-5db9-436c-8759-30b3d5a413e5,who do you work for kiosk,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+77135ea3768f,2026-09-23T11:40:30,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+47ad589c3bd9,2026-09-23T12:20:33,526f06a7-6158-4c88-b24f-08343f912cff,where is the placement cell,1.0000,,,Placement Cell,,HIGH,False,HIGH_ENTITY_PLACEMENT_CELL,decision,,answered,entity_kb
+06c6ca9eebea,2026-09-23T12:20:51,526f06a7-6158-4c88-b24f-08343f912cff,coughing,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+f4d685b8e465,2026-09-23T12:21:55,526f06a7-6158-4c88-b24f-08343f912cff,who is the founder of adam and sophie,1.0000,,,Group Chairman & Founder,,HIGH,False,HIGH_ENTITY_CHAIRMAN_FOUNDER,decision,,answered,entity_kb
+72bb77aaab70,2026-09-23T12:22:22,526f06a7-6158-4c88-b24f-08343f912cff,the same about what are the documents should i bring for admissions,0.7127,0.7127,0.0000,Documents Required,Documents Required,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+e07a89e62da0,2026-09-23T20:54:19,02ca2831-5db9-436c-8759-30b3d5a413e5,can you give me the facilities provided by this college,0.7556,0.7556,0.0000,Canteen,Canteen,HIGH,False,HIGH_RAG_ONLY,decision,,answered,RAG_ONLY
+99d8e73443cc,2026-09-23T20:54:48,02ca2831-5db9-436c-8759-30b3d5a413e5,can you can you who is the principal,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+31077284410a,2026-09-23T20:55:28,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what all the recruiting companies come in this college,0.6844,0.6844,0.0000,Placements Overview,Placements Overview,HIGH,False,HIGH_RAG_ONLY,decision,,answered,RAG_ONLY
+ec9f328d5cac,2026-09-23T20:56:27,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the director of rls it,1.0000,,,Director,,HIGH,False,HIGH_ENTITY_DIRECTOR,decision,,answered,entity_kb
+6c5bd3a8a5b1,2026-09-23T20:56:44,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me,0.6585,0.6585,0.0000,Banking,Banking,HIGH,False,HIGH_RAG_ONLY,decision,,answered,RAG_ONLY
+61952ed5fb74,2026-09-24T12:09:34,02ca2831-5db9-436c-8759-30b3d5a413e5,i see a video,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+bc92097c4ec6,2026-09-24T12:09:44,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me what all the facilities the rnsit provides,0.8318,0.8318,0.0000,Campus Facilities Overview,Campus Facilities Overview,HIGH,False,HIGH_RAG_ONLY,decision,,answered,RAG_ONLY
+5c0986c9593e,2026-09-24T12:10:22,02ca2831-5db9-436c-8759-30b3d5a413e5,im going to go to the airport,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+de9344518955,2026-09-24T12:10:37,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me is rnsit a good college,0.7105,0.7105,0.0000,Does the college provide transport?,Does the college provide transport?,HIGH,False,HIGH_RAG_ONLY,decision,,answered,RAG_ONLY
+c90c3c7327f2,2026-09-24T12:37:44,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about cse department,1.0000,,,Computer Science and Engineering Department,,HIGH,False,HIGH_ENTITY_CSE_DEPT,decision,,answered,entity_kb
+7b747731fd91,2026-09-24T12:38:20,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about its placement,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+7f35123ad93d,2026-09-24T12:38:52,02ca2831-5db9-436c-8759-30b3d5a413e5,which department is good,0.6816,0.6816,0.0000,Electrical and Electronics Engineering,Electrical and Electronics Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+28cb87d8f779,2026-09-24T12:39:15,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about aiml block,0.6028,0.6028,0.0000,CSE (AI and ML),CSE (AI and ML),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+ce1df59c495a,2026-09-24T13:26:35,unknown,Tell me about CSE.,1.0000,,,Computer Science and Engineering Department,,HIGH,False,HIGH_ENTITY_CSE_DEPT,decision,,answered,entity_kb
+4904c3077850,2026-09-24T13:26:37,unknown,What is the placement information?,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+ffca8205c531,2026-09-24T13:26:39,unknown,Who won the 2022 football world cup?,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+3b96cd15b72b,2026-09-24T13:28:12,unknown,Tell me about CSE.,1.0000,,,Computer Science and Engineering Department,,HIGH,False,HIGH_ENTITY_CSE_DEPT,decision,,answered,entity_kb
+11e336638f06,2026-09-24T13:28:14,unknown,What is the placement information?,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+8f8b4658dcaa,2026-09-24T13:28:16,unknown,Who is the president of France?,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+10106d5fc33f,2026-09-24T13:28:25,unknown,Tell me about CSE.,1.0000,,,Computer Science and Engineering Department,,HIGH,False,HIGH_ENTITY_CSE_DEPT,decision,,answered,entity_kb
+98231e63414e,2026-09-24T13:41:49,02ca2831-5db9-436c-8759-30b3d5a413e5,all right lets go,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+f3ee9fdd7951,2026-09-24T13:42:09,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about mechanical department,0.7723,0.7723,0.0000,Mechanical Engineering,Mechanical Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+f765270923c1,2026-09-24T13:42:43,02ca2831-5db9-436c-8759-30b3d5a413e5,okay can you tell me the rns institute of technology,0.7785,0.7785,0.0000,What is the website of RNSIT?,What is the website of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+2820bd979b88,2026-09-24T13:43:21,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me its location,0.7408,0.7408,0.0000,Where is the canteen located?,Where is the canteen located?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+cb6e7f204ae1,2026-09-24T13:43:45,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me where it is located in bengaluru,0.7066,0.7066,0.0000,Where is the canteen located?,Where is the canteen located?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+20cb53352ce4,2026-09-24T13:43:58,02ca2831-5db9-436c-8759-30b3d5a413e5,so i went into my room,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+c5e48d8ba08e,2026-09-24T13:44:07,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me how many departments are,1.0000,,,Departments Overview,,HIGH,False,HIGH_ENTITY_DEPARTMENTS_OVERVIEW,decision,,answered,entity_kb
+e24bd5bbf956,2026-09-24T13:44:21,02ca2831-5db9-436c-8759-30b3d5a413e5,is rnsit a good college,0.6948,0.6948,0.0000,Scholarships,Scholarships,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+ed3ff5c6fd81,2026-09-24T13:44:47,02ca2831-5db9-436c-8759-30b3d5a413e5,thats the day im not out of curve,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+3c1f52500710,2026-09-24T14:48:57,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me,0.6585,0.6585,0.0000,Banking,Banking,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+6abdcc1c485b,2026-09-24T14:49:33,02ca2831-5db9-436c-8759-30b3d5a413e5,good its gone down,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+08ee01d4609e,2026-09-24T15:16:34,526f06a7-6158-4c88-b24f-08343f912cff,so bad,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+2f3a382ebfb5,2026-09-24T15:16:56,526f06a7-6158-4c88-b24f-08343f912cff,it was about to bend my throat with the violence it happens more connection grossed,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+14c5d216c511,2026-09-24T15:17:18,526f06a7-6158-4c88-b24f-08343f912cff,so that is the,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+cd548f0ffaa8,2026-09-24T15:17:34,526f06a7-6158-4c88-b24f-08343f912cff,who do you work for,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+e96dec24528e,2026-09-24T15:18:20,526f06a7-6158-4c88-b24f-08343f912cff,akshata,0.6616,0.6616,0.0000,Auditorium,Auditorium,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+eda4aaba51a2,2026-09-24T15:18:45,526f06a7-6158-4c88-b24f-08343f912cff,aww,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+e09954e6c8d4,2026-09-24T15:18:52,526f06a7-6158-4c88-b24f-08343f912cff,some good quicken eyes tell me a joke,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+d93fd8ee3316,2026-09-24T15:19:05,526f06a7-6158-4c88-b24f-08343f912cff,ess,0.6516,0.6516,0.0000,Electrical and Electronics Engineering,Electrical and Electronics Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+b641a88c066e,2026-09-24T15:24:25,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about the facilities provided by this college,0.7516,0.7516,0.0000,Canteen,Canteen,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL

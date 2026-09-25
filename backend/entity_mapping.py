@@ -894,6 +894,8 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\btell\s+me\s+about\s+placements?\b"),
             re.compile(r"\bwho\s+recruits\b"),
             re.compile(r"\bplacement\s+record\b"),
+            re.compile(r"\b(?:what\s+is\s+the\s+)?placement\s+information\b"),
+            re.compile(r"\bplacement\s+details?\b"),
             re.compile(r"\bplacements?\b"),
         ],
     ),
@@ -914,6 +916,8 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\bwhere\s+is\s+cse\b"),
             re.compile(r"\bcse\s+block\b"),
             re.compile(r"\bcse\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?cse\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about|about)\s+cse\b"),
         ],
     ),
     (
@@ -921,6 +925,7 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
         [
             re.compile(r"\b(?:cse\s+)?(?:ai\s*ml|aiml|ai\s+and\s+ml)\s+department\b"),
             re.compile(r"\bwhere\s+is\s+(?:ai\s*ml|aiml)\b"),
+            re.compile(r"\b(?:tell\s+me\s+about|about)\s+(?:ai\s*ml|aiml|ai\s+and\s+ml)\b"),
         ],
     ),
     (
