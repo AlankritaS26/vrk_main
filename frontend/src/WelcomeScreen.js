@@ -785,7 +785,21 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
     // Fix 1: Only auto-rename when the utterance contains an EXPLICIT name-introduction phrase.
     // Garbled noise, filler words, or partial questions must never trigger a rename.
-    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text);
+    //
+    // Fix 2 (this pass): "i am"/"i'm" is also exactly how a visitor answers
+    // Nova's own "How are you doing today?" greeting ("I am doing good.",
+    // "I'm fine.", "I am a bit tired."). The regex above only checked for
+    // "i am"/"i'm" + ANY word, so a wellbeing reply matched just as well as
+    // a real name intro and got extracted as a "name" ("I am doing good."
+    // -> name "Doing Good") — silently renaming the visitor AND, because
+    // /visitor/rename bypasses /ask entirely, leaving the backend's
+    // awaiting_reengagement_reply flag set, which then misrouted the
+    // visitor's actual next question. Reject "i am"/"i'm" as a name intro
+    // whenever it's immediately followed by a common wellbeing/feeling word
+    // (with an optional "doing"/intensifier in between) — a real name never
+    // looks like this.
+    const isWellbeingReply = /\b(?:i\s*am|i'm|im)\s+(?:doing\s+)?(?:really|pretty|quite|very|so|kind of|kinda|super)?\s*(good|great|fine|well|okay|ok|alright|all right|bad|not good|not great|not bad|so-so|so so|normal|tired|exhausted|stressed|sad|down|happy|excited|frustrated|annoyed|worried|nervous|anxious|overwhelmed|hectic|terrible|awful|rough|wonderful|fantastic|amazing)\b/i.test(text);
+    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text) && !isWellbeingReply;
     if (isExplicitNameIntro && !bareNameChange) {
       const candidateName = extractVisitorName(text);
       if (candidateName && candidateName.length >= 2 && candidateName.split(' ').length <= 3

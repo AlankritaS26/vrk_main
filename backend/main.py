@@ -113,6 +113,8 @@ from backend.confidence_rag import (
     handle_query as confidence_rag_handle_query,
     handle_query_stream as confidence_rag_handle_query_stream,
     is_broad_department_query,
+    is_emotional_reengagement_response,
+    is_college_evaluation_query,
 )
 from backend.llm import get_weather_greeting_phrase, chat_completion_with_fallback
 from backend.entity_mapping import detect_entity
@@ -1752,12 +1754,20 @@ async def resume_or_create_session(face_id: str, user_name: str,
     session_id = None
 
     if face_id:
+        # Single Source of Truth: look up authoritative persistent face profile
+        doc = await faces_collection.find_one({"face_id": face_id}, {"name": 1})
+        if doc and doc.get("name") and doc["name"] not in ("Guest", "Unknown", ""):
+            user_name = doc["name"]
+
         prev = await find_recent_session_by_face(face_id, days=30)
         if prev and prev.get("session_id"):
             session_id = prev["session_id"]          # SAME thread continues
             continued_from = prev.get("continued_from") or prev["session_id"]
             resumed = True
             visit_count = max(visit_count, int(prev.get("visit_count") or 1) + 1)
+            if not doc or not doc.get("name") or doc["name"] in ("Guest", "Unknown", ""):
+                if prev.get("user_name") and prev["user_name"] not in ("Guest", "Unknown", ""):
+                    user_name = prev["user_name"]
 
     if not session_id:
         session_id = str(uuid.uuid4())               # never face_id
@@ -1899,8 +1909,13 @@ async def are_you_there_endpoint():
 
 @app.get("/session/current")
 async def get_current_session():
-    global _last_activity_ts
+    global _last_activity_ts, active_session
     if active_session:
+        fid = active_session.get("face_id")
+        if fid:
+            f_doc = await faces_collection.find_one({"face_id": fid}, {"name": 1})
+            if f_doc and f_doc.get("name") and f_doc["name"] not in ("Guest", "Unknown", ""):
+                active_session["user_name"] = f_doc["name"]
         _last_activity_ts = datetime.now().timestamp()
         return {"active": True, **active_session}
     return {"active": False}
@@ -1961,6 +1976,33 @@ def _is_cacheable(ans: str) -> bool:
     return not any(p in a for p in _UNCACHEABLE_PATTERNS)
 
 
+# Routes whose answer text is generated FROM conversation history / a
+# session-specific "pending" candidate rather than purely from the literal
+# question text. Caching these under a Redis key derived only from
+# `q_normalized` is wrong in two ways:
+#   1) HIGH_BROAD_DEPT_* — the broad "which department is good?" answer is
+#      synthesized with the visitor's own recent history baked in, so once
+#      cached it gets replayed verbatim to every later visitor (or the same
+#      visitor's next unrelated turn) who happens to phrase a question
+#      similarly, ignoring their actual conversation context.
+#   2) HIGH_DISAMBIGUATED_*, HIGH_NEITHER, HIGH_CLARIFY_LIMIT — these are
+#      the ANSWER to a short reply ("yes", "the CSE one") that only makes
+#      sense against THAT session's pending candidate. Caching under the
+#      literal reply text ("yes") would serve a random unrelated visitor's
+#      disambiguation answer to the next person who happens to say "yes".
+# Only genuinely question-grounded, context-independent answers — a direct
+# verified-entity fact (HIGH_ENTITY_*) or a single top-hit RAG synthesis
+# with no pending/ambiguity involved (bare HIGH_<tier>) — are safe to cache.
+_UNCACHEABLE_ROUTE_MARKERS = ("broad_dept", "disambiguated", "neither", "clarify_limit")
+
+
+def _is_cacheable_route(route: str) -> bool:
+    r = (route or "").lower()
+    if not r.startswith("high_") or "ambiguous" in r:
+        return False
+    return not any(m in r for m in _UNCACHEABLE_ROUTE_MARKERS)
+
+
 async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
     """
     All the fast, deterministic pre-RAG routes — greeting, farewell,
@@ -1994,33 +2036,19 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
             return answer, "easter_egg", "CONTINUE"
 
-    # ─── Returning visitor reply to "How are you doing today?" greeting ─────────────
+    # ─── Returning visitor reply to "How are you doing today?" greeting ──────────
     #
-    # PRIORITY: runs BEFORE NAME_CHANGE, RAG, and entity detection.
-    # When awaiting_reengagement_reply is True the user's NEXT message is
-    # ALWAYS the emotional/wellbeing reply. It MUST NOT be routed to
-    # NAME_CHANGE or RAG regardless of content.
-    # Exception: a purely factual campus query with zero emotional words
-    # (e.g. "Which department is good?") is allowed to fall through.
+    # INTENT GATE — runs BEFORE NAME_CHANGE, RAG, and entity detection.
+    # awaiting_reengagement_reply does NOT mean 'treat every message as emotional'.
+    # It means: CHECK if the message is actually an emotional response;
+    # otherwise clear the flag and continue normal routing.
+    #
+    # Uses POSITIVE detection (is_emotional_reengagement_response) so that
+    # genuine questions like 'Who is the principal?' or garbled inputs like
+    # 'Did I ask you about the journey...' are never consumed as wellbeing replies.
     if active_session and active_session.get("awaiting_reengagement_reply"):
-        emotion_hints = (
-            "good", "well", "fine", "stress", "stressed", "sad", "bad",
-            "tired", "happy", "great", "ok", "okay", "excited", "frustrated",
-            "worried", "rough", "exhausted", "alright", "not good", "doing great",
-            "doing well", "doing fine", "pretty good", "not bad", "quite good",
-            "wonderful", "fantastic", "terrible", "awful", "so so", "normal",
-            "i am", "i'm", "im ",
-        )
-        has_emotion = any(w in q_normalized for w in emotion_hints)
-        is_pure_campus_query = (
-            not has_emotion
-            and (
-                detect_entity(q_normalized) is not None
-                or is_broad_department_query(q_normalized)
-            )
-        )
-        if not is_pure_campus_query:
-            # Consume the flag; next message gets normal routing.
+        if is_emotional_reengagement_response(q_normalized):
+            # This IS an emotional response — handle it and consume the flag.
             active_session["awaiting_reengagement_reply"] = False
             answer, topic = await handle_personalized_reengagement(q_normalized, active_session)
             if topic:
@@ -2031,10 +2059,11 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             logger.info("[ROUTE] PERSONALIZED_REENGAGEMENT — reply=%r topic=%r", q_normalized, topic)
             return answer, "personalized_reengagement", "CONTINUE"
         else:
-            # Pure campus query in re-engagement window — clear flag and fall through.
+            # NOT an emotional response — clear the pending flag and fall through
+            # to normal routing so this query is handled on its own merits.
             active_session["awaiting_reengagement_reply"] = False
             logger.info(
-                "[ROUTE] RE-ENGAGEMENT bypassed (pure campus query, no emotion) — '%s'",
+                "[ROUTE] RE-ENGAGEMENT bypassed (not emotional response) — '%s'",
                 q_normalized,
             )
 
@@ -2048,7 +2077,41 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
         new_name_raw = name_change_match.group(1).strip()
         if "," in new_name_raw:
             new_name_raw = new_name_raw.split(",")[0].strip()
+        # Cut the captured group at the first sentence boundary — the regex's
+        # `[a-zA-Z\s,.-]+` group is greedy and, since normalize_query() has
+        # already stripped end-of-sentence punctuation, it can swallow an
+        # ENTIRE following sentence as part of the "name" (e.g. "my name is
+        # Rahul and I also wanted to ask about hostel fees" -> "Rahul And I
+        # Also Wanted To Ask About Hostel Fees"). Conjunctions/fillers that
+        # a real one-to-few-word name would never contain mark where the
+        # actual name ends.
+        _NAME_STOP_WORDS = (
+            "and", "but", "so", "also", "actually", "interested", "tell",
+            "more", "about", "in", "for", "to", "department", "departments",
+            "branch", "branches", "course", "courses", "college", "campus",
+            "admission", "admissions", "placement", "placements", "fee",
+            "fees", "hostel", "electronics", "software", "computing",
+            "engineering", "good", "better", "best", "information", "info",
+            "details", "help", "know", "want", "need", "going", "doing",
+            "feeling", "that", "this", "one", "area",
+        )
+        _stop_idx = None
+        _raw_words = new_name_raw.split()
+        for _i, _w in enumerate(_raw_words):
+            if _w.lower().strip(".,") in _NAME_STOP_WORDS:
+                _stop_idx = _i
+                break
+        if _stop_idx is not None:
+            new_name_raw = " ".join(_raw_words[:_stop_idx]).strip()
         new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
+        # Sanity cap: a real spoken/typed name is 1-4 words. If nothing
+        # name-shaped survives the stop-word cut (e.g. the whole utterance
+        # was noise like "interested in electronics" with no stop word this
+        # module recognizes, or a garbled STT capture), or what's left is
+        # implausibly long, don't treat it as a name change at all — fall
+        # through to normal routing instead of saving garbage to the DB.
+        if len(new_name_words) > 4:
+            new_name_words = []
         if new_name_words:
             new_name = " ".join(new_name_words)
             if active_session:
@@ -2255,7 +2318,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         # caching a "Did you mean A or B?" or "Are you asking about X?"
         # under the ORIGINAL question's key would serve that clarification
         # question to every future visitor who asks the same thing.
-        if redis_client and answer and route.startswith("high_") and "ambiguous" not in route:
+        if redis_client and answer and _is_cacheable_route(route):
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
@@ -2401,7 +2464,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
             yield f"data: {json.dumps({'sentence': answer})}\n\n"
 
-        if redis_client and answer and route.startswith("high_") and "ambiguous" not in route:
+        if redis_client and answer and _is_cacheable_route(route):
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)

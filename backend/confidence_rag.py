@@ -121,15 +121,16 @@ async def _get_settings() -> dict:
 
 # ── Keyword allowlist for the Scope Check (no extra LLM call) ──────────
 DOMAIN_KEYWORDS = {
-    "rnsit", "rns", "college", "campus", "institute", "university",
-    "admission", "admissions", "eligibility", "cutoff", "comedk", "cet",
-    "kcet", "department", "hod", "faculty", "professor", "principal",
-    "director", "course", "branch", "syllabus", "semester", "exam",
-    "fee", "fees", "scholarship", "hostel", "canteen", "library",
-    "placement", "placements", "recruiter", "internship", "package",
-    "ctc", "sports", "gym", "transport", "bus", "block", "building",
-    "lab", "laboratory", "workshop", "auditorium", "seminar", "event",
-    "fest", "club", "ncc", "nss", "phd", "research", "intake", "seat",
+    "rnsit", "rns", "college", "colleges", "campus", "institute", "university",
+    "admission", "admissions", "eligibility", "cutoff", "cutoffs", "comedk", "cet",
+    "kcet", "department", "departments", "dept", "depts", "hod", "hods", "faculty", "faculties",
+    "professor", "professors", "principal", "director", "course", "courses", "branch", "branches",
+    "syllabus", "semester", "semesters", "exam", "exams",
+    "fee", "fees", "scholarship", "scholarships", "hostel", "hostels", "canteen", "library",
+    "placement", "placements", "recruiter", "recruiters", "internship", "internships", "package", "packages",
+    "ctc", "sports", "gym", "transport", "bus", "buses", "block", "blocks", "building", "buildings",
+    "lab", "labs", "laboratory", "laboratories", "workshop", "workshops", "auditorium", "seminar", "seminars", "event", "events",
+    "fest", "fests", "club", "clubs", "ncc", "nss", "phd", "research", "intake", "seat", "seats",
     "vtu", "aicte", "naac", "nba",
     # Campus names & specific keywords
     "ramesh", "babu", "venkatesha", "shetty", "kiran", "pallavi", "aperture",
@@ -138,6 +139,16 @@ DOMAIN_KEYWORDS = {
     "cricket", "football", "basketball", "cafeteria", "food", "eat",
     "timing", "timings", "hours", "books", "mca", "mba", "cse", "ise",
     "ece", "eee", "mech", "civil", "aiml", "aids", "founder", "chairman",
+    # Spelled-out department/branch names (the abbreviations above — cse,
+    # ece, eee, aiml, aids — only match if the visitor says the acronym.
+    # A visitor who instead spells the branch out, e.g. "computer science",
+    # "electronics and communication", "information science", was falling
+    # through with NO keyword hit at all and getting refused as
+    # out-of-scope even though it's a clearly on-topic follow-up.
+    "computer", "science", "electronics", "communication", "communications",
+    "information", "electrical", "mechanical", "artificial", "intelligence",
+    "machine", "learning", "robotics", "biotechnology", "engineering",
+    "technology", "telecommunication", "instrumentation",
 }
 
 
@@ -193,6 +204,386 @@ def is_broad_department_query(query: str) -> bool:
             return True
     if any(k in q for k in ("department", "departments", "branch", "branches")):
         if any(w in q for w in ("good", "better", "best", "choose", "suggest", "recommend", "compare", "preferred", "scope")):
+            return True
+    return False
+
+
+# Known valid RNSIT department abbreviations / names
+_KNOWN_DEPT_CODES = {"CSE", "ECE", "ISE", "EEE", "AIML", "AIDS", "MECH", "CIVIL", "MCA", "MBA"}
+
+# Regex patterns to detect department mentions in comparison queries
+_DEPT_PATTERNS = [
+    ("CSE", r"\b(?:cse|computer\s+science(?:\s+and\s+engineering)?)\b"),
+    ("ECE", r"\b(?:ece|electronics(?:\s+and\s+communication)?)\b"),
+    ("ISE", r"\b(?:ise|information\s+science(?:\s+and\s+engineering)?)\b"),
+    ("EEE", r"\b(?:eee|electrical(?:\s+and\s+electronics)?)\b"),
+    ("AIML", r"\b(?:aiml|ai\s+(?:and|&)\s+ml)\b"),
+    ("AIDS", r"\b(?:aids|ai\s+(?:and|&)\s+ds)\b"),
+    ("MECH", r"\b(?:mech|mechanical(?:\s+engineering)?)\b"),
+    ("CIVIL", r"\b(?:civil(?:\s+engineering)?)\b"),
+]
+
+# Pattern to detect unrecognised uppercase 2-4-letter abbreviations used as dept names
+_UNKNOWN_DEPT_ABBREV_RE = re.compile(r"\b([A-Z]{2,4})\b")
+
+
+def extract_comparison_departments(query: str) -> tuple[str, str] | tuple[str, None] | None:
+    """Detects if query asks to compare two specific departments.
+
+    Returns:
+      (dept_a, dept_b) — both verified  → do the comparison.
+      (dept_a, None)   — one known, one unknown/unrecognised → ask clarification.
+      None             — not a comparison query at all.
+    """
+    q = (query or "").lower()
+    q_orig = (query or "")
+    comp_keywords = ("which is good", "which is better", "which one is good", "which one is better",
+                     "compare", "difference", "versus", " vs ", " vs. ", " or ", "better between",
+                     "choose between", "good cse", "good ece", "prefer")
+    if not any(k in q for k in comp_keywords):
+        return None
+
+    found = []
+    for code, pat in _DEPT_PATTERNS:
+        if re.search(pat, q):
+            if code not in found:
+                found.append(code)
+
+    if len(found) >= 2:
+        return found[0], found[1]
+
+    # One known dept found — check whether an unrecognised abbreviation is also present.
+    # e.g. 'CSE or ESE?' → found=['CSE'], but 'ESE' is unknown.
+    if len(found) == 1:
+        # Look for uppercase abbreviations in the ORIGINAL query that weren't matched above.
+        for abbrev in _UNKNOWN_DEPT_ABBREV_RE.findall(q_orig):
+            if abbrev not in _KNOWN_DEPT_CODES and abbrev not in {"RNSIT", "VTU", "PhD", "HOD"}:
+                # Unknown abbreviation alongside a known dept → signal for clarification.
+                return found[0], None  # sentinel: second dept unknown
+
+    return None
+
+
+def _get_department_comparison_facts(dept_a: str, dept_b: str, user_interest: str | None = None) -> str:
+    """Builds verified factual context for comparing two departments."""
+    facts = {
+        "CSE": (
+            "Computer Science & Engineering (CSE):\n"
+            "- Located in the CSE Block, HOD is Dr. Kiran Y.C., annual intake is 720 students.\n"
+            "- VTU recognized PhD research center.\n"
+            "- Focus areas & curriculum: Software engineering, algorithms, programming languages, data structures, "
+            "computing systems, operating systems, and computer architecture fundamentals."
+        ),
+        "ECE": (
+            "Electronics & Communication Engineering (ECE):\n"
+            "- Located in the Main Campus with a recognized PhD research center.\n"
+            "- Focus areas & curriculum: Hardware systems, VLSI design, embedded systems, electronic circuits, "
+            "microcontrollers, telecommunications, and digital signal processing."
+        ),
+        "ISE": (
+            "Information Science & Engineering (ISE):\n"
+            "- Located in the CSE Block.\n"
+            "- Focus areas & curriculum: Software systems, information architecture, data engineering, web applications, and network management."
+        ),
+        "EEE": (
+            "Electrical & Electronics Engineering (EEE):\n"
+            "- Equipped with state-of-the-art laboratory facilities.\n"
+            "- Focus areas & curriculum: Electrical power systems, electrical machines, control systems, and electronic instrumentation."
+        ),
+        "MECH": (
+            "Mechanical Engineering:\n"
+            "- Located in the Mechanical Block, houses the Toyota Center of Excellence and recognized PhD research center.\n"
+            "- Focus areas: Mechanical design, manufacturing, thermal engineering, robotics, and CAD/CAM."
+        ),
+        "CIVIL": (
+            "Civil Engineering:\n"
+            "- Located in the Civil Block with recognized PhD research center.\n"
+            "- Focus areas: Structural engineering, geotechnical engineering, environmental engineering, and surveying."
+        ),
+        "AIML": (
+            "Artificial Intelligence & Machine Learning (AIML):\n"
+            "- Located in the CSE Block, HOD is Dr. Andhe Pallavi.\n"
+            "- Focus areas: Artificial intelligence, machine learning algorithms, data analysis, and intelligent systems."
+        ),
+    }
+
+    fact_a = facts.get(dept_a, f"{dept_a} Department at RNSIT.")
+    fact_b = facts.get(dept_b, f"{dept_b} Department at RNSIT.")
+
+    interest_context = f"\nVisitor's Stated Interest: {user_interest}\n" if user_interest else ""
+    return (
+        f"Verified Department Facts for Comparison:\n\n"
+        f"{fact_a}\n\n"
+        f"{fact_b}\n"
+        f"{interest_context}\n"
+        f"Comparison Guidelines:\n"
+        f"- Explain the factual differences between {dept_a} and {dept_b} as relevant to the visitor's question and stated interest.\n"
+        f"- State what each department specifically focuses on (e.g. curriculum, labs, systems).\n"
+        f"- Do NOT make unsupported subjective claims like 'Both offer strong programs' or 'Both are excellent choices'.\n"
+        f"- Do NOT declare one department objectively better.\n"
+        f"- Let the visitor decide based on these factual differences."
+    )
+
+
+def is_department_interest_followup(query: str, state: dict, history: list | None) -> str | None:
+    """Checks if the query is a user specifying an interest/area following a broad department discussion."""
+    last_topic = (state.get("last_topic") or "").lower()
+    last_kiosk_text = ""
+    if history:
+        for msg in reversed(history):
+            spk, txt = parse_history_message(msg)
+            if spk and spk.lower() in ("assistant", "kiosk"):
+                last_kiosk_text = txt.lower()
+                break
+
+    is_dept_discussion = (
+        "department" in last_topic
+        or "branch" in last_topic
+        or "which department" in last_kiosk_text
+        or "what area" in last_kiosk_text
+        or "interested in" in last_kiosk_text
+        or "software and computing" in last_kiosk_text
+    )
+    if not is_dept_discussion:
+        return None
+
+    q_clean = (query or "").lower().strip().rstrip(".!?")
+    _INTEREST_PATTERNS = {
+        "hardware": "Hardware Engineering",
+        "hardware engineering": "Hardware Engineering",
+        "embedded": "Embedded Systems",
+        "embedded systems": "Embedded Systems",
+        "vlsi": "VLSI Design",
+        "software": "Software Engineering",
+        "software engineering": "Software Engineering",
+        "coding": "Software Engineering",
+        "programming": "Software Engineering",
+        "ai": "Artificial Intelligence",
+        "artificial intelligence": "Artificial Intelligence",
+        "machine learning": "Machine Learning",
+        "data science": "Data Science",
+        "cyber security": "Cyber Security",
+        "networking": "Computer Networks",
+        "core": "Core Engineering",
+        "robotics": "Robotics",
+    }
+    for pat, label in _INTEREST_PATTERNS.items():
+        if q_clean == pat or q_clean == f"in {pat}" or q_clean == f"interested in {pat}" or q_clean == f"{pat} engineering":
+            return label
+
+    return None
+
+
+def _get_interest_departments_fact(interest: str) -> str:
+    """Verified factual context tailored to a specific student interest area."""
+    if "hardware" in interest.lower() or "embedded" in interest.lower() or "vlsi" in interest.lower():
+        return (
+            "RNSIT Departments for Hardware Engineering:\n"
+            "- Electronics & Communication Engineering (ECE) and Electrical & Electronics Engineering (EEE) focus directly on hardware systems, electronic circuits, embedded systems, microcontrollers, and VLSI design. ECE is located in the Main Campus with state-of-the-art labs and a PhD research center.\n"
+            "- Computer Science & Engineering (CSE) focuses primarily on software and algorithms, but covers computer organization and computing hardware fundamentals.\n"
+            "If you are deciding between branches like ECE and CSE, I can explain the specific differences between them."
+        )
+    elif "software" in interest.lower():
+        return (
+            "RNSIT Departments for Software Engineering:\n"
+            "- Computer Science & Engineering (CSE) and Information Science & Engineering (ISE) focus directly on software development, algorithms, data structures, and computing systems. CSE has an annual intake of 720 students in the CSE Block.\n"
+            "- Specialized branches like CSE (AI & ML), CSE (Data Science), and CSE (Cyber Security) offer targeted software curriculums."
+        )
+    return _get_broad_departments_fact()
+
+
+def is_incomplete_or_garbled_query(query: str, q_normalized: str | None = None) -> bool:
+    """Detects incomplete, truncated, or unintelligible utterances.
+    
+    Returns True ONLY when input is genuinely incomplete or garbled, asking
+    for clarification without running RAG or returning canned unknowns.
+    Valid short queries (e.g. 'Placements?', 'ECE?', 'What is RNSIT?') return False.
+    """
+    q = (query or "").strip()
+    qn = (q_normalized or normalize_query(q)).strip().lower()
+    if not qn:
+        return True
+
+    # 1. Valid checks: If entity detected, NOT incomplete
+    try:
+        from backend.entity_mapping import detect_entity
+        if detect_entity(qn) is not None or detect_entity(q) is not None:
+            return False
+    except Exception:
+        pass
+
+    # Valid if broad department or weather or traffic or broad college evaluation
+    if is_broad_department_query(qn) or is_broad_department_query(q):
+        return False
+    if is_weather_intent(qn) or is_traffic_intent(qn):
+        return False
+    if is_college_evaluation_query(qn) or is_college_evaluation_query(q):
+        return False
+
+    # Check for valid standalone keyword queries (e.g. 'placements', 'admissions', 'fees', 'hostel', etc.)
+    _VALID_STANDALONE = {
+        "placement", "placements", "admission", "admissions", "fee", "fees", "hostel", "hostels",
+        "canteen", "library", "sports", "gym", "bus", "transport", "principal", "director",
+        "chairman", "cse", "ise", "ece", "eee", "mech", "civil", "aiml", "aids", "mca", "mba",
+        "rnsit", "college", "campus", "curriculum", "syllabus", "academics"
+    }
+    words = qn.split()
+    if len(words) == 1 and words[0] in _VALID_STANDALONE:
+        return False
+
+    # SINGLE-WORD filler: a lone function word with no content is incomplete.
+    # ("the", "a", "can", etc.) — these would slip past the multi-word checks below.
+    _SINGLE_FILLER = {
+        "the", "a", "an", "is", "are", "of", "to", "for", "in", "on", "at", "by",
+        "with", "from", "and", "or", "so", "was", "were", "that", "this", "it",
+        "its", "there", "here", "can", "could", "would", "will", "do", "does",
+    }
+    if len(words) == 1 and words[0] in _SINGLE_FILLER:
+        return True
+
+    # Trailing hyphen/dash/ellipsis indicates truncation (e.g. "Can you tell me about-")
+    if re.search(r"[-—–]\s*$", q) or q.endswith("..."):
+        return True
+
+    # Incomplete prompt openers with no topic specified (e.g. "Can you tell me", "Tell me about")
+    _INCOMPLETE_OPENER_RE = re.compile(
+        r"^(?:can\s+you\s+|could\s+you\s+|please\s+|i\s+want\s+to\s+|would\s+you\s+)?"
+        r"(?:tell\s+me|tell|explain|show\s+me|show|know|ask|give\s+me)(?:\s+about|\s+me)?$",
+        re.IGNORECASE
+    )
+    if _INCOMPLETE_OPENER_RE.match(qn):
+        return True
+
+    # Dangling trailing stopwords in multi-word sentence fragments (e.g. "This is the")
+    _DANGLING_STOPWORDS = {
+        "the", "a", "an", "of", "about", "to", "for", "in", "on", "at", "by", "with",
+        "from", "and", "or", "so", "is", "are", "was", "were", "that", "this", "my", "your"
+    }
+    if len(words) >= 2 and words[-1] in _DANGLING_STOPWORDS:
+        return True
+
+    # Short fragments (<= 3 words) with no substantive RNSIT domain signal or interrogative
+    # e.g. "The world.", "The world", "A person", "This thing", "World"
+    _INTERROGATIVE_STARTS = (
+        "who", "what", "where", "when", "why", "how", "which",
+        "is", "are", "do", "does", "did", "can", "could", "would",
+    )
+    has_domain_word = bool(set(words) & DOMAIN_KEYWORDS)
+    starts_interrogative = any(qn.startswith(s + " ") or qn == s for s in _INTERROGATIVE_STARTS)
+    if len(words) <= 3 and not has_domain_word and not starts_interrogative:
+        return True
+
+    # Garbled repetitions / disordered syntax
+    _GARBLED_PATTERNS = (
+        r"\bis\s+what\s+is\b",
+        r"\bwhat\s+is\s+what\s+is\b",
+        r"\bthe\s+is\s+the\b",
+        r"\bname\s+is\s+what\s+is\b",
+        r"\bthis\s+is\s+the\b",
+    )
+    for pat in _GARBLED_PATTERNS:
+        if re.search(pat, qn):
+            return True
+
+    # Utterances composed purely of filler/function words with no substantive noun or verb
+    _PURE_FILLER_WORDS = {
+        "this", "that", "the", "a", "an", "is", "are", "was", "were", "what", "where",
+        "how", "who", "which", "name", "it", "its", "there", "here"
+    }
+    if len(words) >= 2 and all(w in _PURE_FILLER_WORDS for w in words):
+        return True
+
+    return False
+
+
+def is_emotional_reengagement_response(text: str) -> bool:
+    """Returns True only when the user's text is a clear emotional/wellbeing
+    response to the re-engagement greeting 'How are you doing today?'.
+
+    Uses POSITIVE detection: the text must match an emotional pattern.
+    Anything that doesn't positively match is treated as a new question
+    and falls through to normal routing.
+
+    Matches:  'I'm good', 'Fine', 'Stressed', 'Not very good', 'Pretty bad'...
+    Non-matches: 'Who is the principal?', 'Did I ask you...', 'Which department?'
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+
+    # Pattern 1: starts with a personal pronoun + emotional state
+    # 'i am good', "i'm stressed", 'im fine'
+    _EMOTION_STATE_WORDS = (
+        "good", "well", "fine", "great", "okay", "ok", "alright", "alrite",
+        "bad", "not good", "not great", "not okay", "not well", "not fine",
+        "stress", "stressed", "anxious", "worried", "nervous", "overwhelmed",
+        "exhausted", "tired", "hectic", "rough",
+        "sad", "low", "depressed", "unhappy", "terrible", "awful",
+        "frustrated", "annoyed", "irritated", "angry", "upset",
+        "excited", "pumped", "thrilled", "wonderful", "fantastic", "amazing",
+        "happy", "pleased", "cheerful",
+        "okay", "so so", "normal", "same old", "pretty good", "pretty bad",
+        "doing well", "doing good", "doing fine", "doing great", "doing okay",
+        "not too bad", "not bad", "quite good", "fairly good",
+    )
+    # Short 1-3 word emotional replies without any interrogative structure
+    _SHORT_EMOTIONAL = {
+        "good", "fine", "well", "great", "okay", "ok", "alright",
+        "bad", "tired", "stressed", "happy", "sad", "exhausted",
+        "not good", "not bad", "not great", "not okay",
+        "pretty good", "so so", "quite good", "doing well",
+    }
+    if t in _SHORT_EMOTIONAL:
+        return True
+
+    # Pattern 2: "I'm <state>", "I am <state>", "Im <state>"
+    for prefix in ("i'm ", "im ", "i am ", "i feel ", "feeling "):
+        if t.startswith(prefix):
+            rest = t[len(prefix):].strip()
+            if rest and len(rest.split()) <= 4:  # short after prefix = emotional, not a new question
+                return True
+
+    # Pattern 3: explicit emotion word at start of short sentence (<= 5 words, no interrogative start)
+    interrogative_starts = ("who", "what", "where", "when", "why", "how", "which",
+                            "can", "could", "would", "did", "do", "does", "is", "are",
+                            "tell", "please", "show", "find", "explain")
+    if any(t.startswith(s) for s in interrogative_starts):
+        return False  # interrogative opener → definitely a new question
+
+    words_t = t.split()
+    if len(words_t) <= 5:
+        for state in _EMOTION_STATE_WORDS:
+            if state in t:
+                return True
+
+    return False
+
+
+def is_college_evaluation_query(query: str) -> bool:
+    """Returns True for broad 'Is RNSIT a good college?' style evaluation queries.
+
+    These must use verified college overview context, NOT random RAG chunks
+    about buses/ATMs/clubs.
+    """
+    q = (query or "").lower().strip()
+    # Patterns: 'is rnsit a good college', 'is rnsit good', 'rnsit good college',
+    # 'is rns it a good college', 'is rnsit worth it', 'is rnsit recommended'
+    patterns = (
+        r"\brnsit\s+(?:a\s+)?good\s+college\b",
+        r"\brns\s+(?:it\s+)?(?:a\s+)?good\s+college\b",
+        r"\bis\s+rnsit\s+good\b",
+        r"\bis\s+rns\s+(?:it\s+)?good\b",
+        r"\bis\s+rnsit\s+(?:a\s+)?(?:good|great|decent|worth|best|top|reputed|recommended)\b",
+        r"\bis\s+rns\s+(?:it\s+)?(?:a\s+)?(?:good|great|decent|worth|best|top|reputed|recommended)\b",
+        r"\brnsit\s+is\s+(?:a\s+)?(?:good|great|decent|nice|best|top|reputed|recommended)\b",
+        r"\brnsit\s+(?:is\s+)?(?:a\s+)?(?:good|great|decent|nice|best|top|reputed|recommended)\b",
+        r"\b(?:good|great|best|top|reputed)\s+(?:college|institute).*rnsit\b",
+        r"\brnsit\s+worth\s+(?:it|joining|studying)\b",
+        r"\bshould\s+i\s+(?:join|choose|go to|study at)\s+rnsit\b",
+
+    )
+    for pat in patterns:
+        if re.search(pat, q):
             return True
     return False
 
@@ -346,7 +737,8 @@ _SYSTEM_PROMPT_TMPL = (
     "and ask what area or career path they are interested in so you can help them compare. Do NOT claim one department is objectively 'best' unless the facts explicitly say so.\n"
     "5. CRITICAL: Never casually say 'I don't have that detail on hand', 'I don't know', or 'I don't have information' when relevant facts are present in the context above. Synthesize the best grounded answer possible.\n"
     "6. Only if the provided facts contain zero relevant information about the question should you say: 'I don't have that detail on hand — please check with the Admin Block.'\n"
-    "7. Never output literal 'Q:' / 'A:' labels."
+    "7. Never output literal 'Q:' / 'A:' labels.\n"
+    "8. For comparisons between specific departments or branches (e.g. 'Which is good, CSE or ECE?'), use the visitor's stated interest if provided, explain the factual differences relevant to that interest using only the verified facts, and let the visitor decide. Never make unsupported generic claims like 'Both offer strong programs', 'Both are excellent choices', 'CSE is better', or 'ECE is better'."
 )
 
 
@@ -822,6 +1214,20 @@ async def handle_query(question: str, history: list | None = None,
                                   question=question, user_reply=question, resolution="abandoned")
         state["pending"] = None
 
+    # ── 1.2) Incomplete / Garbled Utterance Check ─────────────────────────
+    if is_incomplete_or_garbled_query(question, question_clean):
+        clarify_ans = "Sure, what would you like to know?"
+        logger.info("[CONF-RAG] Incomplete/garbled query detected: %r -> clarification", question)
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        return {
+            "answer": clarify_ans,
+            "route": "CLARIFICATION_INCOMPLETE",
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": "clarification_incomplete",
+        }
+
     # ── 1.5) Intent Router: Live Weather API ──────────────────────────────
     if is_weather_intent(question_clean) or is_weather_intent(question):
         weather_ans = await _try_fetch_weather(question)
@@ -880,14 +1286,19 @@ async def handle_query(question: str, history: list | None = None,
             "source": "traffic_api",
         }
 
-    # 2) Context-aware query condensing (short follow-ups -> standalone
-    #    query, using recent conversation history).
-    search_query = await condense_query(question_clean, history or [])
-
-    # 2.5) Canonical Entity Detection:
-    # Check whether the user query maps directly to a verified college entity
-    detected = detect_entity(question_clean) or detect_entity(search_query) or detect_entity(question)
+    # ── 1.7) Canonical Entity Detection (Standalone topic check): ─────────
+    # If the user asks directly about a verified entity (e.g. 'Who is the principal?'),
+    # route to that entity without forcing previous unrelated department context into it.
+    detected = detect_entity(question_clean) or detect_entity(question)
     if detected:
+        last_top = (state.get("last_topic") or "").lower()
+        is_dept_earlier = any(d in last_top for d in ("department", "cse", "ece", "hardware", "software", "branch"))
+        is_new_unrelated = (
+            is_dept_earlier
+            and detected.entity_id in ("PRINCIPAL", "DIRECTOR", "CHAIRMAN", "ADMIN_BLOCK", "CANTEEN", "LIBRARY", "SPORTS_GROUND", "GYM")
+        )
+        history_for_gen = None if is_new_unrelated else history
+
         print(f"USER QUERY: {question}")
         print(f"NORMALIZED QUERY: {question_clean}")
         print("DETECTED INTENT: RNSIT")
@@ -904,8 +1315,7 @@ async def handle_query(question: str, history: list | None = None,
         logger.info("[CONF-RAG] RETRIEVAL RESULT: %s", detected.verified_answer[:120])
         logger.info("[CONF-RAG] ANSWER SOURCE: entity_kb")
 
-        # QUESTION + RETRIEVED CONTEXT -> LLM synthesis
-        answer, gen_tier = await _generate_answer(question, detected.verified_answer, history)
+        answer, gen_tier = await _generate_answer(question, detected.verified_answer, history_for_gen)
         if not answer or any(p in answer.lower() for p in ("i don't have that detail", "i don't know", "i do not know", "i don't have information")):
             answer = detected.verified_answer
 
@@ -929,79 +1339,75 @@ async def handle_query(question: str, history: list | None = None,
             "source": "entity_kb",
         }
 
-    # 3) RAG search (single retrieval call feeds confidence routing,
-    #    ambiguity check, AND the scope check below — no repeat calls).
-    context_text, best_score, raw_results = await retrieve_relevant_context(
-        search_query, top_k=RAG_TOP_K
-    )
-    best_score = safe_float(best_score)
+    # ── 1.8) Specific Department Comparison Routing (e.g. 'Which is good, CSE or ECE?') ──
+    comparison_depts = extract_comparison_departments(question_clean) or extract_comparison_departments(question)
+    if comparison_depts is not None:
+        dept_a, dept_b = comparison_depts
 
-    in_domain = _is_in_domain_keyword(question_clean) or _is_in_domain_keyword(question)
+        # dept_b is None → one department is unrecognised/unknown (e.g. 'ESE').
+        # Never invent what an abbreviation means — ask a short clarification instead.
+        if dept_b is None:
+            clarify_answer = (
+                f"I know {dept_a} but I'm not sure which department you mean by the other abbreviation. "
+                f"Did you perhaps mean ECE, ISE, EEE, or another department?"
+            )
+            logger.info("[CONF-RAG] Comparison: known=%s, unknown dept abbrev → clarification", dept_a)
+            state["pending"] = None
+            state["clarify_streak"] = 0
+            return {
+                "answer": clarify_answer,
+                "route": "CLARIFICATION_UNKNOWN_DEPT",
+                "session_action": "CONTINUE",
+                "session_state": state,
+                "source": "clarification_unknown_dept",
+            }
 
-    # Out-of-scope refusal: If query contains no campus domain keywords and score is low (< 0.65)
-    if not in_domain and best_score < 0.65:
+        user_interest = state.get("user_interest")
+        # Also check recent history if user previously stated an interest
+        if not user_interest and history:
+            for h_msg in reversed(history[-4:]):
+                _, h_txt = parse_history_message(h_msg)
+                if h_txt and "hardware" in h_txt.lower():
+                    user_interest = "Hardware Engineering"
+                    state["user_interest"] = user_interest
+                    break
+
+        comp_facts = _get_department_comparison_facts(dept_a, dept_b, user_interest=user_interest)
         print(f"USER QUERY: {question}")
         print(f"NORMALIZED QUERY: {question_clean}")
-        print("DETECTED INTENT: UNSUPPORTED")
-        print("DETECTED ENTITY: NONE")
-        print(f"ENTITY CONFIDENCE: {best_score:.2f}")
-        print("RETRIEVAL RESULT: None")
-        print("ANSWER SOURCE: guardrail_refusal")
+        print(f"DETECTED INTENT: DEPARTMENT_COMPARISON ({dept_a} vs {dept_b})")
+        print(f"USER INTEREST: {user_interest}")
+        print(f"RETRIEVAL RESULT: {comp_facts[:120]}")
+        print("ANSWER SOURCE: department_comparison_kb")
 
-        logger.info("[CONF-RAG] USER QUERY: %s", question)
-        logger.info("[CONF-RAG] NORMALIZED QUERY: %s", question_clean)
-        logger.info("[CONF-RAG] DETECTED INTENT: UNSUPPORTED")
-        logger.info("[CONF-RAG] ANSWER SOURCE: guardrail_refusal")
+        logger.info("[CONF-RAG] Comparison query: %s vs %s, interest=%r", dept_a, dept_b, user_interest)
+        answer, gen_tier = await _generate_answer(question, comp_facts, history)
+        if not answer or any(p in answer.lower() for p in ("i don't have that detail", "i don't know", "i do not know")):
+            if "hardware" in (user_interest or "").lower():
+                answer = (
+                    "Electronics and Communication Engineering (ECE) focuses on hardware systems, VLSI design, electronic circuits, and embedded systems, located in the Main Campus with specialized labs. "
+                    "Computer Science and Engineering (CSE) focuses on software engineering, algorithms, and computing systems, with introductory hardware concepts. "
+                    "Depending on whether you prefer hands-on electronics hardware or software development, both paths offer distinct career options."
+                )
+            else:
+                answer = (
+                    f"{dept_a} and {dept_b} each have distinct focus areas. "
+                    "I recommend choosing based on whether your primary interest is software, hardware, or another engineering field."
+                )
 
-        return await _handle_low(question, 0.0, session_id, face_id, state, settings)
-
-    # Broad RNSIT / general query handling:
-    broad_overview_phrases = (
-        "about rnsit", "something about rnsit", "about college", "tell me about rnsit",
-        "about the college", "college overview", "what is rnsit", "tell me something about rnsit",
-        "tell me about rns", "about campus", "tell me about this college",
-        "about rns institute", "about r n s", "give me an overview", "overview of rnsit",
-        "overview of rns", "what is rns institute", "what is rns", "about this institute",
-        "about this college", "what does rnsit", "what does rns institute",
-        "introduce rnsit", "introduce rns", "know about rnsit", "know about this college",
-        "information about rnsit", "info about rnsit", "general info about rnsit",
-    )
-    is_broad_rnsit = any(p in question_clean for p in broad_overview_phrases)
-
-    top_entity_label = raw_results[0].get("metadata", {}).get("entity_name", "UNKNOWN") if raw_results else "NONE"
-    print(f"USER QUERY: {question}")
-    print(f"NORMALIZED QUERY: {question_clean}")
-    print("DETECTED INTENT: RNSIT_GENERAL")
-    print("DETECTED ENTITY: NONE")
-    print(f"ENTITY CONFIDENCE: {best_score:.2f}")
-    print(f"RETRIEVAL RESULT: {context_text[:120] if context_text else 'None'}")
-    print("ANSWER SOURCE: general_rag")
-
-    logger.info(
-        "[CONF-RAG] q=%r search=%r score=%.3f band=%s (high>=%.2f near>=%.2f)",
-        question, search_query, best_score,
-        "HIGH" if best_score >= settings["high_threshold"] else
-        ("MEDIUM" if best_score >= settings["near_threshold"] else "LOW"),
-        settings["high_threshold"], settings["near_threshold"],
-    )
-
-    if is_broad_rnsit:
-        overview_fact = _get_college_overview_fact()
-        answer, gen_tier = await _generate_answer(question, overview_fact, history)
-        if "i don't have that detail" in answer.lower():
-            answer = overview_fact
         state["pending"] = None
         state["clarify_streak"] = 0
-        state["last_topic"] = "College Overview"
+        state["last_topic"] = f"{dept_a} vs {dept_b} Comparison"
         return {
             "answer": answer,
-            "route": "RNSIT_GENERAL",
+            "route": f"HIGH_DEPARTMENT_COMPARISON_{gen_tier}",
             "session_action": "CONTINUE",
             "session_state": state,
-            "source": "general_rag",
+            "source": f"dept_comparison_{gen_tier.lower()}",
         }
 
-    # Broad Department query handling (e.g. "Which department is good?", "Which branch should I choose?"):
+    # ── 1.9) Broad Department Query Check (runs BEFORE generic RAG search) ──
+    # Prevents generic RAG chunks (clubs, academics) from contaminating broad department context.
     if is_broad_department_query(question_clean) or is_broad_department_query(question):
         broad_dept_context = _get_broad_departments_fact()
         print(f"USER QUERY: {question}")
@@ -1035,9 +1441,158 @@ async def handle_query(question: str, history: list | None = None,
             "source": f"broad_dept_{gen_tier.lower()}",
         }
 
+    # ── 1.10) Department Follow-up: User specifies an interest area ────────
+    dept_interest = is_department_interest_followup(question_clean, state, history) or is_department_interest_followup(question, state, history)
+    if dept_interest:
+        state["user_interest"] = dept_interest
+        interest_facts = _get_interest_departments_fact(dept_interest)
+
+        print(f"USER QUERY: {question}")
+        print(f"NORMALIZED QUERY: {question_clean}")
+        print(f"DETECTED INTENT: BROAD_DEPARTMENT_FOLLOWUP ({dept_interest})")
+        print("ANSWER SOURCE: interest_followup_kb")
+
+        logger.info("[CONF-RAG] Department interest follow-up: %s", dept_interest)
+        answer, gen_tier = await _generate_answer(question, interest_facts, history)
+        if not answer or any(ref in answer.lower() for ref in ("i don't have that detail", "i don't know", "i do not know")):
+            answer = interest_facts
+
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        state["last_topic"] = f"Department Interest: {dept_interest}"
+        return {
+            "answer": answer,
+            "route": f"HIGH_BROAD_DEPT_FOLLOWUP_{gen_tier}",
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": f"dept_interest_{gen_tier.lower()}",
+        }
+
+    # 2) Context-aware query condensing for remaining follow-up questions
+    search_query = await condense_query(question_clean, history or [])
+    if search_query != question_clean:
+        detected_search = detect_entity(search_query)
+        if detected_search:
+            answer, gen_tier = await _generate_answer(question, detected_search.verified_answer, history)
+            state["pending"] = None
+            state["clarify_streak"] = 0
+            state["last_topic"] = detected_search.canonical_name
+            return {
+                "answer": answer,
+                "route": f"HIGH_ENTITY_{detected_search.entity_id}",
+                "session_action": "CONTINUE",
+                "session_state": state,
+                "detected_entity": detected_search.entity_id,
+                "entity_confidence": detected_search.confidence,
+                "source": "entity_kb",
+            }
+
+    # 3) RAG search (single retrieval call feeds confidence routing,
+    #    ambiguity check, AND the scope check below — no repeat calls).
+    context_text, best_score, raw_results = await retrieve_relevant_context(
+        search_query, top_k=RAG_TOP_K
+    )
+    best_score = safe_float(best_score)
+
+    in_domain = (
+        _is_in_domain_keyword(question_clean)
+        or _is_in_domain_keyword(question)
+        or _is_in_domain_keyword(search_query)
+    )
+
+    # ── Broad RNSIT overview / college-evaluation queries ─────────────────
+    # These must use verified college_overview context, NOT random RAG chunks.
+    broad_overview_phrases = (
+        "about rnsit", "something about rnsit", "about college", "tell me about rnsit",
+        "about the college", "college overview", "what is rnsit", "tell me something about rnsit",
+        "tell me about rns", "about campus", "tell me about this college",
+        "about rns institute", "about r n s", "give me an overview", "overview of rnsit",
+        "overview of rns", "what is rns institute", "what is rns", "about this institute",
+        "about this college", "what does rnsit", "what does rns institute",
+        "introduce rnsit", "introduce rns", "know about rnsit", "know about this college",
+        "information about rnsit", "info about rnsit", "general info about rnsit",
+    )
+    is_broad_rnsit = (
+        any(p in question_clean for p in broad_overview_phrases)
+        or is_college_evaluation_query(question_clean)
+        or is_college_evaluation_query(question)
+    )
+
+    if is_broad_rnsit:
+        overview_fact = _get_college_overview_fact()
+        answer, gen_tier = await _generate_answer(question, overview_fact, history)
+        if "i don't have that detail" in answer.lower():
+            answer = overview_fact
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        state["last_topic"] = "College Overview"
+        return {
+            "answer": answer,
+            "route": "RNSIT_GENERAL",
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": "general_rag",
+        }
+
+    # Out-of-scope / weak-query protection:
+    # If the query contains NO campus domain keywords, DO NOT let generic RAG retrieval
+    # produce an answer from a weak semantic match.
+    if not in_domain:
+        words_q = question_clean.split()
+        if len(words_q) <= 4:
+            clarify_ans = "Sure, what would you like to know?"
+            logger.info("[CONF-RAG] Weak/unclear query with no domain keywords: %r -> clarification", question)
+            state["pending"] = None
+            state["clarify_streak"] = 0
+            return {
+                "answer": clarify_ans,
+                "route": "CLARIFICATION_INCOMPLETE",
+                "session_action": "CONTINUE",
+                "session_state": state,
+                "source": "clarification_incomplete",
+            }
+
+        print(f"USER QUERY: {question}")
+        print(f"NORMALIZED QUERY: {question_clean}")
+        print("DETECTED INTENT: UNSUPPORTED")
+        print("DETECTED ENTITY: NONE")
+        print(f"ENTITY CONFIDENCE: {best_score:.2f}")
+        print("RETRIEVAL RESULT: None")
+        print("ANSWER SOURCE: guardrail_refusal")
+
+        logger.info("[CONF-RAG] USER QUERY: %s", question)
+        logger.info("[CONF-RAG] NORMALIZED QUERY: %s", question_clean)
+        logger.info("[CONF-RAG] DETECTED INTENT: UNSUPPORTED")
+        logger.info("[CONF-RAG] ANSWER SOURCE: guardrail_refusal")
+
+        return await _handle_low(question, best_score, session_id, face_id, state, settings)
+
+    top_entity_label = raw_results[0].get("metadata", {}).get("entity_name", "UNKNOWN") if raw_results else "NONE"
+    print(f"USER QUERY: {question}")
+    print(f"NORMALIZED QUERY: {question_clean}")
+    print("DETECTED INTENT: RNSIT_GENERAL")
+    print("DETECTED ENTITY: NONE")
+    print(f"ENTITY CONFIDENCE: {best_score:.2f}")
+    print(f"RETRIEVAL RESULT: {context_text[:120] if context_text else 'None'}")
+    print("ANSWER SOURCE: general_rag")
+
+    logger.info(
+        "[CONF-RAG] q=%r search=%r score=%.3f band=%s (high>=%.2f near>=%.2f)",
+        question, search_query, best_score,
+        "HIGH" if best_score >= settings["high_threshold"] else
+        ("MEDIUM" if best_score >= settings["near_threshold"] else "LOW"),
+        settings["high_threshold"], settings["near_threshold"],
+    )
+
     if not raw_results:
         return await _handle_low(question, best_score, session_id, face_id, state, settings)
 
+    # ── LOW confidence with ambiguous/unrelated retrieval ────────────────
+    # Prevent low-relevance generic chunks (buses, ATM, clubs) from becoming
+    # answers for queries that had weak retrieval signal.
+    # If best_score is HIGH-band but the top chunk entity doesn't semantically
+    # relate to the query, let the normal HIGH handler proceed — ambiguity
+    # check will handle competing chunks. Only intercept truly weak retrievals.
     if best_score >= settings["high_threshold"]:
         return await _handle_high(question, context_text, raw_results, best_score, history, state, settings, session_id)
     if best_score >= settings["near_threshold"]:
@@ -1088,6 +1643,22 @@ async def handle_query_stream(question: str, history: list | None = None,
             await log_resolution(decision_id=pending["decision_id"], session_id=session_id,
                                   question=question, user_reply=question, resolution="abandoned")
         state["pending"] = None
+
+    # ── 1.2) Incomplete / Garbled Utterance Check ─────────────────────────
+    if is_incomplete_or_garbled_query(question, question_clean):
+        clarify_ans = "Sure, what would you like to know?"
+        logger.info("[CONF-RAG-STREAM] Incomplete/garbled query detected: %r -> clarification", question)
+        yield {"sentence": clarify_ans, "partial": False}
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        yield {
+            "done": True,
+            "answer": clarify_ans,
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": "clarification_incomplete",
+        }
+        return
 
     # ── 1.5) Intent Router: Live Weather API ──────────────────────────────
     if is_weather_intent(question_clean) or is_weather_intent(question):
@@ -1141,10 +1712,17 @@ async def handle_query_stream(question: str, history: list | None = None,
         }
         return
 
-    search_query = await condense_query(question_clean, history or [])
-
-    detected = detect_entity(question_clean) or detect_entity(search_query) or detect_entity(question)
+    # ── 1.7) Canonical Entity Detection (Standalone topic check): ─────────
+    detected = detect_entity(question_clean) or detect_entity(question)
     if detected:
+        last_top = (state.get("last_topic") or "").lower()
+        is_dept_earlier = any(d in last_top for d in ("department", "cse", "ece", "hardware", "software", "branch"))
+        is_new_unrelated = (
+            is_dept_earlier
+            and detected.entity_id in ("PRINCIPAL", "DIRECTOR", "CHAIRMAN", "ADMIN_BLOCK", "CANTEEN", "LIBRARY", "SPORTS_GROUND", "GYM")
+        )
+        history_for_gen = None if is_new_unrelated else history
+
         print(f"USER QUERY: {question}")
         print(f"NORMALIZED QUERY: {question_clean}")
         print("DETECTED INTENT: RNSIT")
@@ -1156,7 +1734,7 @@ async def handle_query_stream(question: str, history: list | None = None,
         # QUESTION + RETRIEVED CONTEXT -> LLM streaming synthesis
         system_prompt = _SYSTEM_PROMPT_TMPL.format(context=detected.verified_answer)
         messages = [{"role": "system", "content": system_prompt}]
-        for msg in (history or [])[-4:]:
+        for msg in (history_for_gen or [])[-4:]:
             speaker, text = parse_history_message(msg)
             if speaker and text:
                 role = "user" if speaker.lower() in ("visitor", "user") else "assistant"
@@ -1213,64 +1791,91 @@ async def handle_query_stream(question: str, history: list | None = None,
         }
         return
 
-    context_text, best_score, raw_results = await retrieve_relevant_context(
-        search_query, top_k=RAG_TOP_K
-    )
-    best_score = safe_float(best_score)
+    # ── 1.8) Specific Department Comparison Routing (streaming) ───────────
+    comparison_depts = extract_comparison_departments(question_clean) or extract_comparison_departments(question)
+    if comparison_depts is not None:
+        dept_a, dept_b = comparison_depts
 
-    in_domain = _is_in_domain_keyword(question_clean) or _is_in_domain_keyword(question)
+        # Unknown/unrecognised second dept → clarify instead of inventing
+        if dept_b is None:
+            clarify_answer = (
+                f"I know {dept_a} but I'm not sure which department you mean by the other abbreviation. "
+                f"Did you perhaps mean ECE, ISE, EEE, or another department?"
+            )
+            logger.info("[CONF-RAG-STREAM] Comparison: known=%s, unknown dept → clarification", dept_a)
+            state["pending"] = None
+            state["clarify_streak"] = 0
+            yield {"answer": clarify_answer, "route": "CLARIFICATION_UNKNOWN_DEPT",
+                   "session_action": "CONTINUE", "session_state": state}
+            return
 
-    if not in_domain and best_score < 0.65:
-        print(f"USER QUERY: {question}")
-        print(f"NORMALIZED QUERY: {question_clean}")
-        print("DETECTED INTENT: UNSUPPORTED")
-        print("DETECTED ENTITY: NONE")
-        print(f"ENTITY CONFIDENCE: {best_score:.2f}")
-        print("RETRIEVAL RESULT: None")
-        print("ANSWER SOURCE: guardrail_refusal")
+        user_interest = state.get("user_interest")
+        if not user_interest and history:
+            for h_msg in reversed(history[-4:]):
+                _, h_txt = parse_history_message(h_msg)
+                if h_txt and "hardware" in h_txt.lower():
+                    user_interest = "Hardware Engineering"
+                    state["user_interest"] = user_interest
+                    break
 
-        yield await _handle_low(question, 0.0, session_id, face_id, state, settings)
-        return
+        comp_facts = _get_department_comparison_facts(dept_a, dept_b, user_interest=user_interest)
+        system_prompt = _SYSTEM_PROMPT_TMPL.format(context=comp_facts)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in (history or [])[-4:]:
+            speaker, text = parse_history_message(msg)
+            if speaker and text:
+                role = "user" if speaker.lower() in ("visitor", "user") else "assistant"
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": question})
 
-    broad_overview_phrases = (
-        "about rnsit", "something about rnsit", "about college", "tell me about rnsit",
-        "about the college", "college overview", "what is rnsit", "tell me something about rnsit",
-        "tell me about rns", "about campus", "tell me about this college",
-        "about rns institute", "about r n s", "give me an overview", "overview of rnsit",
-        "overview of rns", "what is rns institute", "what is rns", "about this institute",
-        "about this college", "what does rnsit", "what does rns institute",
-        "introduce rnsit", "introduce rns", "know about rnsit", "know about this college",
-        "information about rnsit", "info about rnsit", "general info about rnsit",
-    )
-    is_broad_rnsit = any(p in question_clean for p in broad_overview_phrases)
+        parts = []
+        first_sentence_sent = False
+        tier_seen = "local"
+        try:
+            buf = ""
+            async for delta, tier, _model in chat_completion_with_fallback_stream(messages, temperature=0.2, max_tokens=180):
+                tier_seen = tier
+                buf += delta
+                ready, buf = _pop_complete_sentences(buf)
+                for s in ready:
+                    if not first_sentence_sent:
+                        s = _clean_repetitive_greeting(s)
+                        first_sentence_sent = True
+                    if s:
+                        parts.append(s)
+                        yield {"answer": s, "route": f"HIGH_DEPARTMENT_COMPARISON_{tier_seen.upper()}", "session_action": "CONTINUE", "partial": True}
+            if buf.strip():
+                b = _clean_repetitive_greeting(buf.strip()) if not first_sentence_sent else buf.strip()
+                if b:
+                    parts.append(b)
+                    yield {"answer": b, "route": f"HIGH_DEPARTMENT_COMPARISON_{tier_seen.upper()}", "session_action": "CONTINUE", "partial": True}
+        except Exception:
+            pass
 
-    print(f"USER QUERY: {question}")
-    print(f"NORMALIZED QUERY: {question_clean}")
-    print("DETECTED INTENT: RNSIT_GENERAL")
-    print("DETECTED ENTITY: NONE")
-    print(f"ENTITY CONFIDENCE: {best_score:.2f}")
-    print(f"RETRIEVAL RESULT: {context_text[:120] if context_text else 'None'}")
-    print("ANSWER SOURCE: general_rag")
+        full_answer = "".join(parts).strip()
+        if not full_answer or any(p in full_answer.lower() for p in ("i don't have that detail", "i don't know", "i do not know")):
+            if "hardware" in (user_interest or "").lower():
+                full_answer = (
+                    "Electronics and Communication Engineering (ECE) focuses on hardware systems, VLSI design, electronic circuits, and embedded systems, located in the Main Campus with specialized labs. "
+                    "Computer Science and Engineering (CSE) focuses on software engineering, algorithms, and computing systems, with introductory hardware concepts. "
+                    "Depending on whether you prefer hands-on electronics hardware or software development, both paths offer distinct career options."
+                )
+            else:
+                full_answer = f"CSE focuses on software development and computing systems, while {dept_b} focuses on its specific field. I recommend choosing based on whether your primary interest is software or hardware."
 
-    if is_broad_rnsit:
-        overview_fact = _get_college_overview_fact()
-        answer, gen_tier = await _generate_answer(question, overview_fact, history)
-        if "i don't have that detail" in answer.lower():
-            answer = overview_fact
         state["pending"] = None
         state["clarify_streak"] = 0
-        state["last_topic"] = "College Overview"
-        yield {"sentence": answer, "partial": False}
+        state["last_topic"] = f"{dept_a} vs {dept_b} Comparison"
         yield {
             "done": True,
-            "answer": answer,
+            "answer": full_answer,
             "session_action": "CONTINUE",
             "session_state": state,
-            "source": "general_rag",
+            "source": f"dept_comparison_{tier_seen.lower()}",
         }
         return
 
-    # Broad Department query handling (streaming):
+    # ── 1.9) Broad Department Query Check (streaming, runs BEFORE generic RAG) ──
     if is_broad_department_query(question_clean) or is_broad_department_query(question):
         broad_dept_context = _get_broad_departments_fact()
         print(f"USER QUERY: {question}")
@@ -1341,6 +1946,144 @@ async def handle_query_stream(question: str, history: list | None = None,
         state["last_topic"] = "Departments Overview"
         yield {"answer": full_answer, "route": f"HIGH_BROAD_DEPT_{tier_seen.upper()}",
                "session_action": "CONTINUE", "session_state": state, "final": True}
+        return
+
+    # ── 1.10) Department Interest Follow-up (streaming) ───────────────────
+    dept_interest = is_department_interest_followup(question_clean, state, history) or is_department_interest_followup(question, state, history)
+    if dept_interest:
+        state["user_interest"] = dept_interest
+        interest_facts = _get_interest_departments_fact(dept_interest)
+        system_prompt = _SYSTEM_PROMPT_TMPL.format(context=interest_facts)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in (history or [])[-4:]:
+            speaker, text = parse_history_message(msg)
+            if speaker and text:
+                role = "user" if speaker.lower() in ("visitor", "user") else "assistant"
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": question})
+
+        parts = []
+        tier_seen = "local"
+        try:
+            buf = ""
+            async for delta, tier, _model in chat_completion_with_fallback_stream(messages, temperature=0.2, max_tokens=180):
+                tier_seen = tier
+                buf += delta
+                ready, buf = _pop_complete_sentences(buf)
+                for s in ready:
+                    if s:
+                        parts.append(s)
+                        yield {"answer": s, "route": f"HIGH_BROAD_DEPT_FOLLOWUP_{tier_seen.upper()}", "session_action": "CONTINUE", "partial": True}
+            if buf.strip():
+                parts.append(buf.strip())
+                yield {"answer": buf.strip(), "route": f"HIGH_BROAD_DEPT_FOLLOWUP_{tier_seen.upper()}", "session_action": "CONTINUE", "partial": True}
+        except Exception:
+            pass
+
+        full_answer = "".join(parts).strip()
+        if not full_answer:
+            full_answer = interest_facts
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        state["last_topic"] = f"Department Interest: {dept_interest}"
+        yield {"answer": full_answer, "route": f"HIGH_BROAD_DEPT_FOLLOWUP_{tier_seen.upper()}", "session_action": "CONTINUE", "session_state": state, "final": True}
+        return
+
+    search_query = await condense_query(question_clean, history or [])
+
+    # ── College evaluation / broad RNSIT overview (streaming) ────────────
+    # 'Is RNSIT a good college?' must use verified overview, not generic RAG.
+    broad_overview_phrases = (
+        "about rnsit", "something about rnsit", "about college", "tell me about rnsit",
+        "about the college", "college overview", "what is rnsit", "tell me something about rnsit",
+        "tell me about rns", "about campus", "tell me about this college",
+        "about rns institute", "about r n s", "give me an overview", "overview of rnsit",
+        "overview of rns", "what is rns institute", "what is rns", "about this institute",
+        "about this college", "what does rnsit", "what does rns institute",
+        "introduce rnsit", "introduce rns", "know about rnsit", "know about this college",
+        "information about rnsit", "info about rnsit", "general info about rnsit",
+    )
+    is_broad_rnsit_stream = (
+        any(p in question_clean for p in broad_overview_phrases)
+        or is_college_evaluation_query(question_clean)
+        or is_college_evaluation_query(question)
+    )
+    if is_broad_rnsit_stream:
+        overview_fact = _get_college_overview_fact()
+        system_prompt = _SYSTEM_PROMPT_TMPL.format(context=overview_fact)
+        messages = [{"role": "system", "content": system_prompt}]
+        for msg in (history or [])[-4:]:
+            speaker, text = parse_history_message(msg)
+            if speaker and text:
+                role = "user" if speaker.lower() in ("visitor", "user") else "assistant"
+                messages.append({"role": role, "content": text})
+        messages.append({"role": "user", "content": question})
+
+        parts: list[str] = []
+        first_sentence_sent = False
+        tier_seen = "local"
+        try:
+            buf = ""
+            async for delta, tier, _model in chat_completion_with_fallback_stream(
+                messages, temperature=0.2, max_tokens=180
+            ):
+                tier_seen = tier
+                buf += delta
+                ready, buf = _pop_complete_sentences(buf)
+                for s in ready:
+                    if not first_sentence_sent:
+                        s = _clean_repetitive_greeting(s)
+                        first_sentence_sent = True
+                    if s:
+                        parts.append(s)
+                        yield {"answer": s, "route": f"RNSIT_GENERAL",
+                               "session_action": "CONTINUE", "partial": True}
+            if buf.strip():
+                b = buf.strip()
+                if not first_sentence_sent:
+                    b = _clean_repetitive_greeting(b)
+                if b:
+                    parts.append(b)
+                    yield {"answer": b, "route": "RNSIT_GENERAL",
+                           "session_action": "CONTINUE", "partial": True}
+        except Exception as e:
+            logger.error("[CONF-RAG-STREAM] College overview generation failed: %s", e)
+            parts = [overview_fact]
+            yield {"answer": overview_fact, "route": "RNSIT_GENERAL", "partial": False}
+
+        full_answer = "".join(parts).strip() or overview_fact
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        state["last_topic"] = "College Overview"
+        yield {"answer": full_answer, "route": "RNSIT_GENERAL",
+               "session_action": "CONTINUE", "session_state": state, "final": True}
+        return
+
+    context_text, best_score, raw_results = await retrieve_relevant_context(search_query, top_k=RAG_TOP_K)
+    best_score = safe_float(best_score)
+
+    in_domain = (
+        _is_in_domain_keyword(question_clean)
+        or _is_in_domain_keyword(question)
+        or _is_in_domain_keyword(search_query)
+    )
+    if not in_domain:
+        words_q = question_clean.split()
+        if len(words_q) <= 4:
+            clarify_ans = "Sure, what would you like to know?"
+            logger.info("[CONF-RAG-STREAM] Weak/unclear query with no domain keywords: %r -> clarification", question)
+            yield {"sentence": clarify_ans, "partial": False}
+            state["pending"] = None
+            state["clarify_streak"] = 0
+            yield {
+                "done": True,
+                "answer": clarify_ans,
+                "session_action": "CONTINUE",
+                "session_state": state,
+                "source": "clarification_incomplete",
+            }
+            return
+        yield await _handle_low(question, best_score, session_id, face_id, state, settings)
         return
 
     if not raw_results:

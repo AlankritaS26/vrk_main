@@ -314,3 +314,66 @@ eda4aaba51a2,2026-09-24T15:18:45,526f06a7-6158-4c88-b24f-08343f912cff,aww,0.0000
 e09954e6c8d4,2026-09-24T15:18:52,526f06a7-6158-4c88-b24f-08343f912cff,some good quicken eyes tell me a joke,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
 d93fd8ee3316,2026-09-24T15:19:05,526f06a7-6158-4c88-b24f-08343f912cff,ess,0.6516,0.6516,0.0000,Electrical and Electronics Engineering,Electrical and Electronics Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
 b641a88c066e,2026-09-24T15:24:25,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about the facilities provided by this college,0.7516,0.7516,0.0000,Canteen,Canteen,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+f18fc4415453,2026-09-25T11:33:11,02ca2831-5db9-436c-8759-30b3d5a413e5,in computer science,0.0000,,,,,LOW,False,LOW_OUT_OF_SCOPE,decision,,out_of_scope,
+0dc2cea7e2d6,2026-09-25T11:48:36,02ca2831-5db9-436c-8759-30b3d5a413e5,this is the only one that has a sonic water so well stop the delay there,0.5368,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+3e7b6f1060bf,2026-09-25T11:49:27,02ca2831-5db9-436c-8759-30b3d5a413e5,im not a student im a student im a student im a student,0.6704,0.6704,0.0000,Counselling,Counselling,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+b1986264eea7,2026-09-25T11:49:49,unknown,go and test it later,0.5728,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+ed34310cdee9,2026-09-25T12:02:55,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me like im interested in software and computing so tell me information regarding that,0.6778,0.6778,0.0000,Academics — Clubs,Academics — Clubs,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+02f0080eb3e1,2026-09-25T12:03:47,02ca2831-5db9-436c-8759-30b3d5a413e5,yes tell me about software and computing programs in rnsit please,0.7366,0.7366,0.0000,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+4934aa7a6097,2026-09-25T12:04:00,02ca2831-5db9-436c-8759-30b3d5a413e5,they can get each one,0.6284,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+fcfeeab4eea4,2026-09-25T12:04:10,02ca2831-5db9-436c-8759-30b3d5a413e5,tell me regarding cyber security in that,0.7117,0.7117,0.0000,CSE (Cyber Security),CSE (Cyber Security),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+99395ec0ab82,2026-09-25T12:04:20,02ca2831-5db9-436c-8759-30b3d5a413e5,the name is what is,0.6403,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+901c1053c2e5,2026-09-25T12:04:33,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me about,0.6586,0.6586,0.0000,Banking,Banking,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+c37581bfd559,2026-09-25T12:05:21,02ca2831-5db9-436c-8759-30b3d5a413e5,okay tell me about mechanical block,0.6727,0.6727,0.0000,Mechanical Engineering,Mechanical Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+31c7715928d8,2026-09-25T12:05:50,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me something regarding rnsit like is it a good college,0.7511,0.7511,0.0000,What is the website of RNSIT?,What is the website of RNSIT?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+17bf5ec983cc,2026-09-25T12:06:19,02ca2831-5db9-436c-8759-30b3d5a413e5,the,0.8240,0.8240,0.0000,Campus Facilities Overview,Campus Facilities Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+6827fee5a307,2026-09-25T12:11:42,02ca2831-5db9-436c-8759-30b3d5a413e5,this is the,0.6482,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+0a32c77ad1d2,2026-09-25T12:11:57,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal of rnsit,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+b09394e4b125,2026-09-25T12:12:40,02ca2831-5db9-436c-8759-30b3d5a413e5,kenneth delmu is the director of rnsit,1.0000,,,Director,,HIGH,False,HIGH_ENTITY_DIRECTOR,decision,,answered,entity_kb
+327e8f70aee4,2026-09-25T12:13:14,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me regarding the placements of this college,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+7860b968bd1d,2026-09-25T12:13:38,02ca2831-5db9-436c-8759-30b3d5a413e5,how many blocks are there in rnsit,0.6874,0.6874,0.0000,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+48db68825043,2026-09-25T12:15:33,02ca2831-5db9-436c-8759-30b3d5a413e5,hardware engineering,0.7679,0.7679,0.0000,Departments Overview,Departments Overview,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+019dd10fb124,2026-09-25T12:16:14,02ca2831-5db9-436c-8759-30b3d5a413e5,like which is good cse or ece,0.7029,0.7029,0.0000,Electrical and Electronics Engineering,Electrical and Electronics Engineering,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+bdacd2ea58fe,2026-09-25T12:17:09,02ca2831-5db9-436c-8759-30b3d5a413e5,is that kings place and just college,0.6155,0.6155,0.0000,Is there an ATM on campus?,Is there an ATM on campus?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+dfedb2c6aa90,2026-09-25T12:17:48,02ca2831-5db9-436c-8759-30b3d5a413e5,what is the fee in management,1.0000,,,Fee Structure,,HIGH,False,HIGH_ENTITY_FEES,decision,,answered,entity_kb
+e4155ef7b873,2026-09-25T13:32:22,unknown,Hardware Engineering.,0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+2280e70e3ddf,2026-09-25T13:32:25,unknown,"Which is good, CSE or ECE?",0.0000,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+5b81b3f56872,2026-09-25T13:53:09,unknown,Tell me about RNSIT,0.9200,,,,,HIGH,False,HIGH_RAG_ONLY,decision,,answered,rag_only
+8c176eb951e1,2026-09-25T13:53:33,unknown,Tell me about RNSIT,0.9200,,,,,HIGH,False,HIGH_LOCAL,decision,,answered,local
+25e5529da73f,2026-09-25T13:57:11,unknown,we will take the paper and the paper to the assistants idea,0.5799,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+4732bd5d69d1,2026-09-25T14:01:00,02ca2831-5db9-436c-8759-30b3d5a413e5,sneha sneha can you tell me who is the principal of rnsit,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+b6643645fd28,2026-09-25T14:01:21,02ca2831-5db9-436c-8759-30b3d5a413e5,i live in the us and i live in the region sleep,0.5782,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+4f153a010617,2026-09-25T15:06:39,02ca2831-5db9-436c-8759-30b3d5a413e5,like how is that like how is cse and what is the intake fee placement all that,1.0000,,,Fee Structure,,HIGH,False,HIGH_ENTITY_FEES,decision,,answered,entity_kb
+a79ac88f7ba1,2026-09-25T15:19:43,5ed99bd7-27a1-448e-9c97-176fa303d687,im a student im a student im a student im a student im a student im a student im a student,0.6962,0.6962,0.0000,Counselling,Counselling,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+45a775d827ac,2026-09-25T15:20:11,5ed99bd7-27a1-448e-9c97-176fa303d687,its not a lot of people,0.5656,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+9fd9177c22ec,2026-09-25T15:20:39,5ed99bd7-27a1-448e-9c97-176fa303d687,i have to go to the meeting why because it is guest thats why it is not ending,0.5895,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+67306648c524,2026-09-25T15:20:46,5ed99bd7-27a1-448e-9c97-176fa303d687,i will not see it it is not in india it is in india,0.5915,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+0a2547bfdb43,2026-09-25T15:24:28,526f06a7-6158-4c88-b24f-08343f912cff,now just find some of the resources for me,0.6040,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+346da1c636c0,2026-09-25T15:24:49,526f06a7-6158-4c88-b24f-08343f912cff,oh okay lets ask amy,0.6013,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+2556dfbbdea3,2026-09-25T15:25:06,526f06a7-6158-4c88-b24f-08343f912cff,all made in the answer,0.5947,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+b4a592a91970,2026-09-25T15:25:22,526f06a7-6158-4c88-b24f-08343f912cff,and saimi hostel principal of arunasad,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+1dd9e0423cca,2026-09-25T15:25:42,526f06a7-6158-4c88-b24f-08343f912cff,the moment is here,0.5796,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+dad06c76e55d,2026-09-25T15:26:59,526f06a7-6158-4c88-b24f-08343f912cff,who is rns,0.6524,0.6524,0.0000,Group Chairman,Group Chairman,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+f315ab63d7fb,2026-09-25T15:27:30,526f06a7-6158-4c88-b24f-08343f912cff,yeah why are you not speaking correctly,0.5411,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+49d7ee61dd0f,2026-09-25T15:33:13,02ca2831-5db9-436c-8759-30b3d5a413e5,just to introduce my name to smeha,0.5616,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+4d7504e3dad1,2026-09-25T15:33:36,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me which is good cse or ese,0.6776,0.6776,0.0000,CSE (Cyber Security),CSE (Cyber Security),HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+8aaee25066ad,2026-09-25T15:34:47,02ca2831-5db9-436c-8759-30b3d5a413e5,can you help me about cse please,1.0000,,,Computer Science and Engineering Department,,HIGH,False,HIGH_ENTITY_CSE_DEPT,decision,,answered,entity_kb
+7cce3007652d,2026-09-25T15:36:07,02ca2831-5db9-436c-8759-30b3d5a413e5,this is a lot of time,0.5869,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+445112a2bd5d,2026-09-25T15:36:25,02ca2831-5db9-436c-8759-30b3d5a413e5,isr at a good college,0.6396,0.6396,0.0000,Does the college provide transport?,Does the college provide transport?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+321236251ab4,2026-09-25T15:36:57,02ca2831-5db9-436c-8759-30b3d5a413e5,ise aiml cie social hod placement,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+06d8caeb92ab,2026-09-25T15:37:51,02ca2831-5db9-436c-8759-30b3d5a413e5,just samey is rnsit a good college,0.6850,0.6850,0.0000,Is there a gym on campus?,Is there a gym on campus?,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+475b570b5dae,2026-09-25T15:39:16,02ca2831-5db9-436c-8759-30b3d5a413e5,what are the benefits thus the rnsit gives,0.6942,0.6942,0.0000,Scholarships,Scholarships,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+f4a712ed9d8f,2026-09-25T15:40:00,unknown,weve come by the states union act people are coming from the states union act,0.5935,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+b982e47f1cdd,2026-09-25T15:42:43,02ca2831-5db9-436c-8759-30b3d5a413e5,why is there no habit with cell here why are you saying lies,0.5986,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+9d5c0f684c12,2026-09-28T12:10:05,02ca2831-5db9-436c-8759-30b3d5a413e5,its deeply,0.5975,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+8694c8f211b8,2026-09-28T12:10:23,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the principal,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+986424af4b13,2026-09-28T12:10:37,02ca2831-5db9-436c-8759-30b3d5a413e5,im going to go to the hospital im going to go to the hospital,0.7365,0.7365,0.0000,Medical,Medical,HIGH,False,HIGH_LOCAL,decision,,answered,LOCAL
+afd1425386ea,2026-09-28T12:11:00,02ca2831-5db9-436c-8759-30b3d5a413e5,im sorry about this but im okay,0.5698,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+9e2710e51584,2026-09-28T12:12:45,02ca2831-5db9-436c-8759-30b3d5a413e5,like give me the information regarding their placement study etc,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+899621ca0cc6,2026-09-28T12:14:47,02ca2831-5db9-436c-8759-30b3d5a413e5,may i know like who is the hod of aiml department,1.0000,,,HOD of AI and ML,,HIGH,False,HIGH_ENTITY_AIML_HOD,decision,,answered,entity_kb
+6e03c50d252a,2026-09-28T12:16:18,02ca2831-5db9-436c-8759-30b3d5a413e5,the world,0.7560,0.7560,0.0000,Departments Overview,Departments Overview,HIGH,False,HIGH_RAG_ONLY,decision,,answered,RAG_ONLY
+28830bbdb9ca,2026-09-28T12:34:07,unknown,Placements?,1.0000,,,Placements Overview,,HIGH,False,HIGH_ENTITY_PLACEMENTS_OVERVIEW,decision,,answered,entity_kb
+0987e71f17ce,2026-09-28T12:34:09,unknown,ECE?,1.0000,,,Electronics and Communication Engineering,,HIGH,False,HIGH_ENTITY_ECE_DEPT,decision,,answered,entity_kb
+7417946a8e75,2026-09-28T12:34:10,unknown,Who is the principal?,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+6cc3e2e337bb,2026-09-28T12:34:13,unknown,How many departments are there?,1.0000,,,Departments Overview,,HIGH,False,HIGH_ENTITY_DEPARTMENTS_OVERVIEW,decision,,answered,entity_kb
+f8de36fba646,2026-09-28T12:41:49,02ca2831-5db9-436c-8759-30b3d5a413e5,can you tell me who is the director of rns institute,1.0000,,,Director,,HIGH,False,HIGH_ENTITY_DIRECTOR,decision,,answered,entity_kb

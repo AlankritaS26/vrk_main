@@ -1212,6 +1212,13 @@ async def condense_query(question: str, history: list | None) -> str:
     if len(question.split()) > 3:
         return question
 
+    try:
+        from backend.confidence_rag import is_incomplete_or_garbled_query
+        if is_incomplete_or_garbled_query(question):
+            return question
+    except Exception:
+        pass
+
     history_lines = []
     for msg in history[-3:]:
         speaker_val, text_val = parse_history_message(msg)
