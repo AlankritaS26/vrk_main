@@ -98,7 +98,7 @@ logging.basicConfig(
 logger = logging.getLogger("RNSIT_Kiosk")
 
 MAX_QUERY_LENGTH: int = 300 
-SESSION_TIMEOUT_SECONDS: int = 180
+SESSION_TIMEOUT_SECONDS: int = 360   # 6 min idle grace — raised from 180s to avoid premature session endings
 
 # ── RAG MICROSERVICE CONFIG ────────────────────────────────────────────────
 # Read once, here, near the top of the file — everything else in this module
@@ -1518,20 +1518,18 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
         test_raw = name_change_match.group(1).strip().lower()
         if any(test_raw.startswith(prefix) for prefix in INVALID_NAME_STARTS):
             name_change_match = None
-
-    if not name_change_match and len(q_normalized.split()) in (1, 2):
-        _words = q_normalized.split()
-        if all(w.isalpha() and len(w) >= 2 for w in _words):
-            _non_name = {"where", "what", "how", "when", "who", "which", "can", "tell", "fees", "admission", "hostel", "placement", "library", "department", "principal", "hod", "contact", "address", "course", "branch", "branches", "syllabus", "exam", "seat", "cutoff", "rnsit", "college", "campus", "building", "block", "canteen", "sports", "yes", "no", "guest", "skip", "continue", "ok", "okay", "bye", "thanks", "thank you", "hello", "hi", "hey", "help", "info", "details", *INVALID_NAME_WORDS}
-            if not any(w in _non_name for w in _words):
-                name_change_match = re.search(r"^([a-zA-Z\s]+)$", q_normalized)
-
     if name_change_match:
         new_name_raw = name_change_match.group(1).strip()
         if "," in new_name_raw:
             new_name_raw = new_name_raw.split(",")[0].strip()
         new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
-        if new_name_words and len(new_name_words) <= 3 and not any(w.lower() in INVALID_NAME_WORDS for w in new_name_words):
+        if (
+            new_name_words
+            and len(new_name_words) <= 3
+            and all(w.isalpha() for w in new_name_words)
+            and not any(w.lower() in INVALID_NAME_WORDS for w in new_name_words)
+            and not any(x in new_name_raw.lower() for x in ["blink", "twice", "yes", "no", "eye", "emoji"])
+        ):
             new_name = " ".join(new_name_words)
             if active_session:
                 active_session["user_name"] = new_name

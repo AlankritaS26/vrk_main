@@ -2,6 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import IdleScreen from './IdleScreen';
 import WelcomeScreen from './WelcomeScreen';
 import GoodbyeScreen from './GoodbyeScreen';
+import Nova3DAvatar from './Nova3DAvatar';
 import './index.css';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';

@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createKioskMic, float32ToInt16 } from './kioskMic';
+import Nova3DAvatar from './Nova3DAvatar';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
@@ -182,6 +183,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const cleanText = (t) => (t || '').replace(/\u2014|\u2013/g, ', ').replace(/\s+,/g, ',');
 
   const addMessage = useCallback((text, speaker) => {
+    if (!text || text === '__BLINK__' || /👁|\[Blinked/i.test(text)) return;
     text = cleanText(text);
     setMessages(prev => [...prev, {
       text, speaker,
@@ -781,18 +783,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
     const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
 
-    // If the visitor directly stated their name or spelled it (e.g. "Akshata", "My name is Akshata", "I am Akshata"):
-    if (!isQuestionText && !bareNameChange) {
-      const candidateName = extractVisitorName(text);
-      if (candidateName && candidateName.split(' ').length <= 3 && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you)$/i.test(candidateName)) {
-        setLocalName(candidateName);
-        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(candidateName), { method: 'POST' }).catch(() => {});
-        const doneMsg = `Done! I have changed your name to ${candidateName}. How may I assist you today?`;
-        addMessage(doneMsg, 'kiosk');
-        speak(doneMsg);
-        return;
-      }
-    }
+    // NOTE: We do NOT auto-accept single or multi-word blurts as a name change.
+    // Names are only updated when the visitor uses an explicit phrase like
+    // "my name is X", "call me X", "change my name to X", or goes through the
+    // bareNameChange interactive flow below. This prevents random words like
+    // "okay", "yes", "Akshay Dao" (said mid-conversation) from being silently
+    // treated as a name change.
 
     if (bareNameChange && !hasInlineName) {
       // ── Step 1: Ask for the new name ────────────────────────────────────
@@ -808,20 +804,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         return;
       }
 
-      addMessage(heardNewName, 'user');
-      let extracted = extractVisitorName(heardNewName) || heardNewName.trim();
-      extracted = extracted.replace(/[.!?]+$/, '').trim();
-      const cleanWords = extracted.split(/\s+/).filter(w =>
-        !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
-
-      if (cleanWords.length === 0) {
+      const extracted = extractVisitorName(heardNewName);
+      if (!extracted) {
         const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
         addMessage(cancelMsg, 'kiosk');
         speak(cancelMsg);
         return;
       }
 
-      extracted = cleanWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
+      addMessage(heardNewName, 'user');
 
       // ── Step 2: Confirm with voice OR double-blink ───────────────────────
       const confirmMsg = `Got it — should I call you ${extracted}? Say yes or blink twice to confirm, or say no to spell it out.`;
@@ -832,6 +823,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       // Helper: apply the final name to DB + session
       const applyName = async (finalName) => {
         setLocalName(finalName);
+        window.dispatchEvent(new CustomEvent('vrk_user_name_update', { detail: { userName: finalName } }));
         await fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(finalName), { method: 'POST' }).catch(() => {});
         const doneMsg = `Done! I have changed your name to ${finalName}. How may I assist you today?`;
         addMessage(doneMsg, 'kiosk');
@@ -1043,6 +1035,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const extractVisitorName = useCallback((raw) => {
     if (!raw) return '';
+    // Disqualify any string that contains eye emoji, blink, yes, no
+    if (/👁|\[Blinked|blink|twice/i.test(raw)) return '';
     let s = raw.trim();
     s = s.replace(/^(?:hi|hello|hey|nova|please|ok|okay)?[\s,.]*(?:my name is|i am called|call me|myself|i am|im|it's|its|this is)\s+/i, '');
     s = s.replace(/^(?:hi|hello|hey|nova|please)[\s,.]+/i, '');
@@ -1055,8 +1049,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }
     }
     const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
-    if (words.length === 0) return '';
-    // Guard: if the entire result is a single rejection/control word, return empty
+    if (words.length === 0 || words.length > 3) return '';
+    // Only accept strictly alphabetic words
+    if (!words.every(w => /^[a-zA-Z]+$/.test(w))) return '';
     const result = words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
     if (words.length === 1 && _REJECTION_WORDS.test(words[0])) return '';
     return result;
@@ -1065,8 +1060,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // ── Double Blink Listener for Yes/Confirm ──────────────────────────────
   const prevDoubleBlinkRef = useRef(0);
   // Latches a double-blink that fired while no prompt was active (e.g. while
-  // Nova is speaking). captureUtteranceText/captureYesNo consume it instantly
-  // on their next call so the blink is never silently lost.
+  // Nova is speaking). captureYesNo consumes it instantly so the blink is never lost.
   const pendingBlinkRef = useRef(false);
 
   useEffect(() => {
@@ -1074,15 +1068,22 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       prevDoubleBlinkRef.current = doubleBlink;
       console.log('[BLINK] Double blink detected!');
       if (activePromptResolverRef.current) {
-        // A prompt is already waiting — resolve it immediately
         const resolver = activePromptResolverRef.current;
-        activePromptResolverRef.current = null;
-        statusRef.current = 'ready';
-        setStatus('ready');
-        resolver('👁️ [Blinked twice — Yes]');
+        if (resolver.isYesNo) {
+          activePromptResolverRef.current = null;
+          statusRef.current = 'ready';
+          setStatus('ready');
+          resolver(true);
+        } else if (resolver.allowBlink) {
+          activePromptResolverRef.current = null;
+          statusRef.current = 'ready';
+          setStatus('ready');
+          resolver('__BLINK__');
+        } else {
+          console.log('[BLINK] Prompt is waiting for spoken name/text; latching blink for next prompt');
+          pendingBlinkRef.current = true;
+        }
       } else {
-        // No prompt active yet (Nova still speaking) — latch it so the
-        // NEXT captureUtteranceText/captureYesNo call picks it up instantly
         console.log('[BLINK] No resolver active — latching blink for next prompt');
         pendingBlinkRef.current = true;
       }
@@ -1091,27 +1092,27 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const wantsToGiveName = useCallback((text) => {
     if (!text) return false;
-    return /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will|blink|blinked)\b/i.test(text)
-      || text.includes('👁️') || text.toLowerCase().includes('blink');
+    return text === '__BLINK__'
+      || /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will|blink|blinked)\b/i.test(text);
   }, []);
 
   const isGuestOption = useCallback((text) => {
-    if (!text) return false;
+    if (!text || text === '__BLINK__') return false;
     return /\b(guest|guest mode|continue as guest|as guest|no name|anonymous|just guest)\b/i.test(text);
   }, []);
 
   const isContinueOption = useCallback((text) => {
-    if (!text) return false;
+    if (!text || text === '__BLINK__') return false;
     return /\b(skip|dont want|neither|no thanks|continue|just continue|start|just start|proceed|dont give)\b/i.test(text);
   }, []);
 
   // ── Voice prompt capture helpers (uses single persistent mic) ──────────
-  const captureUtteranceText = useCallback((timeoutMs = 25000) => {
+  const captureUtteranceText = useCallback((timeoutMs = 25000, allowBlink = false) => {
     return new Promise((resolve) => {
-      // If a double-blink was latched while Nova was speaking, consume it now
-      if (pendingBlinkRef.current) {
+      // Only consume latched blink if caller explicitly permits blinks
+      if (allowBlink && pendingBlinkRef.current) {
         pendingBlinkRef.current = false;
-        resolve('👁️ [Blinked twice — Yes]');
+        resolve('__BLINK__');
         return;
       }
       let timer = null;
@@ -1119,6 +1120,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (timer) clearTimeout(timer);
         resolve((text || '').trim());
       };
+      resolver.allowBlink = allowBlink;
+
       const checkTimeout = () => {
         // If user is currently speaking or audio is being transcribed (Whisper STT), keep waiting!
         if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
@@ -1144,7 +1147,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // Waits for a spoken "yes"/"no" response, double blink, or direct correction
   const captureYesNo = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
-      // If a double-blink was latched while Nova was speaking, consume it now
+      // If a double-blink was latched, consume it immediately as affirmative
       if (pendingBlinkRef.current) {
         pendingBlinkRef.current = false;
         resolve(true);
@@ -1153,8 +1156,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       let timer = null;
       const resolver = (rawText) => {
         if (timer) clearTimeout(timer);
+        if (typeof rawText === 'boolean') {
+          resolve(rawText);
+          return;
+        }
         const heard = (rawText || '').trim().toLowerCase();
-        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|blink|blinked)\b/i.test(heard) || heard.includes('👁️')) {
+        if (rawText === '__BLINK__' || /\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|blink|blinked)\b/i.test(heard)) {
           resolve(true);
         } else if (/\b(no|nope|nah|wrong|incorrect|not right|not that|different|change)\b/i.test(heard) || /don.?t/i.test(heard)) {
           resolve(false);
@@ -1164,6 +1171,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           resolve(null);
         }
       };
+      resolver.isYesNo = true;
+
       const checkTimeout = () => {
         // If user is currently speaking or audio is being transcribed, keep waiting!
         if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
@@ -1234,17 +1243,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!stillCurrent()) return;
 
         setNameStage('listening_name');
-        const heard = await captureUtteranceText(6000);
+        const heard = await captureUtteranceText(6000, true);
         if (!stillCurrent()) return;
 
         let choseGiveName = false;
         let directNameProvided = null;
 
         if (heard) {
-          addMessage(heard, 'user');
+          if (heard !== '__BLINK__') {
+            addMessage(heard, 'user');
+          }
 
           if (wantsToGiveName(heard)) {
-            // User affirmed verbally or with double-blink: e.g. "Yes", "👁️ [Blinked twice — Yes]"
+            // User affirmed verbally or with double-blink
             choseGiveName = true;
           } else if (isGuestOption(heard)) {
             // User chose Guest verbally
@@ -1318,8 +1329,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             const extractedName = extractVisitorName(heardSpokenName);
             if (extractedName && !_NAME_REJECTION.test(extractedName.trim())) {
               finalName = extractedName;
-            } else if (!_NAME_REJECTION.test(heardSpokenName.trim())) {
-              finalName = heardSpokenName.trim();
             } else {
               finalName = null; // will trigger the retry below
             }
@@ -1333,7 +1342,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             const retrySpoken = await captureUtteranceText(25000);
             if (retrySpoken) {
               addMessage(retrySpoken, 'user');
-              finalName = extractVisitorName(retrySpoken) || retrySpoken.trim();
+              const _NAME_REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
+              const ext = extractVisitorName(retrySpoken);
+              finalName = (ext && !_NAME_REJECTION.test(ext.trim())) ? ext : 'Friend';
             } else {
               finalName = 'Friend';
             }
@@ -1361,6 +1372,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
           addMessage(greetNamed, 'kiosk');
           setLocalName(finalName);
+          window.dispatchEvent(new CustomEvent('vrk_user_name_update', { detail: { userName: finalName } }));
           await submitVoiceName(finalName, true);
           await speakAndWait(greetNamed);
           if (stillCurrent()) startListening();
@@ -1368,8 +1380,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         } else if (confirmed === false || (typeof confirmed === 'string' && confirmed.length > 0)) {
           pendingCandidateNameRef.current = '';
           let correctedName = '';
+          const _REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
           if (typeof confirmed === 'string' && confirmed.length > 0 && !/\b(no|nope|nah|wrong|change|not)\b/i.test(confirmed)) {
-            correctedName = extractVisitorName(confirmed) || confirmed.trim();
+            const ext = extractVisitorName(confirmed);
+            correctedName = (ext && !_REJECTION.test(ext.trim())) ? ext : '';
           } else {
             setNameStage('asking');
             const retryMsg = "My apologies! Could you please spell out your name?";
@@ -1381,16 +1395,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             const retrySpokenName = await captureUtteranceText(25000);
             if (!stillCurrent()) return;
 
-            // Guard: never accept rejection/negation words as a name
-            const _REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
             const extracted = extractVisitorName(retrySpokenName);
             if (extracted && !_REJECTION.test(extracted.trim())) {
               correctedName = extracted;
-            } else if (retrySpokenName && retrySpokenName.trim().split(/\s+/).length > 1) {
-              // Multi-word response not matching rejection — treat as spelled name
-              correctedName = retrySpokenName.trim();
             } else {
-              // Still got a rejection word or silence — fall back to Guest rather than saving garbage
               correctedName = 'Guest';
             }
           }
@@ -1410,6 +1418,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           const changedMsg = `Done! Your name has been changed to ${correctedName}. How may I assist you today?`;
           addMessage(changedMsg, 'kiosk');
           setLocalName(correctedName);
+          window.dispatchEvent(new CustomEvent('vrk_user_name_update', { detail: { userName: correctedName } }));
           await submitVoiceName(correctedName, true);
           await speakAndWait(changedMsg);
           if (stillCurrent()) startListening();
@@ -1548,159 +1557,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
 
-  /* ── ANIMATED NOVA CHARACTER ─────────────────────────────────────────── */
-  const NovaCharacter = ({ st }) => (
-    <svg className={`nova-svg nova-${st}`} viewBox="0 0 320 500"
-      style={{ width: '100%', maxWidth: '340px', overflow: 'visible', display: 'block' }}>
-      <defs>
-        <linearGradient id="skinG" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#FFCFA0" /><stop offset="100%" stopColor="#F0A06A" />
-        </linearGradient>
-        <linearGradient id="suitG" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" />
-        </linearGradient>
-        <radialGradient id="shadowG" cx="50%" cy="50%">
-          <stop offset="0%" stopColor="#0000001a" /><stop offset="100%" stopColor="#00000000" />
-        </radialGradient>
-      </defs>
+  /* ── 3D NOVA AVATAR ACTIVE (replaces legacy SVG) ── */
 
-      {/* ── floor shadow ── */}
-      <ellipse cx="160" cy="498" rx="88" ry="11" fill="url(#shadowG)" />
-
-      {/* ════════ BODY (breathing group) ════════ */}
-      <g className="body-grp" style={{ transformOrigin: '160px 360px' }}>
-
-        {/* suit */}
-        <path d="M55 228 Q55 202 160 207 Q265 202 265 228 L270 460 Q160 474 50 460 Z" fill="url(#suitG)" />
-        {/* shirt */}
-        <path d="M130 207 L160 245 L190 207" fill="white" />
-        {/* lapels */}
-        <path d="M88 207 L130 207 L160 245 Q110 265 80 298 Z" fill="#152070" />
-        <path d="M232 207 L190 207 L160 245 Q210 265 240 298 Z" fill="#152070" />
-        {/* buttons */}
-        <circle cx="160" cy="280" r="4.5" fill="#3a4ec8" />
-        <circle cx="160" cy="308" r="4.5" fill="#3a4ec8" />
-        <circle cx="160" cy="336" r="4.5" fill="#3a4ec8" />
-        <line x1="160" y1="245" x2="160" y2="465" stroke="#0d1860" strokeWidth="1.5" />
-
-        {/* ── LEFT ARM (stays normal in all states) ── */}
-        <path d="M55 228 Q22 270 18 325 Q15 355 28 366"
-          stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
-        <ellipse cx="28" cy="372" rx="22" ry="15" fill="url(#skinG)" />
-
-        {/* ── RIGHT ARM — normal (hidden during processing) ── */}
-        {st !== 'processing' && <>
-          <path d="M265 228 Q298 270 302 325 Q305 355 292 366"
-            stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
-          <ellipse cx="292" cy="372" rx="22" ry="15" fill="url(#skinG)" />
-        </>}
-
-        {/* ── RIGHT ARM — thinking pose ── */}
-        {st === 'processing' && <>
-          <path className="arm-think" d="M265 228 Q288 212 272 176 Q264 158 244 152"
-            stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
-          <ellipse className="hand-think" cx="242" cy="158" rx="24" ry="15" fill="url(#skinG)" />
-        </>}
-      </g>{/* end body-grp */}
-
-      {/* ════════ HEAD (expression group) ════════ */}
-      <g className="head-grp" style={{ transformOrigin: '160px 120px' }}>
-
-        {/* neck */}
-        <rect x="145" y="175" width="30" height="38" rx="10" fill="url(#skinG)" />
-
-        {/* hair back */}
-        <path d="M74 158 Q68 86 108 44 Q133 16 160 13 Q187 16 212 44 Q252 86 246 158" fill="#2B1A0C" />
-        {/* head skin */}
-        <circle cx="160" cy="105" r="80" fill="url(#skinG)" />
-        {/* hair front */}
-        <path d="M80 86 Q92 34 160 28 Q228 34 240 86 Q218 48 160 46 Q102 48 80 86" fill="#2B1A0C" />
-        {/* hair sides */}
-        <path d="M80 86 Q66 124 70 170" stroke="#2B1A0C" strokeWidth="15" fill="none" strokeLinecap="round" />
-        <path d="M240 86 Q254 124 250 170" stroke="#2B1A0C" strokeWidth="15" fill="none" strokeLinecap="round" />
-
-        {/* ── EYE AREA ── */}
-        {/* whites */}
-        <ellipse cx="131" cy="106" rx="16" ry="17" fill="white" opacity="0.97" />
-        <ellipse cx="189" cy="106" rx="16" ry="17" fill="white" opacity="0.97" />
-        {/* iris */}
-        <circle className="iris-l" cx="133" cy="107" r="10" fill="#3A2010" />
-        <circle className="iris-r" cx="191" cy="107" r="10" fill="#3A2010" />
-        {/* pupil */}
-        <circle className="pupil-l" cx="134" cy="108" r="5.5" fill="#0C0706" />
-        <circle className="pupil-r" cx="192" cy="108" r="5.5" fill="#0C0706" />
-        {/* shine */}
-        <circle cx="136" cy="104" r="2.8" fill="white" />
-        <circle cx="194" cy="104" r="2.8" fill="white" />
-        {/* bottom lash line */}
-        <path d="M115 118 Q131 124 147 118" stroke="#2B1A0C" strokeWidth="1.5" fill="none" />
-        <path d="M173 118 Q189 124 205 118" stroke="#2B1A0C" strokeWidth="1.5" fill="none" />
-        {/* BLINK eyelids — animated via SMIL */}
-        <ellipse cx="131" cy="106" rx="16.5" ry="1" fill="url(#skinG)">
-          <animate attributeName="ry" values="1;1;1;1;1;1;1;1;1;18;1;1;1" dur="4.2s" repeatCount="indefinite" />
-        </ellipse>
-        <ellipse cx="189" cy="106" rx="16.5" ry="1" fill="url(#skinG)">
-          <animate attributeName="ry" values="1;1;1;1;1;1;1;1;1;18;1;1;1" dur="4.2s" begin="0.07s" repeatCount="indefinite" />
-        </ellipse>
-
-        {/* ── eyebrows ── */}
-        <path className={`brow-l ${st === 'processing' ? 'brow-think' : ''}`}
-          d="M 117 89 Q 131 82 145 89" stroke="#2B1A0C" strokeWidth="3.5" fill="none" strokeLinecap="round" />
-        <path className={`brow-r ${st === 'processing' ? 'brow-think' : ''}`}
-          d="M 175 89 Q 189 82 203 89" stroke="#2B1A0C" strokeWidth="3.5" fill="none" strokeLinecap="round" />
-
-        {/* nose */}
-        <path d="M157 120 Q152 132 154 136 Q159 140 165 136 Q168 132 163 120" fill="none" stroke="#D4906A" strokeWidth="1.5" />
-
-        {/* ── MOUTH states ── */}
-        {/* neutral smile */}
-        {st !== 'speaking' &&
-          <path d="M142 149 Q160 161 178 149" stroke="#B84055" strokeWidth="2.8" fill="none" strokeLinecap="round" />}
-        {/* talking — alternates via CSS */}
-        {st === 'speaking' && <>
-          <g className="mouth-a">
-            <path d="M143 149 Q160 163 177 149" fill="#B84055" stroke="#B84055" strokeWidth="2" strokeLinecap="round" />
-            <ellipse cx="160" cy="156" rx="14" ry="8" fill="#7B2030" />
-            <path d="M147 150 Q160 148 173 150" stroke="#FFBBC0" strokeWidth="1.5" fill="none" />
-          </g>
-          <g className="mouth-b">
-            <path d="M142 148 Q160 166 178 148" fill="#B84055" stroke="#B84055" strokeWidth="2" strokeLinecap="round" />
-            <ellipse cx="160" cy="158" rx="17" ry="11" fill="#7B2030" />
-            <path d="M147 149 Q160 147 173 149" stroke="#FFBBC0" strokeWidth="1.5" fill="none" />
-          </g>
-        </>}
-
-        {/* blush */}
-        <ellipse cx="108" cy="124" rx="17" ry="12" fill="#F4A0B0" opacity="0.28" />
-        <ellipse cx="212" cy="124" rx="17" ry="12" fill="#F4A0B0" opacity="0.28" />
-        {/* earrings */}
-        <circle cx="80" cy="113" r="5.5" fill="#FFD700" />
-        <circle cx="240" cy="113" r="5.5" fill="#FFD700" />
-
-        {/* ── SPEAKING sound waves (right of head) ── */}
-        {st === 'speaking' && <>
-          <path className="wave1" d="M250 92 Q264 105 250 118" stroke="#7c4dff" strokeWidth="3" fill="none" strokeLinecap="round" />
-          <path className="wave2" d="M260 80 Q278 105 260 130" stroke="#7c4dff" strokeWidth="2.5" fill="none" strokeLinecap="round" />
-          <path className="wave3" d="M270 68 Q292 105 270 142" stroke="#7c4dff" strokeWidth="2" fill="none" strokeLinecap="round" />
-        </>}
-
-        {/* ── LISTENING pulse ring ── */}
-        {st === 'listening' && <>
-          <circle cx="160" cy="105" r="92" fill="none" stroke="#43a047" strokeWidth="2.5" className="listen-r1" />
-          <circle cx="160" cy="105" r="92" fill="none" stroke="#43a047" strokeWidth="1.5" className="listen-r2" />
-        </>}
-
-        {/* ── THINKING bubble ── */}
-        {st === 'processing' && <>
-          <circle className="tbub" cx="226" cy="70" r="6" fill="rgba(255,255,255,0.88)" />
-          <circle className="tbub" cx="240" cy="54" r="10" fill="rgba(255,255,255,0.92)" />
-          <circle className="tbub" cx="258" cy="36" r="15" fill="rgba(255,255,255,0.96)" />
-          <text x="258" y="41" textAnchor="middle" fontSize="15" fill="#7e57c2" fontWeight="700">?</text>
-        </>}
-
-      </g>{/* end head-grp */}
-    </svg>
-  );
 
   /* background tint per state */
   const charBg = {
@@ -1871,9 +1729,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             </div>
           )}
 
-          {/* ── Nova SVG character ── */}
+          {/* ── Nova 3D Character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
-            <NovaCharacter st={status} />
+            <Nova3DAvatar st={status} />
           </div>
 
           {/* ── Name + status badge ── */}
