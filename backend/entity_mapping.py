@@ -527,6 +527,19 @@ def _build_verified_answers() -> dict[str, dict]:
                 f"The cultural fest of RNSIT is called {kb.get('academics', {}).get('cultural_fest', 'Aperture')}."
             ),
         },
+        "CAMPUS_FACILITIES": {
+            "name": "Campus Facilities Overview",
+            "type": "facility",
+            # Same wording/source as the "Campus Facilities Overview" RAG chunk
+            # in llm.py so the deterministic and retrieved answers never drift.
+            "answer": (
+                "RNSIT provides campus-wide facilities including "
+                + ", ".join(k.replace("_", " ").title() for k in facs.keys())
+                + ". Key facilities on campus include Central Library, Canteen, Shivaram Karanth Auditorium, "
+                "Boys and Girls Hostels, Gym, Sports Ground, Placement Cell, Medical & 24/7 Ambulance service, "
+                "Campus-wide Wi-Fi, Canara Bank ATM, Toyota Center of Excellence, and Student Counselling."
+            ),
+        },
         "CAPABILITIES": {
             "name": "Nova Capabilities",
             "type": "meta",
@@ -894,6 +907,8 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\btell\s+me\s+about\s+placements?\b"),
             re.compile(r"\bwho\s+recruits\b"),
             re.compile(r"\bplacement\s+record\b"),
+            re.compile(r"\b(?:what\s+is\s+the\s+)?placement\s+information\b"),
+            re.compile(r"\bplacement\s+details?\b"),
             re.compile(r"\bplacements?\b"),
         ],
     ),
@@ -914,6 +929,13 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\bwhere\s+is\s+cse\b"),
             re.compile(r"\bcse\s+block\b"),
             re.compile(r"\bcse\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?cse\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about|about)\s+cse\b"),
+            # Follow-up interest queries: 'I am interested in CSE', 'tell me more about CSE'
+            re.compile(r"\binterested\s+in\s+cse\b"),
+            re.compile(r"\bcse\s+(?:specifically|particularly|more)\b"),
+            re.compile(r"\bmore\s+(?:about|regarding|on)\s+cse\b"),
+            re.compile(r"\bcse\b.*\b(?:more|details?|specifically|particular)\b"),
         ],
     ),
     (
@@ -921,6 +943,52 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
         [
             re.compile(r"\b(?:cse\s+)?(?:ai\s*ml|aiml|ai\s+and\s+ml)\s+department\b"),
             re.compile(r"\bwhere\s+is\s+(?:ai\s*ml|aiml)\b"),
+            re.compile(r"\b(?:tell\s+me\s+about|about)\s+(?:ai\s*ml|aiml|ai\s+and\s+ml)\b"),
+        ],
+    ),
+    (
+        "ECE_DEPT",
+        [
+            re.compile(r"\b(?:electronics\s+(?:and|&)\s+communication(?:\s+engineering)?|ece)\b"),
+            re.compile(r"\bwhere\s+is\s+ece\b"),
+            re.compile(r"\bece\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?ece\b"),
+        ],
+    ),
+    (
+        "ISE_DEPT",
+        [
+            re.compile(r"\b(?:information\s+science(?:\s+and\s+engineering)?|ise)\b"),
+            re.compile(r"\bwhere\s+is\s+ise\b"),
+            re.compile(r"\bise\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?ise\b"),
+        ],
+    ),
+    (
+        "EEE_DEPT",
+        [
+            re.compile(r"\b(?:electrical\s+(?:and|&)\s+electronics(?:\s+engineering)?|eee)\b"),
+            re.compile(r"\bwhere\s+is\s+eee\b"),
+            re.compile(r"\beee\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?eee\b"),
+        ],
+    ),
+    (
+        "MECH_DEPT",
+        [
+            re.compile(r"\b(?:mechanical(?:\s+engineering)?|mech)\b"),
+            re.compile(r"\bwhere\s+is\s+mech(?:anical)?\b"),
+            re.compile(r"\bmech(?:anical)?\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?mech(?:anical)?\b"),
+        ],
+    ),
+    (
+        "CIVIL_DEPT",
+        [
+            re.compile(r"\bcivil(?:\s+engineering)?\b"),
+            re.compile(r"\bwhere\s+is\s+civil\b"),
+            re.compile(r"\bcivil\s+department\b"),
+            re.compile(r"\b(?:tell\s+me\s+about\s+|about\s+|info\s+on\s+)?civil\b"),
         ],
     ),
     (
@@ -998,6 +1066,14 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\bwhat\s+can\s+you\s+do\b"),
             re.compile(r"\bhow\s+can\s+you\s+help\b"),
             re.compile(r"\bwho\s+are\s+you\b"),
+        ],
+    ),
+    # Generic "what facilities does RNSIT provide?" — LAST on purpose: every
+    # specific facility rule above (library, hostel, gym, wifi, bus...) wins first.
+    (
+        "CAMPUS_FACILITIES",
+        [
+            re.compile(r"\b(?:facilit(?:y|ies)|amenit(?:y|ies))\b"),
         ],
     ),
 ]

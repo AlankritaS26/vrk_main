@@ -172,27 +172,60 @@ async def update_face_name_with_alias(face_id: str, new_name: str) -> bool:
         # First fetch the current name so we can archive it
         doc = await faces_collection.find_one({"face_id": face_id}, {"name": 1})
         if not doc:
-            logger.warning(f"[MongoDB] update_face_name_with_alias: face_id {face_id} not found")
-            return False
-        old_name = doc.get("name", "")
-        result = await faces_collection.update_one(
-            {"face_id": face_id},
-            {
-                "$set": {
-                    "name": new_name,
-                    "name_updated_at": datetime.now().isoformat(),
+            logger.info(f"[MongoDB] update_face_name_with_alias: face_id {face_id} not found, upserting record")
+            await faces_collection.update_one(
+                {"face_id": face_id},
+                {
+                    "$set": {
+                        "face_id": face_id,
+                        "name": new_name,
+                        "name_updated_at": datetime.now().isoformat(),
+                    }
                 },
-                # Push the old name into name_history (deduplicating with $addToSet)
-                "$addToSet": {"name_history": old_name} if old_name and old_name != new_name else {},
-            }
-        )
+                upsert=True
+            )
+            old_name = ""
+        else:
+            old_name = doc.get("name", "")
+            await faces_collection.update_one(
+                {"face_id": face_id},
+                {
+                    "$set": {
+                        "name": new_name,
+                        "name_updated_at": datetime.now().isoformat(),
+                    },
+                    # Push the old name into name_history (deduplicating with $addToSet)
+                    "$addToSet": {"name_history": old_name} if old_name and old_name != new_name else {},
+                }
+            )
+
         # Also sync user_name across sessions collection for this face_id
         await sessions_collection.update_many(
             {"face_id": face_id},
             {"$set": {"user_name": new_name}}
         )
-        logger.info(f"[MongoDB] Face name updated across DB: '{old_name}' -> '{new_name}' ({face_id[:8]})")
-        return result.matched_count > 0
+        # Also sync user_name across interactions collection for this face_id
+        await interactions_collection.update_many(
+            {"face_id": face_id},
+            {"$set": {"user_name": new_name}}
+        )
+
+        # Invalidate detection known_faces cache immediately
+        try:
+            from backend.detection import _load_known_faces, ST
+            _load_known_faces(force=True)
+            ST.set(identity=new_name, face_id=face_id)
+        except Exception as cache_ex:
+            logger.debug("[MongoDB] Detection cache invalidate note: %s", cache_ex)
+
+        # Verify persistence directly
+        verify_doc = await faces_collection.find_one({"face_id": face_id}, {"name": 1})
+        persisted = bool(verify_doc and verify_doc.get("name") == new_name)
+        if persisted:
+            logger.info(f"[MongoDB] Face name updated and verified across DB: '{old_name}' -> '{new_name}' ({face_id[:8]})")
+            return True
+        logger.error(f"[MongoDB] Verification failed for face_id {face_id[:8]} new_name='{new_name}'")
+        return False
     except Exception as e:
         logger.error(f"Error updating face name with alias: {e}")
         return False

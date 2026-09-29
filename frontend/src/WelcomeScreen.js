@@ -22,6 +22,52 @@ export const CONV_STATE = {
   INTERRUPTED: 'INTERRUPTED',
   GOODBYE: 'GOODBYE'
 };
+// Splits an answer into the same TTS sentence/clause chunks speakStream()
+// plays, sequentially. Pulled out to module scope and shared with
+// sendToBackend's "first chunk" prefetch below — they used to each keep
+// their own copy of this splitting logic, and only speakStream's copy had
+// the "merge a too-short first fragment into the next one" step. That
+// meant a title like "Dr." (a complete "sentence" to the [.!?] splitter)
+// got prefetched and synthesized on its own by the first-chunk request —
+// a wasted ~2s Kokoro call for 3 characters, e.g. "Dr. Ramesh Babu H S is
+// the current Principal..." — while speakStream's OWN sentences[0] (after
+// its merge step) was actually "Dr. Ramesh Babu H S is the current
+// Principal of RNSIT. Contact: ...", the mismatch also meaning the
+// prefetched "Dr."-only clip did not match what got played for chunk 0.
+// One shared function makes both places agree by construction.
+function buildTtsSentenceChunks(text) {
+  const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
+    .map(s => s.trim()).filter(Boolean);
+
+  const sentences = [];
+  if (raw.length) {
+    let first = raw[0];
+    if (first.length > 60) {
+      const cut = first.indexOf(',');
+      if (cut > 15) {
+        sentences.push(first.slice(0, cut + 1));
+        first = first.slice(cut + 1).trim();
+      }
+    }
+    if (first) sentences.push(first);
+    let buf = '';
+    for (let i = 1; i < raw.length; i++) {
+      buf = buf ? buf + ' ' + raw[i] : raw[i];
+      if (buf.length >= 90) { sentences.push(buf); buf = ''; }
+    }
+    if (buf) sentences.push(buf);
+  }
+
+  // Merge a too-short first fragment (an abbreviation like "Dr." caught by
+  // the sentence-boundary regex, not a real standalone clause) into the
+  // next chunk so it's never synthesized/spoken on its own.
+  if (sentences.length > 1 && sentences[0].length < 25) {
+    sentences[1] = sentences[0] + ' ' + sentences[1];
+    sentences.shift();
+  }
+
+  return sentences;
+}
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
@@ -832,8 +878,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     })
   ), [speak]);
 
+  // Legacy callback kept temporarily to avoid the merge artifact; the active flow uses the later callback below.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  const sendToBackend = useCallback(async (text) => {
+  const sendToBackendLegacy = useCallback(async (text) => {
     if (!text) return;
     setLiveText('');
     setProcessingHint('');
@@ -1087,6 +1134,19 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }
 
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
+      const tAnswerReceived = performance.now();
+      console.log(`[LATENCY] ANSWER_RECEIVED t=${tAnswerReceived.toFixed(1)}ms`, answer);
+
+      // Extracts just the first chunk — this is all the first TTS request
+      // needs to send; the rest is chunked+prefetched inside speakStream.
+      // Uses the SAME buildTtsSentenceChunks() speakStream uses for its
+      // own sentences[0], so this prefetch can never diverge from (or be
+      // a too-short throwaway fragment ahead of) what actually gets played.
+      const firstChunkText = (ans) => buildTtsSentenceChunks(ans)[0] || ans;
+
+      // Store full answer so resume intent can replay it on interruption
+      lastAnswerRef.current = answer;
+      wasInterruptedRef.current = false;
       fetch(BACKEND + '/message', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1707,7 +1767,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             choseGiveName = true;
           } else if (isGuestOption(heard) || isContinueOption(heard)) {
             setConvState(CONV_STATE.GUEST);
-          }
             const guestMsg = 'Continuing as Guest! How may I assist you today?';
             addMessage(guestMsg, 'kiosk');
             setLocalName('Guest');
