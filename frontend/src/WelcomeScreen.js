@@ -268,7 +268,27 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }]);
   }, [setMessages]);
 
-
+  // Creates a new chat bubble for `speaker` and returns a function that
+  // appends sentence-by-sentence text into it — keeps the on-screen text
+  // in sync with what the TTS is actually reading aloud.
+  const startProgressiveMessage = useCallback((speaker) => {
+    const msgId = Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+    setMessages(prev => [...prev, {
+      _id: msgId,
+      text: '',
+      speaker,
+      timestamp: new Date().toLocaleTimeString()
+    }]);
+    return (sentence) => {
+      if (!sentence) return;
+      const cleaned = cleanText(sentence);
+      setMessages(prev => prev.map(m =>
+        m._id === msgId
+          ? { ...m, text: m.text ? m.text + ' ' + cleaned : cleaned }
+          : m
+      ));
+    };
+  }, [setMessages]);
 
   // ── WAVEFORM ─────────────────────────────────────────────────────────────
   const stopWaveform = useCallback(() => {
@@ -467,6 +487,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     activeNodesRef.current.forEach((n) => { try { n.stop(); } catch (e) { /* already stopped */ } });
     activeNodesRef.current = [];
     window.speechSynthesis.cancel();        // in case the browser-voice fallback was speaking
+    window.__novaTtsActive = false;         // kill lipsync immediately on barge-in
     if (playCtxRef.current) playCursorRef.current = playCtxRef.current.currentTime;
     if (ttsGainRef.current && playCtxRef.current) {
       const now = playCtxRef.current.currentTime;
@@ -595,12 +616,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const fireStart = () => {
       if (hasStartedAvatar) return;
       hasStartedAvatar = true;
+      window.__novaTtsActive = true;   // tell the avatar animation loop that lipsync is live
       setStatus('speaking');    // avatar flips to "speaking" ONLY when first audio buffer starts
       if (onStart) { onStart(); onStart = null; }
     };
 
     const finish = () => {
       if (activeSpeakIdRef.current !== myId) return;
+      window.__novaTtsActive = false;  // lipsync off — mouth returns to rest
       isSpeaking.current = false;
       if (isMounted.current) startListening();
       setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
@@ -620,8 +643,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     if (!ttsAnalyserRef.current) {
       ttsAnalyserRef.current = pctx.createAnalyser();
-      ttsAnalyserRef.current.fftSize = 256;
-      ttsAnalyserRef.current.smoothingTimeConstant = 0.72;
+      ttsAnalyserRef.current.fftSize = 1024;          // more frequency bins → smoother envelope
+      ttsAnalyserRef.current.smoothingTimeConstant = 0.65;
+      // Wiring: source nodes → analyser → gain → destination
+      // (source nodes connect to analyser, not directly to gain)
       ttsAnalyserRef.current.connect(ttsGainRef.current);
       window.__novaTtsAnalyser = ttsAnalyserRef.current;
     }
@@ -782,7 +807,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             if (activeSpeakIdRef.current === myId) {
               const node = pctx.createBufferSource();
               node.buffer = clipData.buf;
-              node.connect(ttsGainRef.current);
+              // Route through analyser so the avatar's lipsync can read the live audio level.
+              // Chain: source → analyser → gain → destination
+              node.connect(ttsAnalyserRef.current || ttsGainRef.current);
               activeNodesRef.current.push(node);
 
               await new Promise((resolveEnd) => {

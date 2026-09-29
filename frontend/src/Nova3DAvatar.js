@@ -311,35 +311,54 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
           let audioLevel = 0;
           const analyser = window.__novaTtsAnalyser;
           if (window.__novaTtsActive && analyser) {
-            analyser.getByteTimeDomainData(audioSamples);
-            let sum = 0;
-            for (const sample of audioSamples) {
-              const centered = (sample - 128) / 128;
-              sum += centered * centered;
-            }
-            const rms = Math.sqrt(sum / audioSamples.length);
-            audioLevel = THREE.MathUtils.clamp((rms - 0.012) * 7.5, 0, 1);
+            // Frequency-band energy in the speech range (100–4000 Hz)
+            const freqData = new Uint8Array(analyser.frequencyBinCount);
+            analyser.getByteFrequencyData(freqData);
+            const sampleRate = analyser.context.sampleRate;
+            const binHz = sampleRate / analyser.fftSize;
+            const loIdx = Math.max(1, Math.round(100 / binHz));
+            const hiIdx = Math.min(freqData.length - 1, Math.round(4000 / binHz));
+            let sum = 0, count = 0;
+            for (let k = loIdx; k <= hiIdx; k++) { sum += freqData[k]; count++; }
+            const avgFreq = count > 0 ? sum / count : 0;
+            // Softer normalisation — keeps mouth in human range even for loud TTS
+            audioLevel = THREE.MathUtils.clamp((avgFreq - 8) / 140, 0, 1);
           }
-          const envelopeRate = audioLevel > speechEnvelope ? 28 : 12;
+          // Fast attack, slower decay — matches how lips open/close with syllables
+          const envelopeRate = audioLevel > speechEnvelope ? 35 : 14;
           speechEnvelope = THREE.MathUtils.lerp(speechEnvelope, audioLevel, delta * envelopeRate);
-          const voiced = speechEnvelope > 0.055;
+          const voiced = speechEnvelope > 0.05;
+
+          // ── Syllable-rhythm jaw ────────────────────────────────────────────
+          // Rather than constant-open, the jaw pulses open/closed at a rate
+          // that tracks speech energy (~4–7 syllables/sec). At rest between
+          // syllables the jaw naturally returns toward closed.
           visemeTimer -= delta;
           if (visemeTimer <= 0) {
-            visemeTimer = 0.075 + Math.random() * 0.1;
+            // 80–180 ms per syllable group — faster when more energetic speech
+            const sylRate = 0.08 + (1 - speechEnvelope) * 0.10;
+            visemeTimer = sylRate + Math.random() * 0.04;
             if (currentViseme) setMorphWeight(currentViseme, 0);
-            currentViseme      = VISEME_SEQUENCE[Math.floor(Math.random() * VISEME_SEQUENCE.length)];
-            targetVisemeWeight = voiced ? 0.04 + speechEnvelope * (0.08 + Math.random() * 0.1) : 0;
+            // Lip-shape visemes at low weight — subtle, not dominant
+            currentViseme = VISEME_SEQUENCE[Math.floor(Math.random() * VISEME_SEQUENCE.length)];
+            targetVisemeWeight = voiced ? 0.03 + speechEnvelope * 0.07 : 0;
           }
           if (!voiced) targetVisemeWeight = 0;
-          currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, targetVisemeWeight, delta * 30);
-          targetJawWeight     = voiced ? 0.02 + speechEnvelope * 0.34 : 0;
-          currentJawWeight    = THREE.MathUtils.lerp(currentJawWeight, targetJawWeight, delta * (voiced ? 24 : 15));
+          currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, targetVisemeWeight, delta * 28);
+
+          // Jaw: resting ~0, normal speech ~0.20–0.30, stressed vowel up to 0.38
+          const jawPulse = voiced ? Math.max(0, Math.sin(elapsed * (5 + speechEnvelope * 3)) * 0.5 + 0.5) : 0;
+          targetJawWeight  = voiced ? (0.05 + speechEnvelope * 0.26) * (0.55 + jawPulse * 0.45) : 0;
+          currentJawWeight = THREE.MathUtils.lerp(currentJawWeight, targetJawWeight, delta * (voiced ? 28 : 22));
+
           if (currentViseme) setMorphWeight(currentViseme, currentVisemeWeight);
-          setMorphWeight('jawOpen', currentJawWeight);
-          setMorphWeight('mouthOpen', currentJawWeight * 0.28);
-          smileWeight = THREE.MathUtils.lerp(smileWeight, 0.3, delta * 4);
+          // Cap at 0.38 — visible, natural, not cartoon-wide
+          const clampedJaw = Math.min(currentJawWeight, 0.38);
+          setMorphWeight('jawOpen', clampedJaw);
+          setMorphWeight('mouthOpen', clampedJaw * 0.22);
+          smileWeight = THREE.MathUtils.lerp(smileWeight, 0.22, delta * 3);
           setMorphWeight('mouthSmile', smileWeight);
-          setMorphWeight('browInnerUp', 0.15 + Math.sin(elapsed * 4) * 0.1);
+          setMorphWeight('browInnerUp', 0.10 + Math.sin(elapsed * 3.5) * 0.06);
         } else {
           if (currentViseme) { setMorphWeight(currentViseme, 0); currentViseme = ''; }
           currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, 0, delta * 15);
