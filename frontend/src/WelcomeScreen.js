@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createKioskMic, float32ToInt16 } from './kioskMic';
 import { normalizeSpelledName, resolveSingleLetter, isSpellingSkipOrGuest } from './utils/spellingNormalizer';
+import Nova3DAvatar from './Nova3DAvatar';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
@@ -60,6 +61,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
   const lastAnswerRef = useRef('');              // stores the most recent full answer text for resume-on-interrupt
   const wasInterruptedRef = useRef(false);       // true if TTS was barged-in before it finished — triggers "want to continue?" offer
+  const ttsAnalyserRef = useRef(null);           // live TTS level for the 3D avatar mouth
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -120,6 +122,54 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
 
+  // ── QR Companion & Escalation States ──
+  const [companionToken, setCompanionToken] = useState(null);
+  const [companionUrl, setCompanionUrl] = useState('');
+  const [showCompanionModal, setShowCompanionModal] = useState(false);
+  const [escalationState, setEscalationState] = useState(null); // null | 'pending' | 'connected' | 'timeout'
+  const [escalationMsg, setEscalationMsg] = useState('');
+
+  useEffect(() => {
+    if (!session?.session_id) {
+      setCompanionToken(null);
+      setCompanionUrl('');
+      return;
+    }
+    fetch(BACKEND + '/companion/token', { method: 'POST' })
+      .then(r => r.json())
+      .then(d => {
+        if (d?.token) {
+          setCompanionToken(d.token);
+          setCompanionUrl(d.url);
+        }
+      })
+      .catch(() => {});
+  }, [session?.session_id]);
+
+  const handleRequestEscalation = async () => {
+    try {
+      setEscalationState('pending');
+      setEscalationMsg('Connecting you to front desk staff…');
+      await fetch(BACKEND + '/escalation/request', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'user_request' }),
+      });
+    } catch (err) {
+      console.error('[ESCALATION] Request failed:', err);
+    }
+  };
+
+  const handleCancelEscalation = async () => {
+    setEscalationState(null);
+    const sid = session?.session_id;
+    if (sid) {
+      try {
+        await fetch(`${BACKEND}/escalation/cancel/${sid}`, { method: 'POST' });
+      } catch (e) { /* silent */ }
+    }
+  };
+
   // The backend composes the greeting (it knows resume-vs-new and the
   // institute intro line); these local strings are only a fallback.
   const greeting = session?.greeting || (isReturning
@@ -164,6 +214,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const cleanText = (t) => (t || '').replace(/\u2014|\u2013/g, ', ').replace(/\s+,/g, ',');
 
   const addMessage = useCallback((text, speaker) => {
+    if (!text || text === '__BLINK__' || /👁|\[Blinked/i.test(text)) return;
     text = cleanText(text);
     setMessages(prev => [...prev, {
       text, speaker,
@@ -521,6 +572,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ttsGainRef.current = pctx.createGain();
       ttsGainRef.current.connect(pctx.destination);
     }
+    if (!ttsAnalyserRef.current) {
+      ttsAnalyserRef.current = pctx.createAnalyser();
+      ttsAnalyserRef.current.fftSize = 256;
+      ttsAnalyserRef.current.smoothingTimeConstant = 0.72;
+      ttsAnalyserRef.current.connect(ttsGainRef.current);
+      window.__novaTtsAnalyser = ttsAnalyserRef.current;
+    }
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
 
@@ -600,6 +658,31 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         const buf = await pctx.decodeAudioData(bytes.buffer);
         const tDecoded = performance.now();
         return { buf, tReq, tAudioRecv, tDecoded };
+        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
+        const node = pctx.createBufferSource();
+        node.buffer = buf;
+        node.connect(ttsAnalyserRef.current || ttsGainRef.current);
+        activeNodesRef.current.push(node);
+        node.onended = () => {
+          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+        };
+
+        const at = Math.max(pctx.currentTime, playCursorRef.current);
+        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
+        node.start(at);
+        playCursorRef.current = at + buf.duration;
+
+        // Fire onStart/onSentence exactly when THIS clip's audio begins —
+        // if it's scheduled to start later than "now" (queued behind an
+        // earlier clip that's still playing), wait for that moment instead
+        // of firing immediately, so text and voice stay in lockstep.
+        const announce = () => {
+          fireStart();                                     // status + first-clip-only hook
+          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
+          resolveStarted();
+        };
+        if (delayMs > 0) setTimeout(announce, delayMs);
+        else announce();
       } catch (e) {
         console.warn('[TTS] Fetch or decode error for sentence:', sentenceText, e);
         return { buf: null, tReq, tAudioRecv: performance.now(), tDecoded: performance.now() };
@@ -725,17 +808,314 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   // Promise-returning wrapper: resolves once THIS utterance has fully
   // finished playing. Pauses the mic during prompts to prevent speaker echo.
+  // Safety: a 15-second hard timeout always resumes the mic even if TTS
+  // hangs or SpeechSynthesis never fires onend (e.g. Kokoro slow to load,
+  // browser voice unavailable). Without this the mic stays paused forever.
   const speakAndWait = useCallback((text, onStart) => (
     new Promise((resolve) => {
-      micRef.current?.pause();
-      speak(text, onStart, () => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
         if (isMounted.current && micRef.current) {
           micRef.current.resume();
         }
         resolve();
+      };
+      micRef.current?.pause();
+      // Hard timeout — always resume listening even if TTS never finishes
+      const safetyTimer = setTimeout(done, 15000);
+      speak(text, onStart, () => {
+        clearTimeout(safetyTimer);
+        done();
       });
     })
   ), [speak]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const sendToBackend = useCallback(async (text) => {
+    if (!text) return;
+    setLiveText('');
+    setProcessingHint('');
+    const sid = session?.session_id || 'guest';
+    addMessage(text, 'user');
+
+    if (escalationState && /\b(?:stop|cancel|never mind|nevermind|back|continue|dont connect|no staff)\b/i.test(text)) {
+      setEscalationState(null);
+    }
+
+    // ── Check if visitor is affirming a pending name confirmation ──────
+    const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
+      || /\b(?:yes that is my name|yes that is correct|yes that is me|thats my name|that's my name)\b/i.test(text.trim());
+    if (pendingCandidateNameRef.current && isAffirmation) {
+      const confirmedName = pendingCandidateNameRef.current;
+      pendingCandidateNameRef.current = '';
+      setLocalName(confirmedName);
+      await submitVoiceName(confirmedName, true);
+      const greetNamed = `Great to meet you, ${confirmedName}! How may I assist you today?`;
+      addMessage(greetNamed, 'kiosk');
+      speak(greetNamed);
+      return;
+    }
+
+    // ── Mid-session bare "change my name" prompt (no name given yet) ──────
+    // Explicit "change my name to X" / "call me X" patterns are handled by
+    // the backend _deterministic_route via /ask below — do NOT early-return
+    // for those, or save_interaction will be skipped and the DB won't log it.
+    const bareNameChange = /\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text)
+      || /\b(?:i want to|can i|can you|please|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text);
+
+    // Only fire the interactive prompt when NO name was provided inline
+    const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
+      || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
+
+    const isQuestionText = text.includes('?') || /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod|contact|address|course|branch|branches|syllabus|exam|seat|cutoff|rnsit|college|campus|building|block|canteen|sports)\b/i.test(text);
+
+    // NOTE: We do NOT auto-accept single or multi-word blurts as a name change.
+    // Names are only updated when the visitor uses an explicit phrase like
+    // "my name is X", "call me X", "change my name to X", or goes through the
+    // bareNameChange interactive flow below. This prevents random words like
+    // "okay", "yes", "Akshay Dao" (said mid-conversation) from being silently
+    // treated as a name change.
+
+    if (bareNameChange && !hasInlineName) {
+      // ── Step 1: Ask for the new name ────────────────────────────────────
+      const promptChange = 'Sure! What should I change your name to?';
+      addMessage(promptChange, 'kiosk');
+      await speakAndWait(promptChange);
+      const heardNewName = await captureUtteranceText(25000);
+
+      if (!heardNewName) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
+      }
+
+      const extracted = extractVisitorName(heardNewName);
+      if (!extracted) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
+      }
+
+      addMessage(heardNewName, 'user');
+
+      // ── Step 2: Confirm with voice OR double-blink ───────────────────────
+      const confirmMsg = `Got it — should I call you ${extracted}? Say yes or blink twice to confirm, or say no to spell it out.`;
+      addMessage(confirmMsg, 'kiosk');
+      await speakAndWait(confirmMsg);
+      const confirmed = await captureYesNo(25000);
+
+      // Helper: apply the final name to DB + session
+      const applyName = async (finalName) => {
+        setLocalName(finalName);
+        window.dispatchEvent(new CustomEvent('vrk_user_name_update', { detail: { userName: finalName } }));
+        await fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(finalName), { method: 'POST' }).catch(() => {});
+        const doneMsg = `Done! I have changed your name to ${finalName}. How may I assist you today?`;
+        addMessage(doneMsg, 'kiosk');
+        speak(doneMsg);
+      };
+
+      // ── Helper: letter-by-letter spelling mode ────────────────────────────
+      // Nova echoes each letter as it is heard so the visitor can track
+      // progress. Phonetic alphabet (alpha/bravo/charlie…) is also accepted.
+      const runSpellingMode = async () => {
+        const PHONETIC = {
+          alpha:'a', bravo:'b', charlie:'c', delta:'d', echo:'e', foxtrot:'f',
+          golf:'g', hotel:'h', india:'i', juliet:'j', kilo:'k', lima:'l',
+          mike:'m', november:'n', oscar:'o', papa:'p', quebec:'q', romeo:'r',
+          sierra:'s', tango:'t', uniform:'u', victor:'v', whiskey:'w',
+          xray:'x', 'x-ray':'x', yankee:'y', zulu:'z',
+        };
+        const spellPrompt = 'Sure! Please spell out your name — say each letter one at a time. Say "done" when you are finished.';
+        addMessage(spellPrompt, 'kiosk');
+        await speakAndWait(spellPrompt);
+
+        let spelled = '';
+        let attempts = 0;
+        while (attempts < 25) {
+          const letter = await captureUtteranceText(7000);
+          if (!letter) break;
+
+          const t = letter.trim().toLowerCase();
+          // Finish words
+          if (/^(done|finish|finished|that.?s it|stop|end|complete|that.?s all|ok done)$/i.test(t)) break;
+
+          let ch = '';
+          if (t.length === 1 && /[a-z]/.test(t)) {
+            ch = t.toUpperCase();
+          } else if (PHONETIC[t]) {
+            ch = PHONETIC[t].toUpperCase();
+          } else if (/^[a-z]\s/i.test(t)) {
+            // e.g. STT returns "P." or "P " for a single letter
+            ch = t[0].toUpperCase();
+          }
+
+          if (ch) {
+            spelled += ch;
+            const soFar = spelled.split('').join('-');
+            const echoMsg = `${ch}. So far: ${soFar}`;
+            addMessage(echoMsg, 'kiosk');
+            speak(echoMsg);
+          } else {
+            // Unrecognised syllable — ask them to repeat
+            const retryMsg = "Sorry, I did not catch that letter. Please say it again.";
+            addMessage(retryMsg, 'kiosk');
+            speak(retryMsg);
+          }
+          attempts++;
+        }
+
+        if (spelled.length === 0) return;
+
+        // Capitalise first letter, rest lowercase
+        const spelledName = spelled.charAt(0).toUpperCase() + spelled.slice(1).toLowerCase();
+
+        // Final confirmation after spelling
+        const spelledConfirmMsg = `I have ${spelledName}. Is that correct? Say yes or blink twice.`;
+        addMessage(spelledConfirmMsg, 'kiosk');
+        await speakAndWait(spelledConfirmMsg);
+        const spelledOk = await captureYesNo(12000);
+
+        if (spelledOk !== false) {
+          // Accept on yes, double-blink, or timeout (visitor stayed silent)
+          await applyName(spelledName);
+        } else {
+          const giveUpMsg = 'No problem — I will keep your name as it is for now. You can try again anytime.';
+          addMessage(giveUpMsg, 'kiosk');
+          speak(giveUpMsg);
+        }
+      };
+
+      if (confirmed === true) {
+        // Voice "yes" or double-blink confirmed
+        await applyName(extracted);
+      } else if (
+        confirmed === false ||
+        (typeof confirmed === 'string' && /\b(no|nope|wrong|spell|spelling|incorrect|not right)\b/i.test(confirmed))
+      ) {
+        // User said no / "spell it" — enter spelling mode
+        await runSpellingMode();
+      } else {
+        // captureYesNo timed out (null) — accept the heard name
+        await applyName(extracted);
+      }
+      return;
+    }
+
+    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
+    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
+      const farewells = [
+        'You are most welcome! Have a wonderful day. Goodbye!',
+        'Happy to help! Take care and have a great day.',
+        'Anytime! Wishing you a lovely day ahead. Goodbye!',
+        'My pleasure! All the best, and see you around campus.',
+      ];
+      const farewell = farewells[Math.floor(Math.random() * farewells.length)];
+      micRef.current?.pause();
+      farewellPlayingRef.current = true;     // protect this audio from the session_end stop
+
+      // Switch to the goodbye screen NOW so the farewell voice plays OVER it
+      // (they should appear together). The audio uses Web Audio, which keeps
+      // playing across this component unmounting — and farewellPlayingRef
+      // keeps the session_end handler from stopping it. We clear the flag
+      // when the voice actually finishes.
+      speak(farewell, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => { });
+      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell, userName: localName || session?.user_name } }));   // goodbye screen appears now
+      return;
+    }
+
+    // Set BEFORE the ack fires: from this point until the real answer's
+    // speech actually starts (or the request fails/is dropped), finish()
+    // in speakStream will treat any in-between "ready" moment (e.g. the ack
+    // finishing early) as still 'processing' — see awaitingAnswerRef above.
+    awaitingAnswerRef.current = true;
+
+    // INSTANT ACKNOWLEDGMENT: a real receptionist reacts the moment you
+    // finish speaking — not after a silent pause. We play a short filler
+    // right away while the actual answer is still being fetched, so there's
+    // never dead air with a spinner. Kept short so it doesn't collide with
+    // the real answer. Skipped for very short/greeting-like inputs.
+    const acks = [
+      'Sure, let me check that for you.',
+      'Good question — one moment.',
+      'Let me look that up for you.',
+      'Of course, just a second.',
+      'Right, let me find that.',
+    ];
+    const isInstantCmd = hasInlineName || bareNameChange ||
+      /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+
+    if (!isInstantCmd && text.split(' ').length >= 3) {
+      const ack = acks[Math.floor(Math.random() * acks.length)];
+      speak(ack, () => setProcessingHint(ack));
+    } else {
+      setProcessingHint('Thinking...');
+      statusRef.current = 'processing';
+      setStatus('processing');
+    }
+
+    // 35 s hard cap — prevents status getting stuck at 'processing' if the
+    // LLM is slow or the network drops after the request was sent.
+    const askController = new AbortController();
+    const askTimeout = setTimeout(() => askController.abort(), 35000);
+    try {
+      const [, askRes] = await Promise.all([
+        fetch(BACKEND + '/message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
+        }),
+        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text),
+          { signal: askController.signal })
+      ]);
+      clearTimeout(askTimeout);
+      const data = await askRes.json();
+
+      // STALE-ANSWER GUARD: only drop if sessions are distinct and neither is guest
+      const liveSid = sessionRef.current?.session_id || 'guest';
+      if (data.dropped || (sid !== 'guest' && liveSid !== 'guest' && liveSid !== sid)) {
+        console.info('[sendToBackend] dropped stale answer for', sid);
+        awaitingAnswerRef.current = false;
+        isSpeaking.current = false;
+        setProcessingHint('');
+        setStatus('ready');
+        return;
+      }
+
+      const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
+      fetch(BACKEND + '/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
+      });
+
+      // Clear processing hint when answer arrives
+      setProcessingHint('');
+
+      let appendSentence = null;
+      speakStream(answer, {
+        onStart: () => {
+          awaitingAnswerRef.current = false;   // real answer is speaking now — resting state is 'ready' again
+          setProcessingHint('');
+          appendSentence = startProgressiveMessage('kiosk');
+        },
+        onSentence: (sentence) => { if (appendSentence) appendSentence(sentence); },
+      });
+    } catch (e) {
+      clearTimeout(askTimeout);
+      awaitingAnswerRef.current = false;
+      setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
+      console.error('[sendToBackend]', e);
+      const fallback = e.name === 'AbortError'
+        ? "I'm sorry, that's taking longer than expected. Please try asking again."
+        : 'Sorry, something went wrong. Please try again.';
+      speak(fallback, () => addMessage(fallback, 'kiosk'));
+    }
+  }, [session, addMessage, speakStream, startProgressiveMessage]);
 
   // ── Helper parsing for name & guest choices ──
   // Words that must NEVER be treated as a visitor name regardless of context.
@@ -743,6 +1123,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const extractVisitorName = useCallback((raw) => {
     if (!raw) return '';
+    // Disqualify any string that contains eye emoji, blink, yes, no
+    if (/👁|\[Blinked|blink|twice/i.test(raw)) return '';
     let s = raw.trim();
     s = s.replace(/^(?:hi|hello|hey|nova|please|ok|okay)?[\s,.]*(?:my name is|i am called|call me|myself|i am|im|it's|its|this is)\s+/i, '');
     s = s.replace(/^(?:hi|hello|hey|nova|please)[\s,.]+/i, '');
@@ -755,8 +1137,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }
     }
     const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
-    if (words.length === 0) return '';
-    // Guard: if the entire result is a single rejection/control word, return empty
+    if (words.length === 0 || words.length > 3) return '';
+    // Only accept strictly alphabetic words
+    if (!words.every(w => /^[a-zA-Z]+$/.test(w))) return '';
     const result = words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
     if (words.length === 1 && _REJECTION_WORDS.test(words[0])) return '';
     return result;
@@ -765,8 +1148,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // ── Double Blink Listener for Yes/Confirm ──────────────────────────────
   const prevDoubleBlinkRef = useRef(0);
   // Latches a double-blink that fired while no prompt was active (e.g. while
-  // Nova is speaking). captureUtteranceText/captureYesNo consume it instantly
-  // on their next call so the blink is never silently lost.
+  // Nova is speaking). captureYesNo consumes it instantly so the blink is never lost.
   const pendingBlinkRef = useRef(false);
 
   useEffect(() => {
@@ -774,39 +1156,51 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       prevDoubleBlinkRef.current = doubleBlink;
       console.log('[BLINK] Double blink detected!');
       if (activePromptResolverRef.current) {
-        // A prompt is already waiting — resolve it immediately
         const resolver = activePromptResolverRef.current;
-        activePromptResolverRef.current = null;
-        statusRef.current = 'ready';
-        setStatus('ready');
-        resolver('👁️ [Blinked twice — Yes]');
+        if (resolver.isYesNo) {
+          activePromptResolverRef.current = null;
+          statusRef.current = 'ready';
+          setStatus('ready');
+          resolver(true);
+        } else if (resolver.allowBlink) {
+          activePromptResolverRef.current = null;
+          statusRef.current = 'ready';
+          setStatus('ready');
+          resolver('__BLINK__');
+        } else {
+          console.log('[BLINK] Prompt is waiting for spoken name/text; latching blink for next prompt');
+          pendingBlinkRef.current = true;
+        }
       } else {
-        // No prompt active yet (Nova still speaking) — latch it so the
-        // NEXT captureUtteranceText/captureYesNo call picks it up instantly
         console.log('[BLINK] No resolver active — latching blink for next prompt');
         pendingBlinkRef.current = true;
       }
     }
   }, [doubleBlink]);
 
+  const wantsToGiveName = useCallback((text) => {
+    if (!text) return false;
+    return text === '__BLINK__'
+      || /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will|blink|blinked)\b/i.test(text);
+  }, []);
 
   const isGuestOption = useCallback((text) => {
-    if (!text) return false;
+    if (!text || text === '__BLINK__') return false;
     return /\b(guest|guest mode|continue as guest|as guest|no name|anonymous|just guest)\b/i.test(text);
   }, []);
 
   const isContinueOption = useCallback((text) => {
-    if (!text) return false;
+    if (!text || text === '__BLINK__') return false;
     return /\b(skip|dont want|neither|no thanks|continue|just continue|start|just start|proceed|dont give)\b/i.test(text);
   }, []);
 
   // ── Voice prompt capture helpers (uses single persistent mic) ──────────
-  const captureUtteranceText = useCallback((timeoutMs = 25000) => {
+  const captureUtteranceText = useCallback((timeoutMs = 25000, allowBlink = false) => {
     return new Promise((resolve) => {
-      // If a double-blink was latched while Nova was speaking, consume it now
-      if (pendingBlinkRef.current) {
+      // Only consume latched blink if caller explicitly permits blinks
+      if (allowBlink && pendingBlinkRef.current) {
         pendingBlinkRef.current = false;
-        resolve('👁️ [Blinked twice — Yes]');
+        resolve('__BLINK__');
         return;
       }
       let timer = null;
@@ -814,6 +1208,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (timer) clearTimeout(timer);
         resolve((text || '').trim());
       };
+      resolver.allowBlink = allowBlink;
+
       const checkTimeout = () => {
         // If user is currently speaking or audio is being transcribed (Whisper STT), keep waiting!
         if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
@@ -838,7 +1234,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // Waits for a spoken "yes"/"no" response, double blink, or direct correction
   const captureYesNo = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
-      // If a double-blink was latched while Nova was speaking, consume it now
+      // If a double-blink was latched, consume it immediately as affirmative
       if (pendingBlinkRef.current) {
         pendingBlinkRef.current = false;
         resolve(true);
@@ -847,8 +1243,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       let timer = null;
       const resolver = (rawText) => {
         if (timer) clearTimeout(timer);
+        if (typeof rawText === 'boolean') {
+          resolve(rawText);
+          return;
+        }
         const heard = (rawText || '').trim().toLowerCase();
-        if (/\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|blink|blinked)\b/i.test(heard) || heard.includes('👁️')) {
+        if (rawText === '__BLINK__' || /\b(yes|yeah|yep|yup|sure|ok|okay|please|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|blink|blinked)\b/i.test(heard)) {
           resolve(true);
         } else if (/\b(no|nope|nah|wrong|incorrect|not right|not that|different|change)\b/i.test(heard) || /don.?t/i.test(heard)) {
           resolve(false);
@@ -858,6 +1258,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           resolve(null);
         }
       };
+      resolver.isYesNo = true;
+
       const checkTimeout = () => {
         // If user is currently speaking or audio is being transcribed, keep waiting!
         if (isListening.current || statusRef.current === 'processing' || statusRef.current === 'listening') {
@@ -1297,11 +1699,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (!stillCurrent()) return;
 
         if (heard) {
-          addMessage(heard, 'user');
+          if (heard !== '__BLINK__') {
+            addMessage(heard, 'user');
+          }
 
-          if (isGuestOption(heard) || isContinueOption(heard)) {
-            // User chose Guest
+          if (wantsToGiveName(heard)) {
+            choseGiveName = true;
+          } else if (isGuestOption(heard) || isContinueOption(heard)) {
             setConvState(CONV_STATE.GUEST);
+          }
             const guestMsg = 'Continuing as Guest! How may I assist you today?';
             addMessage(guestMsg, 'kiosk');
             setLocalName('Guest');
@@ -1477,6 +1883,21 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             if (updatedName && updatedName !== 'Guest' && updatedName !== 'Unknown') {
               setLocalName(updatedName);
             }
+          } else if (msg.type === 'companion_qr') {
+            if (msg.token) setCompanionToken(msg.token);
+            if (msg.url) setCompanionUrl(msg.url);
+          } else if (msg.type === 'escalation_pending') {
+            setEscalationState('pending');
+            setEscalationMsg(msg.message || 'Connecting you to front desk staff…');
+          } else if (msg.type === 'escalation_connected') {
+            setEscalationState('connected');
+            setEscalationMsg(msg.message || 'A staff member has connected!');
+          } else if (msg.type === 'escalation_timeout') {
+            setEscalationState('timeout');
+            setEscalationMsg(msg.message || 'No staff available right now. Nova will continue helping you.');
+            setTimeout(() => setEscalationState(null), 6000);
+          } else if (msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') {
+            setEscalationState(null);
           }
         } catch (_) { }
       };
@@ -1488,159 +1909,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
 
-  /* ── ANIMATED NOVA CHARACTER ─────────────────────────────────────────── */
-  const NovaCharacter = ({ st }) => (
-    <svg className={`nova-svg nova-${st}`} viewBox="0 0 320 500"
-      style={{ width: '100%', maxWidth: '340px', overflow: 'visible', display: 'block' }}>
-      <defs>
-        <linearGradient id="skinG" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#FFCFA0" /><stop offset="100%" stopColor="#F0A06A" />
-        </linearGradient>
-        <linearGradient id="suitG" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stopColor="#1e2e96" /><stop offset="100%" stopColor="#0d1860" />
-        </linearGradient>
-        <radialGradient id="shadowG" cx="50%" cy="50%">
-          <stop offset="0%" stopColor="#0000001a" /><stop offset="100%" stopColor="#00000000" />
-        </radialGradient>
-      </defs>
+  /* ── 3D NOVA AVATAR ACTIVE (replaces legacy SVG) ── */
 
-      {/* ── floor shadow ── */}
-      <ellipse cx="160" cy="498" rx="88" ry="11" fill="url(#shadowG)" />
-
-      {/* ════════ BODY (breathing group) ════════ */}
-      <g className="body-grp" style={{ transformOrigin: '160px 360px' }}>
-
-        {/* suit */}
-        <path d="M55 228 Q55 202 160 207 Q265 202 265 228 L270 460 Q160 474 50 460 Z" fill="url(#suitG)" />
-        {/* shirt */}
-        <path d="M130 207 L160 245 L190 207" fill="white" />
-        {/* lapels */}
-        <path d="M88 207 L130 207 L160 245 Q110 265 80 298 Z" fill="#152070" />
-        <path d="M232 207 L190 207 L160 245 Q210 265 240 298 Z" fill="#152070" />
-        {/* buttons */}
-        <circle cx="160" cy="280" r="4.5" fill="#3a4ec8" />
-        <circle cx="160" cy="308" r="4.5" fill="#3a4ec8" />
-        <circle cx="160" cy="336" r="4.5" fill="#3a4ec8" />
-        <line x1="160" y1="245" x2="160" y2="465" stroke="#0d1860" strokeWidth="1.5" />
-
-        {/* ── LEFT ARM (stays normal in all states) ── */}
-        <path d="M55 228 Q22 270 18 325 Q15 355 28 366"
-          stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
-        <ellipse cx="28" cy="372" rx="22" ry="15" fill="url(#skinG)" />
-
-        {/* ── RIGHT ARM — normal (hidden during processing) ── */}
-        {st !== 'processing' && <>
-          <path d="M265 228 Q298 270 302 325 Q305 355 292 366"
-            stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
-          <ellipse cx="292" cy="372" rx="22" ry="15" fill="url(#skinG)" />
-        </>}
-
-        {/* ── RIGHT ARM — thinking pose ── */}
-        {st === 'processing' && <>
-          <path className="arm-think" d="M265 228 Q288 212 272 176 Q264 158 244 152"
-            stroke="#1e2e96" strokeWidth="44" fill="none" strokeLinecap="round" />
-          <ellipse className="hand-think" cx="242" cy="158" rx="24" ry="15" fill="url(#skinG)" />
-        </>}
-      </g>{/* end body-grp */}
-
-      {/* ════════ HEAD (expression group) ════════ */}
-      <g className="head-grp" style={{ transformOrigin: '160px 120px' }}>
-
-        {/* neck */}
-        <rect x="145" y="175" width="30" height="38" rx="10" fill="url(#skinG)" />
-
-        {/* hair back */}
-        <path d="M74 158 Q68 86 108 44 Q133 16 160 13 Q187 16 212 44 Q252 86 246 158" fill="#2B1A0C" />
-        {/* head skin */}
-        <circle cx="160" cy="105" r="80" fill="url(#skinG)" />
-        {/* hair front */}
-        <path d="M80 86 Q92 34 160 28 Q228 34 240 86 Q218 48 160 46 Q102 48 80 86" fill="#2B1A0C" />
-        {/* hair sides */}
-        <path d="M80 86 Q66 124 70 170" stroke="#2B1A0C" strokeWidth="15" fill="none" strokeLinecap="round" />
-        <path d="M240 86 Q254 124 250 170" stroke="#2B1A0C" strokeWidth="15" fill="none" strokeLinecap="round" />
-
-        {/* ── EYE AREA ── */}
-        {/* whites */}
-        <ellipse cx="131" cy="106" rx="16" ry="17" fill="white" opacity="0.97" />
-        <ellipse cx="189" cy="106" rx="16" ry="17" fill="white" opacity="0.97" />
-        {/* iris */}
-        <circle className="iris-l" cx="133" cy="107" r="10" fill="#3A2010" />
-        <circle className="iris-r" cx="191" cy="107" r="10" fill="#3A2010" />
-        {/* pupil */}
-        <circle className="pupil-l" cx="134" cy="108" r="5.5" fill="#0C0706" />
-        <circle className="pupil-r" cx="192" cy="108" r="5.5" fill="#0C0706" />
-        {/* shine */}
-        <circle cx="136" cy="104" r="2.8" fill="white" />
-        <circle cx="194" cy="104" r="2.8" fill="white" />
-        {/* bottom lash line */}
-        <path d="M115 118 Q131 124 147 118" stroke="#2B1A0C" strokeWidth="1.5" fill="none" />
-        <path d="M173 118 Q189 124 205 118" stroke="#2B1A0C" strokeWidth="1.5" fill="none" />
-        {/* BLINK eyelids — animated via SMIL */}
-        <ellipse cx="131" cy="106" rx="16.5" ry="1" fill="url(#skinG)">
-          <animate attributeName="ry" values="1;1;1;1;1;1;1;1;1;18;1;1;1" dur="4.2s" repeatCount="indefinite" />
-        </ellipse>
-        <ellipse cx="189" cy="106" rx="16.5" ry="1" fill="url(#skinG)">
-          <animate attributeName="ry" values="1;1;1;1;1;1;1;1;1;18;1;1;1" dur="4.2s" begin="0.07s" repeatCount="indefinite" />
-        </ellipse>
-
-        {/* ── eyebrows ── */}
-        <path className={`brow-l ${st === 'processing' ? 'brow-think' : ''}`}
-          d="M 117 89 Q 131 82 145 89" stroke="#2B1A0C" strokeWidth="3.5" fill="none" strokeLinecap="round" />
-        <path className={`brow-r ${st === 'processing' ? 'brow-think' : ''}`}
-          d="M 175 89 Q 189 82 203 89" stroke="#2B1A0C" strokeWidth="3.5" fill="none" strokeLinecap="round" />
-
-        {/* nose */}
-        <path d="M157 120 Q152 132 154 136 Q159 140 165 136 Q168 132 163 120" fill="none" stroke="#D4906A" strokeWidth="1.5" />
-
-        {/* ── MOUTH states ── */}
-        {/* neutral smile */}
-        {st !== 'speaking' &&
-          <path d="M142 149 Q160 161 178 149" stroke="#B84055" strokeWidth="2.8" fill="none" strokeLinecap="round" />}
-        {/* talking — alternates via CSS */}
-        {st === 'speaking' && <>
-          <g className="mouth-a">
-            <path d="M143 149 Q160 163 177 149" fill="#B84055" stroke="#B84055" strokeWidth="2" strokeLinecap="round" />
-            <ellipse cx="160" cy="156" rx="14" ry="8" fill="#7B2030" />
-            <path d="M147 150 Q160 148 173 150" stroke="#FFBBC0" strokeWidth="1.5" fill="none" />
-          </g>
-          <g className="mouth-b">
-            <path d="M142 148 Q160 166 178 148" fill="#B84055" stroke="#B84055" strokeWidth="2" strokeLinecap="round" />
-            <ellipse cx="160" cy="158" rx="17" ry="11" fill="#7B2030" />
-            <path d="M147 149 Q160 147 173 149" stroke="#FFBBC0" strokeWidth="1.5" fill="none" />
-          </g>
-        </>}
-
-        {/* blush */}
-        <ellipse cx="108" cy="124" rx="17" ry="12" fill="#F4A0B0" opacity="0.28" />
-        <ellipse cx="212" cy="124" rx="17" ry="12" fill="#F4A0B0" opacity="0.28" />
-        {/* earrings */}
-        <circle cx="80" cy="113" r="5.5" fill="#FFD700" />
-        <circle cx="240" cy="113" r="5.5" fill="#FFD700" />
-
-        {/* ── SPEAKING sound waves (right of head) ── */}
-        {st === 'speaking' && <>
-          <path className="wave1" d="M250 92 Q264 105 250 118" stroke="#7c4dff" strokeWidth="3" fill="none" strokeLinecap="round" />
-          <path className="wave2" d="M260 80 Q278 105 260 130" stroke="#7c4dff" strokeWidth="2.5" fill="none" strokeLinecap="round" />
-          <path className="wave3" d="M270 68 Q292 105 270 142" stroke="#7c4dff" strokeWidth="2" fill="none" strokeLinecap="round" />
-        </>}
-
-        {/* ── LISTENING pulse ring ── */}
-        {st === 'listening' && <>
-          <circle cx="160" cy="105" r="92" fill="none" stroke="#43a047" strokeWidth="2.5" className="listen-r1" />
-          <circle cx="160" cy="105" r="92" fill="none" stroke="#43a047" strokeWidth="1.5" className="listen-r2" />
-        </>}
-
-        {/* ── THINKING bubble ── */}
-        {st === 'processing' && <>
-          <circle className="tbub" cx="226" cy="70" r="6" fill="rgba(255,255,255,0.88)" />
-          <circle className="tbub" cx="240" cy="54" r="10" fill="rgba(255,255,255,0.92)" />
-          <circle className="tbub" cx="258" cy="36" r="15" fill="rgba(255,255,255,0.96)" />
-          <text x="258" y="41" textAnchor="middle" fontSize="15" fill="#7e57c2" fontWeight="700">?</text>
-        </>}
-
-      </g>{/* end head-grp */}
-    </svg>
-  );
 
   /* background tint per state */
   const charBg = {
@@ -1780,9 +2050,40 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             </div>
           )}
 
-          {/* ── Nova SVG character ── */}
+          {/* ── Always-Visible Hands-Free QR Companion Card ── */}
+          {companionToken && (
+            <div style={{
+              position: 'absolute', top: '16px', left: '16px', zIndex: 10,
+              background: 'rgba(255, 255, 255, 0.92)', backdropFilter: 'blur(12px)',
+              borderRadius: '16px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: '12px',
+              boxShadow: '0 8px 24px rgba(26, 35, 126, 0.12)', border: '1.5px solid rgba(224, 228, 255, 0.95)',
+              animation: 'fadeIn 0.5s ease'
+            }}>
+              <img
+                src={`${BACKEND}/companion/qr/${companionToken}`}
+                alt="Companion QR"
+                style={{ width: '70px', height: '70px', borderRadius: '10px', border: '1px solid #c7cbe8', background: '#fff', padding: '3px', objectFit: 'contain' }}
+              />
+              <div style={{ display: 'flex', flexDirection: 'column' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+                  <span style={{ fontSize: '13px' }}>📱</span>
+                  <span style={{ fontSize: '11.5px', fontWeight: '800', color: '#1a237e', textTransform: 'uppercase', letterSpacing: '0.4px' }}>
+                    Phone Companion
+                  </span>
+                </div>
+                <div style={{ fontSize: '11px', color: '#1e293b', fontWeight: '700', marginTop: '3px' }}>
+                  Scan with smartphone
+                </div>
+                <div style={{ fontSize: '10px', color: '#64748b', marginTop: '2px', lineHeight: '1.3', maxWidth: '140px' }}>
+                  Take <strong>Visit Summary</strong> &amp; <strong>PDF Brochures</strong> with you
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── Nova 3D Character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
-            <NovaCharacter st={status} />
+            <Nova3DAvatar st={status} />
           </div>
 
           {/* ── Name + status badge ── */}
@@ -1980,6 +2281,193 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       </div>
 
+      {/* ── ESCALATION MODAL / OVERLAY ── */}
+      {escalationState && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 100,
+          background: 'rgba(15, 23, 42, 0.75)', backdropFilter: 'blur(8px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
+        }}>
+          <div style={{
+            background: '#ffffff', borderRadius: '20px', maxWidth: '440px', width: '100%',
+            padding: '32px 28px', textAlign: 'center', boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
+            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
+          }}>
+            {escalationState === 'pending' && (
+              <>
+                <div style={{
+                  width: '64px', height: '64px', margin: '0 auto 18px', borderRadius: '50%',
+                  border: '4px solid #e0e7ff', borderTopColor: '#4338ca',
+                  animation: 'spin 1s linear infinite',
+                }} />
+                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#1e1b4b', marginBottom: '8px' }}>
+                  Connecting to Front Desk
+                </h2>
+                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
+                  {escalationMsg || 'A front desk reception team member has been alerted to assist you directly at this kiosk.'}
+                </p>
+                <div style={{
+                  background: 'linear-gradient(135deg, #eef2ff, #f0fdf4)',
+                  borderRadius: '14px', padding: '14px 16px', marginBottom: '16px',
+                  border: '1px solid #c7d2fe', textAlign: 'left',
+                }}>
+                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#4338ca', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
+                    📞 Front Desk &amp; Campus Helpline
+                  </div>
+                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#1e1b4b', marginBottom: '3px' }}>
+                    +91 80286 11880 / 81 / 82
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#3730a3' }}>
+                    Admissions Helpline: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
+                  </div>
+                </div>
+                <div style={{
+                  background: '#f0f9ff', borderRadius: '12px', padding: '12px 16px',
+                  fontSize: '13px', color: '#0369a1', border: '1px solid #bae6fd',
+                  fontWeight: '600',
+                }}>
+                  🎤 Say <strong>"Stop"</strong> anytime to return to Nova
+                </div>
+              </>
+            )}
+
+            {escalationState === 'connected' && (
+              <>
+                <div style={{ fontSize: '56px', marginBottom: '16px' }}>🤝</div>
+                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#065f46', marginBottom: '8px' }}>
+                  Staff Member Connected!
+                </h2>
+                <p style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', marginBottom: '20px' }}>
+                  {escalationMsg || 'A front desk team member is now assisting you.'}
+                </p>
+                <div style={{
+                  background: '#f0fdf4', borderRadius: '12px', padding: '12px 16px',
+                  fontSize: '13px', color: '#15803d', border: '1px solid #bbf7d0',
+                  fontWeight: '600',
+                }}>
+                  🎤 Say <strong>&ldquo;Stop&rdquo;</strong> to return to Nova
+                </div>
+              </>
+            )}
+
+            {escalationState === 'timeout' && (
+              <>
+                <div style={{ fontSize: '56px', marginBottom: '16px' }}>⏳</div>
+                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#92400e', marginBottom: '8px' }}>
+                  Staff Currently Occupied
+                </h2>
+                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
+                  {escalationMsg || 'Front desk staff members are currently assisting other visitors. Nova will gladly continue answering your questions!'}
+                </p>
+                <div style={{
+                  background: 'linear-gradient(135deg, #fef3c7, #fffbeb)',
+                  borderRadius: '14px', padding: '14px 16px', marginBottom: '18px',
+                  border: '1px solid #fde68a', textAlign: 'left',
+                }}>
+                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
+                    📞 Direct Contact Numbers
+                  </div>
+                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#78350f', marginBottom: '3px' }}>
+                    +91 80286 11880 / 81 / 82
+                  </div>
+                  <div style={{ fontSize: '12px', color: '#92400e' }}>
+                    Admissions Desk: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
+                  </div>
+                </div>
+                <div style={{
+                  background: '#fffbeb', borderRadius: '12px', padding: '10px 16px',
+                  fontSize: '13px', color: '#92400e', border: '1px solid #fde68a',
+                  fontWeight: '600',
+                }}>
+                  🎤 Say anything to continue with Nova
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── QR COMPANION MODAL ── */}
+      {showCompanionModal && (
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 90,
+          background: 'rgba(15, 23, 42, 0.7)', backdropFilter: 'blur(8px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
+        }}>
+          <div style={{
+            background: '#ffffff', borderRadius: '24px', maxWidth: '440px', width: '100%',
+            padding: '30px', textAlign: 'center', boxShadow: '0 25px 60px rgba(0,0,0,0.3)',
+            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <span style={{ fontSize: '24px' }}>📱</span>
+                <span style={{ fontSize: '17px', fontWeight: '800', color: '#1a237e' }}>Phone Companion</span>
+              </div>
+              <button
+                onClick={() => setShowCompanionModal(false)}
+                style={{
+                  border: 'none', background: '#f1f5f9', borderRadius: '50%', width: '32px', height: '32px',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer',
+                  color: '#64748b', fontSize: '16px', fontWeight: '700',
+                }}
+              >
+                ✕
+              </button>
+            </div>
+
+            <p style={{ fontSize: '13px', color: '#64748b', lineHeight: '1.5', marginBottom: '20px' }}>
+              Scan this QR code with your phone camera to take your conversation recap, useful links, and official brochures with you.
+            </p>
+
+            {companionToken ? (
+              <div style={{
+                display: 'inline-block', padding: '12px', background: '#f8fafc',
+                borderRadius: '16px', border: '1.5px solid #e2e8f0', marginBottom: '16px',
+              }}>
+                <img
+                  src={`${BACKEND}/companion/qr/${companionToken}`}
+                  alt="Companion QR Code"
+                  style={{ width: '190px', height: '190px', display: 'block', borderRadius: '8px' }}
+                />
+              </div>
+            ) : (
+              <div style={{
+                height: '190px', display: 'flex', alignItems: 'center', justifyContent: 'center',
+                background: '#f8fafc', borderRadius: '16px', color: '#94a3b8', fontSize: '14px', marginBottom: '16px',
+              }}>
+                Generating QR code…
+              </div>
+            )}
+
+            <div style={{
+              display: 'flex', flexDirection: 'column', gap: '6px', background: '#f1f5f9',
+              borderRadius: '12px', padding: '12px', textAlign: 'left', fontSize: '11px', color: '#475569',
+              marginBottom: '20px',
+            }}>
+              <div>✅ <strong>Session Summary:</strong> Instant recap of topics discussed</div>
+              <div>📄 <strong>Official Brochure:</strong> Direct PDF download on your device</div>
+              <div>⏱️ <strong>Session Window:</strong> Valid for 20 minutes</div>
+            </div>
+
+            {companionUrl && (
+              <a
+                href={companionUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{
+                  display: 'block', width: '100%', padding: '11px 0', borderRadius: '12px',
+                  background: '#1a237e', color: '#fff', textDecoration: 'none',
+                  fontSize: '13px', fontWeight: '700', textAlign: 'center',
+                }}
+              >
+                Open Companion Link Directly
+              </a>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* ── FLOATING CAMERA PIP ── */}
       <div style={{
         position: 'fixed', bottom: '16px', right: '16px', width: '80px', height: '80px',
@@ -2000,6 +2488,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         /* ── message bubble spring-in ── */
         .msg-in { animation: msgIn 0.2s cubic-bezier(0.18,0.89,0.32,1.28) both; }
         @keyframes msgIn { from{opacity:0;transform:translateY(5px) scale(0.97)} to{opacity:1;transform:none} }
+        @keyframes spin { to { transform: rotate(360deg); } }
 
         /* ── typing dots ── */
         .td { display:inline-block; width:7px; height:7px; border-radius:50%; background:#c5cae9;

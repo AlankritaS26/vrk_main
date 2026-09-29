@@ -20,6 +20,7 @@ college_collection = db["college_profile"]  # Stores RNSIT details / FAQs
 faces_collection = db["faces"]              # Stores face embeddings/IDs
 sessions_collection = db["sessions"]        # Track active/inactive kiosk sessions
 interactions_collection = db["interactions"]# Chat history logs
+escalations_collection = db["escalations"]  # Human-handover escalation records
 
 # ── NEW (Confidence-RAG / Admin Knowledge-Update Loop) ─────────────────
 # unanswered_questions: LOW-confidence queries that were judged RNSIT-
@@ -614,6 +615,71 @@ async def delete_knowledge_entry(entry_id: str) -> bool:
         return res.deleted_count > 0
     except Exception as e:
         logger.error(f"[DB] delete_knowledge_entry failed: {e}")
+async def save_escalation(
+    session_id: str,
+    face_id: str | None,
+    user_name: str,
+    reason: str,
+    transcript: list | None = None,
+) -> str:
+    """
+    Persists a new escalation record to MongoDB.
+    Returns the escalation _id as a string.
+    """
+    try:
+        now = datetime.now().isoformat()
+        doc = {
+            "session_id":  session_id,
+            "face_id":     face_id or "",
+            "user_name":   user_name or "Guest",
+            "reason":      reason,
+            "transcript":  transcript or [],
+            "status":      "STAFF_NOTIFIED",
+            "created_at":  now,
+            "updated_at":  now,
+            "resolved_at": None,
+            "resolution":  None,
+            "staff_id":    None,
+        }
+        result = await escalations_collection.insert_one(doc)
+        logger.info("[DB] Escalation saved: session=%s reason=%s", session_id[:8], reason)
+        return str(result.inserted_id)
+    except Exception as e:
+        logger.error("[DB] save_escalation failed: %s", e)
+        return ""
+
+
+async def resolve_escalation(
+    session_id: str,
+    resolution: str = "resolved",
+    staff_id: str | None = None,
+) -> bool:
+    """Marks an open escalation as resolved and records the outcome."""
+    try:
+        now = datetime.now().isoformat()
+        # Motor's update_one does not support 'sort' — find the newest open
+        # escalation for this session first, then update by _id.
+        doc = await escalations_collection.find_one(
+            {"session_id": session_id, "status": {"$in": ["STAFF_NOTIFIED", "STAFF_CONNECTED"]}},
+            sort=[("created_at", -1)],
+        )
+        if not doc:
+            return False
+        res = await escalations_collection.update_one(
+            {"_id": doc["_id"]},
+            {
+                "$set": {
+                    "status":      "RESOLVED",
+                    "resolved_at": now,
+                    "updated_at":  now,
+                    "resolution":  resolution,
+                    "staff_id":    staff_id or "",
+                }
+            },
+        )
+        return res.matched_count > 0
+    except Exception as e:
+        logger.error("[DB] resolve_escalation failed: %s", e)
         return False
 
 
@@ -626,6 +692,8 @@ async def ensure_indexes():
         await unanswered_collection.create_index("question_id", unique=True)
         await unanswered_collection.create_index([("status", 1), ("ask_count", -1)])
         await knowledge_entries_collection.create_index("entry_id", unique=True)
+        await escalations_collection.create_index("session_id")
+        await escalations_collection.create_index([("status", 1), ("created_at", -1)])
         logger.info("[DB] Indexes ensured.")
     except Exception as e:
         logger.warning(f"[DB] ensure_indexes: {e}")

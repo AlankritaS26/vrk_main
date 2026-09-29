@@ -178,7 +178,7 @@ MATCH_MARGIN    = float(os.getenv("FACE_MATCH_MARGIN", "0.05"))     # best must 
 _DEFAULT_CONT = "0.58" if _ENGINE == "arcface" else "0.28"
 CONTINUITY_DIST = float(os.getenv("SESSION_CONTINUITY_DISTANCE", _DEFAULT_CONT))
 DWELL_REQUIRED  = float(os.getenv("DWELL_REQUIRED", "0.7"))
-DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "3.5"))     # 3.5s face absence tolerance before 'Are you there?' prompt
+DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "6.0"))     # 6s face absence tolerance before 'Are you there?' prompt (raised from 3.5s)
 COOLDOWN        = float(os.getenv("DETECT_COOLDOWN", "2.0"))   # 2s cooldown between sessions
 RECHECK_EVERY   = float(os.getenv("SESSION_RECHECK_INTERVAL", "2.0"))
 RECOG_ABSENCE_GRACE = float(os.getenv("RECOG_ABSENCE_GRACE", "2.5"))
