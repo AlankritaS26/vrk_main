@@ -48,3 +48,8 @@ onnxruntime==1.20.1
 # working on every machine (dropping these also removes TensorFlow,
 # ~350 MB, and the tf-keras/GL headaches on Linux/WSL):
 #   deepface, tf-keras
+
+# ── QR Companion feature ──
+qrcode[pil]==8.0                 # server-side QR image fallback + URL encoding
+reportlab==4.4.1                 # placeholder + dynamic brochure PDF generation
+Pillow>=10.0.0                   # required by qrcode[pil] (likely already installed)

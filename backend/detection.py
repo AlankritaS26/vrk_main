@@ -5,18 +5,78 @@ VRK / RNSIT Digital Receptionist
 RECEPTIONIST MODEL
 ------------------
   PERSON  = face_id     minted ONCE, at first quality-gated enrolment.
-  VISIT   = session_id  owned by the backend; a known face returning
-                        within 30 days RESUMES its previous session_id.
+  VISIT   = session_id  owned by the backend; every fresh detection starts
+                        a brand-new session thread (see main.py).
 
   One visitor is served at a time. Bystanders are detected and ignored:
   the largest face above a size floor is the PRIMARY visitor and holds
   the session until they leave. A different face never inherits a live
   session — it ends the session instead.
 
+  NOTE — "largest face" doubles as "nearest person": a closer visitor's
+  face occupies more of the frame than someone standing further back, so
+  the largest-bbox-wins rule already prioritises whoever is nearest the
+  kiosk when several people are in frame. No separate depth sensor needed.
+
 STATE MACHINE
 -------------
   IDLE -> DWELLING -> RECOGNIZING -> {ACTIVE | ENROLLING -> ACTIVE}
   ACTIVE -> DEPARTING -> (return within grace) ACTIVE | COOLDOWN -> IDLE
+
+GENERATION GUARD
+-----------------
+Recognition/enrolment run in background threads against a frame snapshot
+taken a moment earlier. If the visitor leaves (or a different person steps
+in) before that thread finishes, its result is stale and must NOT be
+committed — otherwise you get "asked for a name into an empty frame" or
+"greeted the wrong person". Every time presence is lost during
+DWELLING/RECOGNIZING/ENROLLING, `ST.generation` is bumped; workers check
+their captured generation before committing ACTIVE/ENROLLING state and
+bail out silently if it no longer matches.
+
+STUCK-STATE WATCHDOG
+---------------------
+`_spawn()` silently no-ops if a worker from the previous visit is still
+finishing up (`ST.busy` still True — e.g. a `_recheck_worker` that hasn't
+cleared its flag yet). Previously the DWELLING->RECOGNIZING transition set
+`state="RECOGNIZING"` *before* checking whether the spawn actually
+succeeded, so a failed spawn left the visitor stuck on "Identifying..."
+forever with no worker ever running for that generation, and the only way
+out was for them to walk away and re-trigger DWELLING from scratch (which
+is what produced the repeated "N known faces loaded" logspam — every
+retry re-hit the backend). Fixed below: state only advances to
+RECOGNIZING/ENROLLING when a worker is actually running, and a watchdog
+force-resets to IDLE if we're ever caught in RECOGNIZING/ENROLLING with
+no worker in flight.
+
+BLINK DETECTION (experimental)
+-------------------------------
+A lightweight eye-aspect-ratio (EAR) blink detector runs on the same
+FaceLandmarker output used for presence/recognition — no extra model.
+It's exposed on DetectionResult as `blink` (a fresh, debounced blink
+event, true for one frame only) purely for the frontend to use as an
+optional "yes" gesture (e.g. confirming "would you like me to remember
+you?"). It never drives the state machine itself — recognition/session
+flow is untouched.
+
+VOICE-FIRST NAME REGISTRATION (register_or_resume_face)
+---------------------------------------------------------
+The camera-driven ENROLLING path above (_enroll_worker) is only one way a
+visitor's name reaches the system now — main.py's /visitor/submit_name is
+called directly by the new voice-input name flow (WelcomeScreen.js), fully
+independently of DWELLING/RECOGNIZING/ENROLLING. That endpoint used to only
+update session/DB name fields and NEVER called /faces/register itself (by
+design — to avoid racing _enroll_worker's real camera-captured embedding).
+The result: a guest's name was saved for the current visit only; no
+embedding ever landed in `faces` collection, so next visit they were
+"unknown" again.
+
+register_or_resume_face() is the shared fix: given a name and whatever live
+anchor embedding ST already holds for the current visitor, it either links
+the name to an already-registered face (duplicate hard block, same rule
+_enroll_worker uses) or mints+registers a brand-new face_id. main.py calls
+this from /visitor/submit_name, /visitor/rename, and the mid-conversation
+"change my name" route — see the main.py snippet.
 
 All mutable state lives in KioskState behind one lock. No naked globals.
 """
@@ -41,7 +101,12 @@ from mediapipe.tasks.python import vision as mp_vision
 #   PRIMARY : backend/recognition.py -> SCRFD + ArcFace (buffalo_l ONNX) run
 #             directly on onnxruntime. No `insightface` pip package, so no MS
 #             C++ Build Tools, on any OS. Same models, same accuracy.
-#   FALLBACK: DeepFace, only if onnxruntime/models are unavailable.
+#   FALLBACK: DeepFace, only if onnxruntime/models are unavailable. Only this
+#             fallback path re-detects with its own internal detector
+#             (`DEEPFACE_DETECTOR`) — the ArcFace path always reuses the
+#             MediaPipe landmarks captured during presence detection instead
+#             (see `extract_embedding`'s fast path), so there is no redundant
+#             detector running when _ENGINE == "arcface".
 _ENGINE = "none"
 try:
     from backend import recognition as RECOG
@@ -80,9 +145,9 @@ _ensure_model()
 _lm_opts = mp_vision.FaceLandmarkerOptions(
     base_options=mp_tasks.BaseOptions(model_asset_path=_MODEL_PATH),
     running_mode=mp_vision.RunningMode.IMAGE,
-    num_faces=4,                      # see bystanders so we can IGNORE them
-    min_face_detection_confidence=0.6,
-    min_face_presence_confidence=0.6,
+    num_faces=5,                      # see bystanders so we can IGNORE them and select nearest face
+    min_face_detection_confidence=0.5,
+    min_face_presence_confidence=0.5,
     min_tracking_confidence=0.5,
 )
 try:
@@ -104,24 +169,24 @@ if _ENGINE == "arcface" and not RECOG.is_available():
 print(f"[DETECT] recognition engine = {_ENGINE}", flush=True)
 
 # ─── Tunables (all env-overridable; calibrate on-site) ────────────────────────
-MIN_FACE_FRAC   = float(os.getenv("MIN_FACE_FRAC", "0.020"))   # ~2% of frame ≈ 1 m.
-                                                               # NOT 15% — that is
-                                                               # nose-on-glass and
-                                                               # detects nobody.
+MIN_FACE_FRAC   = float(os.getenv("MIN_FACE_FRAC", "0.015"))   # 1.5% of frame for fast pickup at distance
 # ArcFace similarities run lower than Facenet512's: same-person pairs land
-# ~0.45-0.75, different-person ~0.0-0.25. Default 0.55 => verified at sim>=0.45.
-_DEFAULT_MATCH = "0.55" if _ENGINE == "arcface" else "0.30"
+# ~0.45-0.75, different-person ~0.0-0.25. Default 0.58 => verified at sim>=0.42.
+_DEFAULT_MATCH = "0.58" if _ENGINE == "arcface" else "0.30"
 MATCH_DISTANCE  = float(os.getenv("FACE_MATCH_DISTANCE", _DEFAULT_MATCH))
-MATCH_MARGIN    = float(os.getenv("FACE_MATCH_MARGIN", "0.06"))     # best must beat 2nd best
-_DEFAULT_CONT = "0.60" if _ENGINE == "arcface" else "0.28"
+MATCH_MARGIN    = float(os.getenv("FACE_MATCH_MARGIN", "0.05"))     # best must beat 2nd best
+_DEFAULT_CONT = "0.58" if _ENGINE == "arcface" else "0.28"
 CONTINUITY_DIST = float(os.getenv("SESSION_CONTINUITY_DISTANCE", _DEFAULT_CONT))
 DWELL_REQUIRED  = float(os.getenv("DWELL_REQUIRED", "0.7"))
-DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "5.5"))      # bag/phone/companion tolerance
-COOLDOWN        = float(os.getenv("DETECT_COOLDOWN", "6.0"))
+DEPART_GRACE    = float(os.getenv("DEPART_GRACE", "6.0"))     # 6s face absence tolerance before 'Are you there?' prompt (raised from 3.5s)
+COOLDOWN        = float(os.getenv("DETECT_COOLDOWN", "2.0"))   # 2s cooldown between sessions
 RECHECK_EVERY   = float(os.getenv("SESSION_RECHECK_INTERVAL", "2.0"))
+RECOG_ABSENCE_GRACE = float(os.getenv("RECOG_ABSENCE_GRACE", "2.5"))
 SWAP_STREAK     = int(os.getenv("SWAP_STREAK", "3"))           # frames before believing a swap
 ENROLL_TEMPLATES = int(os.getenv("ENROLL_TEMPLATES", "3"))     # multi-template enrolment
-NAME_WAIT_SECS  = float(os.getenv("NAME_WAIT_SECS", "30"))
+NAME_WAIT_SECS  = float(os.getenv("NAME_WAIT_SECS", "120"))
+KNOWN_FACES_TTL = float(os.getenv("KNOWN_FACES_TTL", "5.0"))
+WORKER_STUCK_TIMEOUT = float(os.getenv("WORKER_STUCK_TIMEOUT", "6.0"))
 
 
 # ─── Data ─────────────────────────────────────────────────────────────────────
@@ -147,6 +212,8 @@ class DetectionResult:
     bystanders: int = 0
     state: str = "IDLE"
     error: Optional[str] = None
+    blink: bool = False          # single blink event (fires for ONE frame when a full blink completes)
+    double_blink: bool = False   # fires True for ONE frame when 2 blinks detected within BLINK_WINDOW_SECS
 
 
 @dataclass
@@ -156,6 +223,11 @@ class KioskState:
     state: str = "IDLE"                 # IDLE DWELLING RECOGNIZING ENROLLING ACTIVE DEPARTING COOLDOWN
     face_id: str = ""                   # PERSON id of the current primary visitor
     identity: str = ""
+    session_id: str = ""                # VISIT id returned by /visitor/greet — lets us
+                                         # notice if the backend closes this session from
+                                         # somewhere else (e.g. the voice/conversation flow
+                                         # calling /session/end directly) so we can drop
+                                         # out of ACTIVE instead of recognizing forever
     anchor: Optional[List[float]] = None   # live embedding captured at session start
     dwell_started: float = 0.0
     departed_at: float = 0.0
@@ -163,6 +235,12 @@ class KioskState:
     last_recheck: float = 0.0
     swap_streak: int = 0
     busy: bool = False                  # a background worker is running
+    generation: int = 0                 # bumped whenever an in-flight worker's
+                                         # result should be discarded as stale
+    state_entered: float = 0.0          # when we last transitioned into
+                                         # RECOGNIZING/ENROLLING — used by the
+                                         # stuck-state watchdog
+    prompted_departure: bool = False    # True when "Are you there?" prompt has been sent
 
     def set(self, **kw):
         with self.lock:
@@ -172,7 +250,19 @@ class KioskState:
     def snapshot(self) -> dict:
         with self.lock:
             return {"state": self.state, "face_id": self.face_id,
-                    "identity": self.identity, "busy": self.busy}
+                    "identity": self.identity, "busy": self.busy,
+                    "generation": self.generation, "state_entered": self.state_entered,
+                    "prompted_departure": self.prompted_departure,
+                    "anchor": self.anchor}
+
+    def bump_generation(self):
+        """Invalidate any in-flight recognize/enroll/recheck worker."""
+        with self.lock:
+            self.generation += 1
+
+    def is_current(self, gen: int) -> bool:
+        with self.lock:
+            return self.generation == gen
 
     def reset_session(self):
         with self.lock:
@@ -181,20 +271,34 @@ class KioskState:
             self.busy = False   # clear so the NEXT visitor's _spawn doesn't silently no-op
             self.face_id = ""
             self.identity = ""
+            self.session_id = ""
             self.anchor = None
             self.swap_streak = 0
             self.dwell_started = 0.0
             self.departed_at = 0.0
+            self.state_entered = 0.0
+            self.prompted_departure = False
+            self.generation += 1   # any worker from the old visit is now stale
 
 
 ST = KioskState()
+
+# ─── Known-faces cache ────────────────────────────────────────────────────────
+# Previously `_load_known_faces()` hit the backend on EVERY recognition
+# attempt (every DWELLING->RECOGNIZING transition), which (a) is redundant
+# network I/O in a latency-sensitive worker and (b) was the source of the
+# "faces loading again and again" logspam whenever the state machine had to
+# retry. Cached with a short TTL; force-refreshed right after we register a
+# new face so the very next lookup sees it.
 _known_faces: list = []
+_known_faces_loaded_at: float = 0.0
+_known_faces_lock = threading.Lock()
 
 
 # ─── Backend HTTP ─────────────────────────────────────────────────────────────
-def _post(path, **kw):
+def _post(path, timeout: float = 8, **kw):
     try:
-        return httpx.post(f"{BACKEND_URL}{path}", timeout=8, **kw)
+        return httpx.post(f"{BACKEND_URL}{path}", timeout=timeout, **kw)
     except Exception as e:
         logger.warning(f"POST {path} failed: {e}")
         return None
@@ -208,13 +312,98 @@ def _get(path):
         return None
 
 
-def _load_known_faces() -> list:
+def _load_known_faces(force: bool = False) -> list:
+    """Cached read of /faces/all. Set `force=True` right after an enrolment
+    so the freshly-registered face is visible immediately; everywhere else
+    we're happy to reuse a result up to KNOWN_FACES_TTL seconds old."""
+    global _known_faces, _known_faces_loaded_at
+    now = time.time()
+    with _known_faces_lock:
+        if not force and _known_faces and (now - _known_faces_loaded_at) < KNOWN_FACES_TTL:
+            return _known_faces
+
     r = _get("/faces/all")
     if r is not None and r.status_code == 200:
         faces = r.json().get("faces", [])
         logger.info(f"[DETECT] {len(faces)} known faces loaded")
+        with _known_faces_lock:
+            _known_faces = faces
+            _known_faces_loaded_at = now
         return faces
-    return []
+
+    with _known_faces_lock:
+        return _known_faces
+
+
+# ─── EAR Blink Detection ─────────────────────────────────────────────────────
+# Eye Aspect Ratio computed from MediaPipe 468-point facial landmarks.
+# Left eye:  [33,160,158,133,153,144]  Right eye: [362,385,387,263,373,380]
+# EAR = (||p2-p6|| + ||p3-p5||) / (2 * ||p1-p4||)
+# EAR < EAR_CLOSED   → eye is shut
+# EAR >= EAR_OPEN    → eye is fully open
+# A blink = EAR drops below EAR_CLOSED then recovers above EAR_OPEN.
+# Two blinks within BLINK_WINDOW_SECS → double_blink fires for ONE frame.
+
+EAR_CLOSED        = float(os.getenv("EAR_CLOSED", "0.18"))   # below = eye shut (tightened for accuracy)
+EAR_OPEN          = float(os.getenv("EAR_OPEN",   "0.28"))   # above = eye fully open again (tightened for accuracy)
+BLINK_WINDOW_SECS = float(os.getenv("BLINK_WINDOW_SECS", "1.5"))  # max time between 2 blinks (tightened for snappier double-blink)
+
+# Per-person blink state (guarded by the GIL — only the main pipeline thread
+# calls detect_presence, so no extra lock is needed here).
+_blink_eye_closed  = False   # True while the eye is currently below EAR_CLOSED
+_blink_timestamps: list = [] # timestamps of completed single blinks (float)
+
+
+def _ear(lm, idx: list, w: float, h: float) -> float:
+    """Compute Eye Aspect Ratio from 6 landmark indices."""
+    pts = np.array([[lm[i].x * w, lm[i].y * h] for i in idx], dtype=np.float32)
+    # vertical distances
+    A = float(np.linalg.norm(pts[1] - pts[5]))
+    B = float(np.linalg.norm(pts[2] - pts[4]))
+    # horizontal distance
+    C = float(np.linalg.norm(pts[0] - pts[3]))
+    return (A + B) / (2.0 * C) if C > 0 else 0.0
+
+
+_L_EYE = [33, 160, 158, 133, 153, 144]
+_R_EYE = [362, 385, 387, 263, 373, 380]
+
+
+def _check_blink(best_lm, w: float, h: float):
+    """Return (single_blink_event, double_blink_event).
+    Each flag is True for at most ONE call per blink/double-blink."""
+    global _blink_eye_closed, _blink_timestamps
+
+    try:
+        ear_l = _ear(best_lm, _L_EYE, w, h)
+        ear_r = _ear(best_lm, _R_EYE, w, h)
+        ear   = (ear_l + ear_r) / 2.0
+    except Exception:
+        return False, False
+
+    single = False
+    double = False
+    now    = time.time()
+
+    if ear < EAR_CLOSED:
+        # Eye is currently shut — record closure
+        _blink_eye_closed = True
+    elif _blink_eye_closed and ear >= EAR_OPEN:
+        # Eye just re-opened after being shut → one blink completed
+        _blink_eye_closed = False
+        single = True
+        _blink_timestamps.append(now)
+
+        # Purge blink timestamps older than the window
+        _blink_timestamps = [t for t in _blink_timestamps
+                             if now - t <= BLINK_WINDOW_SECS]
+
+        # Two or more blinks inside the window → double-blink
+        if len(_blink_timestamps) >= 2:
+            double = True
+            _blink_timestamps.clear()   # consume the event — don't fire again
+
+    return single, double
 
 
 # ─── Vision helpers ───────────────────────────────────────────────────────────
@@ -233,7 +422,8 @@ def _cos(a, b) -> float:
 
 
 def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResult:
-    """PRIMARY-VISITOR LOCK: largest face above MIN_FACE_FRAC wins; the rest
+    """PRIMARY-VISITOR LOCK: largest face above MIN_FACE_FRAC wins (this is
+    also, in effect, the NEAREST face — see module docstring); the rest
     are bystanders — counted, never served, never blocking."""
     if FACE_LANDMARKER is None:
         return DetectionResult(present=False, error="landmarker_unavailable")
@@ -278,9 +468,14 @@ def detect_presence(frame: np.ndarray, draw_mesh: bool = False) -> DetectionResu
         except Exception:
             kps = None
 
+    # ── Blink detection via EAR on the primary visitor's landmarks ────────────
+    blink_event, double_blink_event = _check_blink(best_lm, w, h) if best_lm else (False, False)
+
     return DetectionResult(present=True, bbox=best, face_crop=crop, kps=kps,
-                           frame_ref=frame,
-                           landmarks_img=mesh, bystanders=max(0, qualifying - 1))
+                           frame_ref=frame, landmarks_img=mesh,
+                           bystanders=max(0, qualifying - 1),
+                           blink=blink_event, double_blink=double_blink_event)
+
 
 
 def extract_embedding(face_crop: np.ndarray,
@@ -345,30 +540,40 @@ def _match(probe: list, faces: list):
 def _end_session(reason: str):
     logger.info(f"[DETECT] session end ({reason})")
     _post("/session/end")
-    ST.reset_session()
+    ST.reset_session()   # also bumps generation — invalidates any straggler worker
 
 
-def _start_session(face: dict, anchor: list, sim: float):
-    """Backend owns session_id and decides resume-vs-new (30-day window)."""
+def _start_session(face: dict, anchor: list, sim: float, gen: int):
+    """Backend owns session_id and decides resume-vs-new. `gen` is the
+    generation captured when the calling worker started — if the visitor
+    has since left (or someone else took their place), we must NOT commit
+    this identity."""
+    if not ST.is_current(gen):
+        logger.info("[DETECT] stale worker (visitor changed) - discarding result "
+                    f"for '{face.get('name')}'")
+        return
+
     face_id = face["face_id"]
-    r = _post("/visitor/greet", json={
+    r = _post("/visitor/greet", timeout=25, json={
         "face_id": face_id,
         "name": face.get("name", "Guest"),
         "is_returning": True,
         "visit_count": int(face.get("visit_count") or 1),
     })
 
-    # ── BUG FIX: only advance to ACTIVE when the backend confirmed the session ──
-    # Previously ACTIVE was always set even when the HTTP call failed, causing
-    # the detection overlay to show "Welcome!" while /session/current returned
-    # {active: false} and App.js stayed stuck on the idle/home screen.
     if r is None or r.status_code != 200:
         logger.error(
-            "[DETECT] /visitor/greet failed (status=%s) — resetting to IDLE so "
-            "the visitor can be re-recognised on the next frame.",
+            "[DETECT] /visitor/greet failed (status=%s) — cooling down before "
+            "the visitor is re-recognised.",
             getattr(r, "status_code", "no-response"),
         )
-        ST.set(state="IDLE")
+        _fail_recognition("/visitor/greet failed", gen)
+        return
+
+    if not ST.is_current(gen):
+        logger.info("[DETECT] stale worker after greet round-trip - ending "
+                    "the session we just opened instead of showing it")
+        _post("/session/end")
         return
 
     _post("/faces/visit", params={"face_id": face_id})
@@ -378,52 +583,104 @@ def _start_session(face: dict, anchor: list, sim: float):
     except Exception:
         pass
     ST.set(state="ACTIVE", face_id=face_id, identity=face.get("name", ""),
-           anchor=anchor, swap_streak=0, last_recheck=time.time())
+           anchor=anchor, swap_streak=0, last_recheck=time.time(), session_id=sid)
     logger.info(f"[DETECT] ACTIVE {face.get('name')} sim={sim:.3f} session={sid[:8]}")
 
 
-def _recognize_worker(crop: np.ndarray, frame=None, kps=None):
+def _fail_recognition(reason: str, gen: int):
+    """A recognize/enrol attempt didn't pan out (bad embedding, ambiguous
+    match, backend hiccup — anything short of a genuine 'visitor left').
+    STOP recognizing immediately, sit quiet for one COOLDOWN period, then
+    automatically re-arm and re-identify whoever is in front of the camera
+    (same person or a new one) instead of instantly re-triggering DWELLING
+    and hammering the backend again."""
+    logger.info(f"[DETECT] recognition attempt aborted ({reason}) - "
+                f"cooling down {COOLDOWN}s before re-identifying")
+    if ST.is_current(gen):
+        ST.set(state="COOLDOWN", cooldown_until=time.time() + COOLDOWN,
+               dwell_started=0.0, state_entered=0.0)
+
+
+def _recognize_worker(crop: np.ndarray, frame=None, kps=None, gen: int = 0):
     """RECOGNIZING: identify, then either start the session or enrol."""
-    global _known_faces
     try:
-        _known_faces = _load_known_faces()
-        probe = extract_embedding(crop, frame, kps)
-        if probe is None:
-            ST.set(state="IDLE")
+        known = _load_known_faces()
+
+        if not ST.is_current(gen):
+            logger.info("[DETECT] recognize aborted: visitor changed while "
+                        "known-faces were loading")
             return
 
-        face, sim = _match(probe, _known_faces)
+        probe = extract_embedding(crop, frame, kps)
+        if probe is None:
+            logger.warning("[DETECT] recognize aborted: embedding extraction "
+                           "returned None (bad crop / engine error — check the "
+                           "'[DETECT] embedding failed' line just above this)")
+            _fail_recognition("embedding extraction failed", gen)
+            return
+
+        if not ST.is_current(gen):
+            logger.info("[DETECT] recognize aborted: visitor changed during "
+                        "embedding extraction")
+            return
+
+        face, sim = _match(probe, known)
         if face:
-            _start_session(face, probe, sim)
+            _start_session(face, probe, sim, gen)
         else:
-            ST.set(state="ENROLLING")
-            _enroll_worker(crop, probe, frame, kps)
+            if not ST.is_current(gen):
+                logger.info("[DETECT] recognize aborted: visitor changed "
+                            "right before enrolment")
+                return
+            logger.info(f"[DETECT] no confident match (best sim={sim:.3f}) "
+                        "— moving to ENROLLING")
+            ST.set(state="ENROLLING", state_entered=time.time(), anchor=probe)
+            _enroll_worker(crop, probe, frame, kps, gen)
     except Exception as e:
         logger.error(f"[DETECT] recognize error: {e}")
-        ST.set(state="IDLE")
+        _fail_recognition(f"exception: {e}", gen)
     finally:
         ST.set(busy=False)
 
 
-def _enroll_worker(crop: np.ndarray, probe: list, frame=None, kps=None):
+def _enroll_worker(crop: np.ndarray, probe: list, frame=None, kps=None, gen: int = 0):
     """
-    ENROLLING — the ONLY place a face_id is ever minted.
+    ENROLLING — the camera-driven identity-minting path.
 
-    Guards (this is what stopped the 'one person, seven face_ids' factory):
+    Guards:
       * DUPLICATE HARD BLOCK — if this face already matches someone, we do
         NOT create a second identity; we greet them as that person.
       * multi-template capture for a robust identity.
+      * GENERATION GUARD — if the visitor leaves while we're waiting for a
+        name (camera goes dark, they walk off), we stop waiting and never
+        commit a session for someone no longer there.
+
+    NOTE: this waits on /visitor/name_response, which the OLD text-prompt
+    name flow populated. The voice flow calls /visitor/submit_name directly
+    and does its own registration via register_or_resume_face() (see module
+    docstring) — this worker only still matters if the camera state machine
+    reaches ENROLLING before the voice flow's submit_name call lands, in
+    which case the DUPLICATE HARD BLOCK below makes sure the two paths can
+    never mint two different face_ids for the same visit.
     """
-    global _known_faces
     try:
+        if not ST.is_current(gen):
+            return
+
         r = _post("/visitor/unknown")
         if r is None or r.status_code != 200:
-            ST.set(state="IDLE")
+            logger.warning("[DETECT] /visitor/unknown failed (status=%s)",
+                           getattr(r, "status_code", "no-response"))
+            _fail_recognition("/visitor/unknown failed", gen)
             return
 
         deadline = time.time() + NAME_WAIT_SECS
         data = None
         while time.time() < deadline:
+            if not ST.is_current(gen):
+                logger.info("[DETECT] visitor left while waiting for name - aborting enrolment")
+                _post("/session/end")
+                return
             rr = _get("/visitor/name_response")
             if rr is not None and rr.status_code == 200:
                 d = rr.json()
@@ -433,71 +690,192 @@ def _enroll_worker(crop: np.ndarray, probe: list, frame=None, kps=None):
                     break
             time.sleep(0.4)
 
+        if not ST.is_current(gen):
+            _post("/session/end")
+            return
+
         name = (data.get("name") or "Guest").strip() if data else "Guest"
         save = bool(data.get("save", True)) if data else False
 
         # ── DUPLICATE HARD BLOCK ──────────────────────────────────────────
-        fresh = _load_known_faces()
+        fresh = _load_known_faces(force=True)
         dup, dup_sim = _match(probe, fresh)
         if dup:
-            logger.warning(f"[DETECT] enrolment blocked — face already registered "
+            logger.warning(f"[DETECT] enrolment blocked - face already registered "
                            f"as '{dup.get('name')}' (sim={dup_sim:.3f}). Resuming them.")
-            _start_session(dup, probe, dup_sim)
+            _start_session(dup, probe, dup_sim, gen)
+            return
+
+        if not ST.is_current(gen):
             return
 
         if not save or name in ("Guest", ""):
-            # Guest: session without an identity; anchor still locks the seat.
             _post("/session/start", params={"user_name": name or "Guest",
                                             "face_id": "", "is_returning": False,
                                             "visit_count": 1, "trigger": "camera"})
+            if not ST.is_current(gen):
+                _post("/session/end")
+                return
             ST.set(state="ACTIVE", face_id="", identity=name or "Guest",
                    anchor=probe, swap_streak=0, last_recheck=time.time())
             return
 
-        templates = [probe]                      # multi-template enrolment
-        # (extra templates are captured by the caller's frames on later visits;
-        #  a single high-quality template plus visit-time updates is enough here)
+        templates = [probe]
 
-        face_id = str(uuid.uuid4())              # minted ONCE, for this person
+        existing_fid = ST.snapshot().get("face_id")
+        if existing_fid:
+            logger.info(f"[DETECT] face_id={existing_fid[:8]} already assigned by submit_name for '{name}'")
+            ST.set(state="ACTIVE", face_id=existing_fid, identity=name,
+                   anchor=probe, swap_streak=0, last_recheck=time.time())
+            return
+
+        face_id = str(uuid.uuid4())
         resp = _post("/faces/register", json={"face_id": face_id, "name": name,
                                               "encoding": templates[0],
                                               "encodings": templates})
         if resp is None or resp.status_code != 200:
-            logger.warning("[DETECT] /faces/register failed")
-            ST.set(state="IDLE")
+            logger.warning("[DETECT] /faces/register failed (status=%s)",
+                           getattr(resp, "status_code", "no-response"))
+            _fail_recognition("/faces/register failed", gen)
             return
 
         logger.info(f"[DETECT] enrolled '{name}' face_id={face_id[:8]}")
-        _known_faces = _load_known_faces()
+        _load_known_faces(force=True)
+
+        if not ST.is_current(gen):
+            _post("/session/end")
+            return
+
         _post("/session/start", params={"user_name": name, "face_id": face_id,
                                         "is_returning": False, "visit_count": 1,
                                         "trigger": "camera"})
+        if not ST.is_current(gen):
+            _post("/session/end")
+            return
         ST.set(state="ACTIVE", face_id=face_id, identity=name,
                anchor=probe, swap_streak=0, last_recheck=time.time())
     except Exception as e:
         logger.error(f"[DETECT] enrol error: {e}")
-        ST.set(state="IDLE")
+        _fail_recognition(f"enrol exception: {e}", gen)
+
+
+def register_or_resume_face(name: str, save: bool = True) -> dict:
+    """
+    THE FIX for "guest's name isn't recognised on their second visit".
+
+    Call this from main.py's /visitor/submit_name, /visitor/rename, and any
+    mid-conversation "change my name" route. Registers (or links to) a real
+    face_id using whatever live anchor embedding ST is already holding for the
+    CURRENT visitor, so the next visit's camera-side _match() in _recognize_worker
+    has something to compare against.
+    """
+    name = (name or "").strip()
+    snap = ST.snapshot()
+    anchor = snap.get("anchor")
+    existing_fid = snap.get("face_id") or ""
+
+    if not save or not name or name in ("Guest", "Unknown", ""):
+        return {"face_id": existing_fid, "created": False}
+
+    if existing_fid:
+        return {"face_id": existing_fid, "created": False}
+
+    if anchor:
+        fresh = _load_known_faces(force=True)
+        dup, dup_sim = _match(anchor, fresh)
+        if dup:
+            logger.info(
+                "[DETECT] register_or_resume_face: '%s' already registered as "
+                "face_id=%s (sim=%.3f) — linking instead of duplicating",
+                name, dup["face_id"][:8], dup_sim,
+            )
+            ST.set(face_id=dup["face_id"], identity=name)
+            return {"face_id": dup["face_id"], "created": False}
+
+    face_id = str(uuid.uuid4())
+    enc = anchor if anchor else []
+    encs = [anchor] if anchor else []
+    resp = _post("/faces/register", json={
+        "face_id": face_id, "name": name,
+        "encoding": enc, "encodings": encs,
+    })
+    if resp is None or resp.status_code != 200:
+        logger.warning(
+            "[DETECT] register_or_resume_face: /faces/register failed "
+            "(status=%s) for '%s'",
+            getattr(resp, "status_code", "no-response"), name,
+        )
+        return {"face_id": face_id, "created": False}
+
+    _load_known_faces(force=True)
+    ST.set(face_id=face_id, identity=name)
+    logger.info("[DETECT] register_or_resume_face: registered '%s' face_id=%s (has_encoding=%s)",
+               name, face_id[:8], bool(anchor))
+    return {"face_id": face_id, "created": True}
+
+
+def _backend_session_still_active(local_session_id: str) -> Optional[bool]:
+    """Ask the backend whether it still considers this visit live."""
+    r = _get("/session/current")
+    if r is None or r.status_code != 200:
+        return None
+    try:
+        cur = r.json() or {}
+    except Exception:
+        return None
+
+    active = cur.get("active")
+    remote_sid = cur.get("session_id") or cur.get("session", {}).get("session_id", "")
+
+    if active is False:
+        logger.info(f"[DETECT] backend /session/current reports active=False "
+                    f"(payload={cur}) - session was ended elsewhere")
+        return False
+    if local_session_id and remote_sid and remote_sid != local_session_id:
+        logger.info(f"[DETECT] backend session_id changed under us "
+                    f"(local={local_session_id[:8]} remote={remote_sid[:8]}) "
+                    "- session was ended/replaced elsewhere")
+        return False
+    return True
 
 
 def _recheck_worker(crop: np.ndarray, frame=None, kps=None):
-    """ACTIVE: is the person in front still the session owner?
-    Deletion is deterministic (immediate). Identity drift is debounced."""
+    """ACTIVE: is the person in front still the session owner, AND does the
+    backend still agree this session is live?"""
     try:
         snap = ST.snapshot()
-        if snap["face_id"]:
-            fresh = _load_known_faces()
-            if not any(f.get("face_id") == snap["face_id"] for f in fresh):
-                logger.info("[DETECT] session face deleted from DB — ending")
-                _end_session("deleted")
-                return
+        gen = snap["generation"]
 
         with ST.lock:
-            anchor = ST.anchor
-        if anchor is None:
+            local_sid = ST.session_id
+        still_active = _backend_session_still_active(local_sid)
+        if still_active is False:
+            _end_session("ended by backend")
             return
+
         probe = extract_embedding(crop, frame, kps)
         if probe is None:
             return
+
+        if not ST.is_current(gen):
+            return
+
+        with ST.lock:
+            anchor = ST.anchor
+            if anchor is None:
+                ST.anchor = probe
+                anchor = probe
+                # If face_id was registered without an anchor, update it with this probe
+                fid = ST.face_id
+                ident = ST.identity
+                if fid and ident:
+                    _post("/faces/register", json={
+                        "face_id": fid, "name": ident,
+                        "encoding": probe, "encodings": [probe],
+                    })
+                    _load_known_faces(force=True)
+                    logger.info("[DETECT] _recheck_worker: backfilled live embedding for '%s' face_id=%s",
+                               ident, fid[:8])
 
         sim = _cos(probe, anchor)
         if sim >= (1.0 - CONTINUITY_DIST):
@@ -509,24 +887,20 @@ def _recheck_worker(crop: np.ndarray, frame=None, kps=None):
             streak = ST.swap_streak
         logger.info(f"[DETECT] continuity mismatch {streak}/{SWAP_STREAK} (sim={sim:.3f})")
         if streak >= SWAP_STREAK:
-            # A DIFFERENT person is now in front. Do not merely end the
-            # session and idle — that left the newcomer stuck inside the
-            # previous visitor's identity until the camera was covered.
-            # End the old session, then RE-IDENTIFY this face right away.
             _end_session("face swap")
+            new_gen = ST.snapshot()["generation"]
 
-            fresh = _load_known_faces()
+            fresh = _load_known_faces(force=True)
             face, msim = _match(probe, fresh)
             if face:
                 logger.info(f"[DETECT] re-identified as '{face.get('name')}' "
                             f"(sim={msim:.3f}) — starting their session")
-                ST.set(state="RECOGNIZING")
-                _start_session(face, probe, msim)
+                ST.set(state="RECOGNIZING", state_entered=time.time())
+                _start_session(face, probe, msim, new_gen)
             else:
-                # Unknown newcomer: enrol them instead of idling.
-                logger.info("[DETECT] newcomer not recognised — enrolling")
-                ST.set(state="ENROLLING")
-                _enroll_worker(crop, probe, frame, kps)
+                logger.info("[DETECT] newcomer not recognised - enrolling")
+                ST.set(state="ENROLLING", state_entered=time.time())
+                _enroll_worker(crop, probe, frame, kps, new_gen)
     except Exception as e:
         logger.error(f"[DETECT] recheck error: {e}")
     finally:
@@ -555,17 +929,28 @@ def run_pipeline(frame_data, known_faces=None, draw_mesh: bool = False) -> Detec
     st = snap["state"]
     res.state = st
 
-    # ── nobody in front ───────────────────────────────────────────────────
     if not res.present:
         if st == "ACTIVE":
-            ST.set(state="DEPARTING", departed_at=now)
+            ST.set(state="DEPARTING", departed_at=now, prompted_departure=False)
         elif st == "DEPARTING":
             with ST.lock:
                 gone_for = now - ST.departed_at
+                already_prompted = ST.prompted_departure
             if gone_for >= DEPART_GRACE:
-                _end_session("visitor left")
+                if not already_prompted:
+                    ST.set(prompted_departure=True)
+                    logger.info("[DETECT] Face absent for %.1fs during ACTIVE session — prompting 'Are you there?'", gone_for)
+                    _post("/session/are_you_there")
+                elif gone_for >= (DEPART_GRACE + 15.0):
+                    _end_session("visitor left after 'are you there' prompt")
         elif st in ("DWELLING", "RECOGNIZING"):
-            ST.set(state="IDLE", dwell_started=0.0)
+            with ST.lock:
+                if ST.departed_at == 0.0:
+                    ST.departed_at = now
+                gone_for = now - ST.departed_at
+            if gone_for >= RECOG_ABSENCE_GRACE:
+                ST.bump_generation()
+                ST.set(state="IDLE", dwell_started=0.0, departed_at=0.0, state_entered=0.0)
         elif st == "COOLDOWN":
             with ST.lock:
                 if now >= ST.cooldown_until:
@@ -573,10 +958,25 @@ def run_pipeline(frame_data, known_faces=None, draw_mesh: bool = False) -> Detec
         res.state = ST.snapshot()["state"]
         return res
 
-    # ── someone is in front ───────────────────────────────────────────────
+    if st in ("DWELLING", "RECOGNIZING", "ENROLLING"):
+        with ST.lock:
+            if ST.departed_at != 0.0:
+                ST.departed_at = 0.0
+
+    if st in ("RECOGNIZING", "ENROLLING"):
+        cur = ST.snapshot()
+        if not cur["busy"]:
+            entered = cur["state_entered"] or now
+            stuck_for = now - entered
+            if stuck_for >= WORKER_STUCK_TIMEOUT:
+                logger.warning(f"[DETECT] {st} stuck with no worker running "
+                               f"({stuck_for:.1f}s) — resetting to IDLE for retry")
+                ST.bump_generation()
+                ST.set(state="IDLE", dwell_started=0.0, departed_at=0.0, state_entered=0.0)
+                st = "IDLE"
+
     if st == "DEPARTING":
-        # they came back inside the grace window → keep the SAME session
-        ST.set(state="ACTIVE", departed_at=0.0)
+        ST.set(state="ACTIVE", departed_at=0.0, prompted_departure=False)
         st = "ACTIVE"
 
     if st == "ACTIVE":
@@ -598,6 +998,7 @@ def run_pipeline(frame_data, known_faces=None, draw_mesh: bool = False) -> Detec
         st = "IDLE"
 
     if st == "IDLE":
+        logger.info("[DETECT] visitor detected - starting dwell timer")
         ST.set(state="DWELLING", dwell_started=now)
         res.identity = "..."
         return res
@@ -608,10 +1009,17 @@ def run_pipeline(frame_data, known_faces=None, draw_mesh: bool = False) -> Detec
         if dwell < DWELL_REQUIRED:
             res.identity = "..."
             return res
-        ST.set(state="RECOGNIZING")
+
         if res.face_crop is not None:
-            _spawn(_recognize_worker, res.face_crop.copy(), res.frame_ref, res.kps)
-        res.identity = "Identifying..."
+            gen = ST.snapshot()["generation"]
+            spawned = _spawn(_recognize_worker, res.face_crop.copy(), res.frame_ref, res.kps, gen)
+            if spawned:
+                ST.set(state="RECOGNIZING", state_entered=now)
+                res.identity = "Identifying..."
+            else:
+                res.identity = "..."
+        else:
+            res.identity = "..."
         return res
 
     res.identity = "Identifying..." if st in ("RECOGNIZING", "ENROLLING") else res.identity
@@ -655,8 +1063,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     show = os.getenv("DETECT_WINDOW", "true").lower() == "true"
-    print("Detection running — press Q in the window to quit.")
-    _known_faces = _load_known_faces()
+    print("Detection running - press Q in the window to quit.")
+    _load_known_faces()
 
     while True:
         ok, frame = cap.read()

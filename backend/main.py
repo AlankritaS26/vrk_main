@@ -1,8 +1,8 @@
 """
 RNSIT Digital Receptionist - Backend Server
 
-HOW TO RUN (always from VRK_MVP/ folder):
-    python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+HOW TO RUN (from repository root):
+    venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8001
 """
 
 import os
@@ -11,6 +11,7 @@ import shutil
 import logging
 import hashlib
 import string
+import re
 import asyncio
 import sys
 import base64
@@ -24,31 +25,42 @@ from contextlib import asynccontextmanager
 import redis
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect, Request, HTTPException, Depends, status, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field, field_validator
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+import httpx
+
+load_dotenv()
+
+# Companion token TTL (minutes) — read once here so companion.py can import it
+COMPANION_TOKEN_TTL_MINUTES: int = int(os.getenv("COMPANION_TOKEN_TTL_MINUTES", "20"))
+# Escalation timeout (seconds)
+ESCALATION_TIMEOUT_SECONDS: int = int(os.getenv("ESCALATION_TIMEOUT_SECONDS", "60"))
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ── BUG FIX: set BEFORE detection import so detection.py captures the right URL ──
-# detection.py reads BACKEND_URL at module-level; setting it here (before the
-# import below) guarantees it always calls 127.0.0.1 even when the .env file
-# contains an external hostname.
 os.environ["BACKEND_URL"] = "http://127.0.0.1:8001"
 
 # Imports matching your async MongoDB database layout
 from backend.database import (
     get_kiosk_data,
-    save_session, save_interaction,
+    save_session, save_interaction, get_last_interaction, get_recent_interactions,
     update_face_seen, save_face_encoding, get_all_face_encodings,
-    delete_face_by_name,
+    delete_face_by_name, update_face_name_with_alias, update_session_user_name,
+    sessions_collection, faces_collection, interactions_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
+    escalations_collection,
 )
-from backend.llm import initialize_rag_knowledge_base, generate_rag_kiosk_response, close_llm_client
+from backend.llm import (
+    initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
+    generate_rag_kiosk_response_stream,
+    extract_topic_label,
+)
 from backend.stt import transcribe_audio, transcribe_pcm
 from backend.tts import text_to_speech
 
@@ -72,17 +84,12 @@ def run_pipeline(frame_data):
         class _NoOp:
             present = False; state = "IDLE"; identity = ""
             verified = False; bbox = None; bystanders = 0
-            error = "detection_unavailable"
+            error = "detection_unavailable"; blink = False; double_blink = False
         return _NoOp()
     return _run_pipeline(frame_data)
 
-load_dotenv()
-
-# When detection.py is imported inside the backend process its HTTP client
-# must call back to localhost, not the external hostname in BACKEND_URL.
-# NOTE: the real override is now ABOVE the detection import (line ~32); this
-# line is kept as a safety net in case load_dotenv() ran after that point.
 os.environ.setdefault("BACKEND_URL", "http://127.0.0.1:8001")
+BACKEND_URL: str = os.environ["BACKEND_URL"]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,9 +97,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RNSIT_Kiosk")
 
-ALLOWED_ORIGINS: List[str] = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-MAX_QUERY_LENGTH: int = 300  # Lowered slightly to guard against buffer/token manipulation attacks
-SESSION_TIMEOUT_SECONDS: int = 120
+MAX_QUERY_LENGTH: int = 300 
+SESSION_TIMEOUT_SECONDS: int = 360   # 6 min idle grace — raised from 180s to avoid premature session endings
+
+# ── RAG MICROSERVICE CONFIG ────────────────────────────────────────────────
+# Read once, here, near the top of the file — everything else in this module
+# (the /ask endpoint, the /api/chat endpoint, and the admin RAG management
+# endpoints) reuses these two constants instead of re-reading os.environ.
+RAG_SERVICE_URL: str   = os.getenv("RAG_SERVICE_URL", "http://127.0.0.1:8600").rstrip("/")
+RAG_COLLECTION:  str   = os.getenv("RAG_COLLECTION", "kiosk-rnsit")
+RAG_TOP_K:       int   = int(os.getenv("RAG_TOP_K", "5"))
+RAG_SIMILARITY_THRESHOLD: float = float(os.getenv("RAG_SIMILARITY_THRESHOLD", "0.35"))
 
 DOMAINS_CORRECTIONS = {
     "pricipal":  "principal",
@@ -100,8 +115,29 @@ DOMAINS_CORRECTIONS = {
     "libary":    "library",
     "placment":  "placement",
     "fees":      "fee",
+    # Common STT mis-hearings of "RNSIT" (the college's own name!) — these
+    # were silently NOT being fixed before: see the note further down
+    # where q_normalized is built vs. what actually got sent to RAG.
+    "rnsfit":    "rnsit",
+    "ransit":    "rnsit",
+    "rnscit":    "rnsit",
+    "arnsit":    "rnsit",
+    "rnsit's":   "rnsit",
+    "rnsits":    "rnsit",
 }
 
+# STT sometimes splits "RNSIT" across multiple tokens instead of mishearing
+# it as one word (e.g. "R N S fit", "run sit") — those can't be fixed by a
+# single-word dict lookup, so they're corrected as whole phrases BEFORE the
+# text is split into words.
+PHRASE_CORRECTIONS = {
+    "rns fit":     "rnsit",
+    "r n s fit":   "rnsit",
+    "run sit":     "rnsit",
+    "rn sit":      "rnsit",
+    "r and s fit": "rnsit",
+    "r n site":    "rnsit",
+}
 # --- REDIS / MEMURAI CACHING ---
 try:
     redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
@@ -140,6 +176,8 @@ active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 _last_activity_ts: float = 0.0
+# Per-session low-confidence answer counter (for escalation trigger)
+_low_confidence_count: int = 0
 
 
 # ==========================================
@@ -188,6 +226,373 @@ def verify_input_safety(query: str) -> bool:
 
 
 # ==========================================
+# RAG MICROSERVICE CLIENT
+# ==========================================
+_RAG_STOPWORDS = {
+    "who", "is", "the", "of", "a", "an", "what", "where", "when", "how", "why",
+    "please", "tell", "me", "can", "you", "are", "in", "for", "to", "and", "or",
+    "do", "does", "it", "was", "were", "be", "this", "that", "rnsit", "rns",
+    "institute", "technology", "about",
+}
+
+
+_RAG_ABBREVS = {"dr", "mr", "mrs", "ms", "prof", "st", "jr", "sr", "no", "vs", "etc"}
+
+
+def _matches_short_phrase(q_normalized: str, phrases: set[str]) -> bool:
+    """
+    Word-boundary phrase match, deliberately restricted to SHORT utterances
+    (<=4 words). This is the fix for the "random Goodbye" bug: the old code
+    did `phrase in q_normalized`, a raw substring check across the entire
+    sentence with no length cap — so a real question that happened to
+    contain "bye"/"thanks" anywhere (or just drifted semantically close via
+    RAG) could trigger a farewell. A genuine "bye"/"thank you" utterance is
+    always short; a real campus question with those letters buried in it
+    (or a coincidental partial match) is not, so capping length here is a
+    cheap, robust way to tell the two apart without a big keyword tree.
+    """
+    q = q_normalized.strip()
+    if not q or len(q.split()) > 4:
+        return False
+    if q in phrases:
+        return True
+    for phrase in phrases:
+        if re.search(rf"(?:^|\s){re.escape(phrase)}(?:$|\s)", q):
+            return True
+    return False
+
+
+GREETING_PHRASES = {
+    "hi", "hello", "hey", "hiya", "yo",
+    "good morning", "good afternoon", "good evening",
+}
+_GREETING_RESPONSES = [
+    "Hello! Welcome to RNSIT. How can I help you today?",
+    "Hi there! How can I help you today?",
+    "Welcome to RNS Institute of Technology! What can I help you with?",
+]
+
+# ── Easter eggs: the handful of off-topic, personality questions every
+# visitor asks an assistant sooner or later ("are you a robot?", "tell me
+# a joke"). This is the single thing visitors actually remember and tell
+# their friends about, so these get warm, self-aware, instant replies
+# instead of falling through to RAG (which has no campus-fact grounding
+# for them and would either hallucinate or bounce to the offtopic fallback).
+# Matched the same way as GREETING_PHRASES — via _matches_short_phrase, so
+# only short, standalone utterances trigger this, never a real question
+# that happens to share a few words with one of these keys.
+EASTER_EGGS = {
+    "are you a robot": [
+        "I'm a digital receptionist, so yes and no — no body, but I do the job!",
+        "Guilty as charged! But I promise I'm a friendly one.",
+    ],
+    "are you real": [
+        "Real enough to help you find your way around campus! What can I help you with?",
+    ],
+    "are you human": [
+        "Not quite — I'm a digital receptionist. But I'll do my best to help you!",
+    ],
+    "tell me a joke": [
+        "Why did the student bring a ladder to class? To reach the higher studies!",
+        "What did the router say to the CSE student? Nothing, they just had a falling out over connection issues.",
+    ],
+    "who made you": [
+        "I was built by the students of RNSIT to help visitors like you find your way around!",
+    ],
+    "what is your name": [
+        "I'm Nova, the digital receptionist here at RNSIT. Nice to meet you!",
+    ],
+    "who are you": [
+        "I'm Nova — think of me as RNSIT's always-awake front desk.",
+    ],
+    "i love you": [
+        "That's sweet! I love helping visitors find their way around RNSIT too.",
+    ],
+    "do you sleep": [
+        "Never! I'm here whenever a visitor needs help, day or night.",
+    ],
+    # ── Interactive/happy-moment additions ────────────────────────────────
+    # Small talk that makes Nova feel like a person at the desk rather than
+    # a search box, without drifting away from the college-assistant role —
+    # deliberately short, warm, and quick to hand the conversation back to
+    # campus topics.
+    "how are you": [
+        "I'm doing great, thanks for asking! Ready to help you explore RNSIT — what can I do for you?",
+        "Feeling good and fully charged! What would you like to know about RNSIT?",
+    ],
+    "what is the weather today": [
+        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
+    ],
+    "how is the weather": [
+        "I don't have a window, so I can't check the sky myself! But whatever it's like out there, I hope it's a good day for a campus visit.",
+    ],
+    "good job": [
+        "Aw, thank you! That made my day. Anything else I can help you with?",
+    ],
+    "you are smart": [
+        "That's very kind of you to say! I try my best. What else can I help you with?",
+    ],
+    "you are awesome": [
+        "You're pretty awesome yourself for saying that! What can I help you with next?",
+    ],
+    "nice to meet you": [
+        "Nice to meet you too! How can I help you today?",
+    ],
+    "good night": [
+        "Good night! It was lovely chatting with you — take care.",
+    ],
+    "where is the qr code": [
+        "The QR code is displayed right on the top left of the screen! Scan it with your phone's camera to take this conversation summary and college brochures with you.",
+    ],
+    "where is qr": [
+        "You can find the QR code right on the top left of the screen. Scan it with your phone camera to view your session summary and download campus brochures.",
+    ],
+    "show qr code": [
+        "The QR code is active on the top left of the screen! Point your smartphone camera at it to take your visit recap and brochures with you.",
+    ],
+    "how to get brochure": [
+        "You can scan the QR code on the top left of the screen with your smartphone camera to download our official department brochures directly.",
+    ],
+    "give me brochure": [
+        "Just scan the QR code on the top left of the screen with your smartphone to download our official brochures directly to your phone!",
+    ],
+    "can i get this on my phone": [
+        "Yes! Scan the QR code displayed on the top left of the screen with your phone camera to take your visit recap and college brochures with you.",
+    ],
+}
+
+
+# ── Replies to the "continue with X, or something else?" re-engagement ──
+# These only carry meaning right after that specific greeting question,
+# so they're intercepted deterministically (see the awaiting_topic_choice
+# check in /ask) rather than being sent to RAG, where a bare "something
+# else" was scoring a coincidental similarity hit and coming back as
+# "I don't have that detail."
+TOPIC_DECLINE_PHRASES = {
+    "something else", "no", "nah", "not that", "different",
+    "something different", "new topic", "no thanks", "not really",
+}
+TOPIC_CONTINUE_PHRASES = {
+    "yes", "yeah", "yep", "sure", "continue", "yes please",
+    "that one", "ok continue", "please continue", "continue with that",
+}
+
+# ── Farewell markers ──────────────────────────────────────────────────────
+# THANK_YOU_PHRASES used to be declared inline inside the /ask endpoint;
+# moved up here (module scope) so _is_farewell (also module scope) can see
+# it, and so it sits alongside the other deterministic-route phrase sets.
+THANK_YOU_PHRASES = {
+    "thank you", "thanks", "thank u", "thankyou",
+    "ok thanks", "okay thanks", "ok thank you", "okay thank you",
+    "thats all", "thats all thanks", "bye", "goodbye", "that is all",
+}
+
+# THANK_YOU_PHRASES (below, used with the strict <=4-word _matches_short_
+# phrase check) only ever caught bare "bye"/"thank you"-style utterances.
+# Real visitors close a conversation in much longer, more natural ways —
+# "Okay, nice talking to you.", "It was really nice talking to you. We'll
+# meet you next time.", "That's it." — none of which matched, so those
+# sessions never ended: the visitor's sign-off got treated as a fresh
+# question, routed all the way through RAG/LLM (slow, and often answered
+# with an irrelevant "I don't have that detail"), and the kiosk just sat
+# there still "listening" instead of closing out.
+#
+# FAREWELL_MARKERS below catches those natural sign-offs as substrings
+# (word-boundary matched) without the 4-word cap, since a closing remark is
+# reliably short and distinctive even when the whole sentence isn't. It's
+# intentionally still a fixed marker list (not "contains bye anywhere") so
+# a genuine campus question is never misrouted.
+FAREWELL_MARKERS = {
+    "nice talking", "nice chatting", "great talking", "great chatting",
+    "lovely talking", "meet you next time", "see you next time",
+    "see you later", "see you soon", "catch you later", "catch you next time",
+    "thats it", "that's it", "thats all", "that's all",
+    "no more questions", "nothing else", "no other questions",
+    "im done", "i am done", "im good", "im all set", "all set thanks",
+    "gotta go", "got to go", "have to go", "need to go", "i should go",
+    "ok bye", "okay bye", "alright bye", "bye bye", "gtg",
+}
+
+
+def _is_farewell(q_normalized: str) -> bool:
+    """
+    True for both the strict short farewells in THANK_YOU_PHRASES and the
+    longer, natural sign-off phrasings in FAREWELL_MARKERS. See the
+    FAREWELL_MARKERS comment above for why the two need different length
+    rules. Capped at 15 words even for markers so a long, unrelated
+    question that happens to contain one of these short phrases deep
+    inside it doesn't get misrouted as a goodbye.
+    """
+    q = (q_normalized or "").strip()
+    if not q:
+        return False
+    if _matches_short_phrase(q, THANK_YOU_PHRASES):
+        return True
+    if len(q.split()) > 15:
+        return False
+    for marker in FAREWELL_MARKERS:
+        if re.search(rf"(?:^|\s){re.escape(marker)}(?:$|\s)", q):
+            return True
+    return False
+
+
+# ── Q/A label stripper ────────────────────────────────────────────────────
+# FAQ-derived chunks are seeded (see backend/llm.py::_json_to_text_chunks)
+# as literal "Q: <question>? A: <answer>" strings, on purpose — that extra
+# question text helps the embedding model match visitor phrasing. But those
+# raw "Q:"/"A:" labels — and the question text itself — must never reach the
+# visitor. _QA_LABEL_RE strips a leading "Q: ...? A: " block; _STRAY_LABEL_RE
+# mops up any leftover "Q:"/"A:" markers (covers chunks with multiple
+# Q/A pairs bundled together, or any other future FAQ-shaped content).
+_QA_LABEL_RE = re.compile(r"Q:\s*.+?\?\s*A:\s*", re.IGNORECASE)
+_STRAY_LABEL_RE = re.compile(r"\b[QA]:\s*", re.IGNORECASE)
+
+
+def _strip_qa_labels(text: str) -> str:
+    """Remove 'Q: ... A: ...' scaffolding from a chunk, leaving just the answer text."""
+    text = _QA_LABEL_RE.sub("", text)
+    text = _STRAY_LABEL_RE.sub("", text)
+    return text.strip()
+
+
+def _split_into_facts(text: str) -> list[str]:
+    """
+    Splits a chunk into sentence-like fragments without cutting titles and
+    initials in half (e.g. "Dr. M K Venkatesha" would otherwise get chopped
+    into "Dr." + "M K Venkatesha" by a naive '. ' split).
+    """
+    raw = re.split(r"(?<=[.!?])\s+", text.strip())
+    merged, buffer = [], ""
+    for frag in raw:
+        buffer = (buffer + " " + frag).strip() if buffer else frag
+        tokens = buffer.split()
+        last = tokens[-1] if tokens else ""
+        is_initial = bool(re.fullmatch(r"[A-Z]\.", last))
+        is_abbrev = last.rstrip(".").lower() in _RAG_ABBREVS
+        if is_initial or is_abbrev:
+            continue  # keep buffering — this period wasn't a real sentence end
+        merged.append(buffer)
+        buffer = ""
+    if buffer:
+        merged.append(buffer)
+    return merged
+
+
+def _extract_relevant_sentences(text: str, query: str, max_sentences: int = 2) -> tuple[str, bool]:
+    """
+    RAGService's chunks sometimes bundle many unrelated facts into one
+    paragraph (e.g. a whole "college facts" block containing the address,
+    director, principal, admissions phone, etc. all together). Instead of
+    handing the entire chunk back to the visitor for every question that
+    happens to match it, pull out just the fact(s) that actually contain
+    the question's keywords.
+
+    Returns (text, matched) — matched=True means we found keyword overlap
+    and text is the focused extract; matched=False means nothing in this
+    chunk matched and text is the original, unmodified chunk (the caller
+    decides whether an unmatched chunk is even worth including at all).
+    """
+    keywords = {w for w in re.findall(r"[a-z0-9]+", query.lower())
+                if w not in _RAG_STOPWORDS and len(w) > 2}
+    if not keywords:
+        return text, False
+
+    fragments = _split_into_facts(text)
+    scored = []
+    for frag in fragments:
+        frag_lower = frag.lower()
+        hits = sum(1 for kw in keywords if kw in frag_lower)
+        if hits > 0:
+            scored.append((hits, frag.strip()))
+
+    if not scored:
+        return text, False
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best = [frag for _, frag in scored[:max_sentences]]
+    return " ".join(best), True
+
+
+async def query_rag_service(query: str, k: int | None = None) -> str:
+    """
+    Calls the standalone RAGService microservice (RAG_SERVICE_URL, default
+    http://127.0.0.1:8600) to semantically search the knowledge base and
+    returns a natural-language answer built from the best-matching chunk(s).
+
+    RAG_TOP_K controls how many candidates we ask for; RAG_SIMILARITY_THRESHOLD
+    filters out weak matches (RAGService's score = 1 - vector distance, so
+    higher is better — 0.35 is a reasonable "actually related" cutoff).
+
+    NOTE: as of the Phase 3 fix, the primary voice pipeline (/ask) no longer
+    calls this — it calls backend.llm.generate_rag_kiosk_response, which
+    retrieves the same way but then passes the context to the LOCAL LLM
+    for a real generated answer instead of returning raw retrieved text.
+    This function is kept for /api/chat, a lower-level diagnostic endpoint
+    useful for inspecting exactly what RAGService itself returns.
+    """
+    k = k or RAG_TOP_K
+    try:
+        # Timeout is generous (60s) because RAGService downloads/loads its
+        # embedding model lazily on its very first search request ever —
+        # after that first warm-up it responds in well under a second.
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(
+                f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/search",
+                json={"query": query, "k": k},
+            )
+        resp.raise_for_status()
+        results = resp.json()
+    except httpx.RequestError as exc:
+        logger.error("[RAG] RAGService unreachable at %s: %s", RAG_SERVICE_URL, exc)
+        return "I'm having trouble reaching the knowledge base right now. Please visit the Admin Block for assistance."
+    except httpx.HTTPStatusError as exc:
+        logger.error("[RAG] RAGService returned an error: %s", exc.response.text)
+        return "I couldn't find an answer to that just now. Could you rephrase your question?"
+    except Exception as exc:
+        logger.error("[RAG] Unexpected error querying RAGService: %s", exc)
+        return "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
+
+    # Drop weak matches so an unrelated question doesn't get a confident-sounding
+    # but wrong answer stitched together from irrelevant chunks.
+    strong_results = [r for r in results if r.get("score", 0) >= RAG_SIMILARITY_THRESHOLD]
+    if not strong_results:
+        logger.info("[RAG] No result above threshold %.2f for: '%s' (best score=%s)",
+                    RAG_SIMILARITY_THRESHOLD, query,
+                    results[0]["score"] if results else "n/a")
+        return "I don't have information on that yet. Please check with the Admin Block or try rephrasing your question."
+
+    # Take the single best-matching chunk instead of stitching facts from
+    # several chunks together. strong_results is ordered by score, so the
+    # first chunk whose text actually contains the question's keywords is
+    # the best answer — stop there rather than appending more chunks that
+    # happen to also mention the same topic (which was producing repetitive,
+    # multi-part answers for simple one-fact questions).
+    answer = ""
+    fallback_text = ""
+    for r in strong_results[:3]:
+        raw_text = (r.get("text") or "").strip()
+        if not raw_text:
+            continue
+        raw_text = _strip_qa_labels(raw_text)
+        if not raw_text:
+            continue
+        extracted, matched = _extract_relevant_sentences(raw_text, query, max_sentences=1)
+        if matched:
+            answer = extracted
+            break
+        if not fallback_text:
+            fallback_text = raw_text
+
+    if not answer:
+        # Nothing matched a keyword anywhere — fall back to just the single
+        # best-ranked chunk's full text rather than stitching several
+        # unrelated chunks together.
+        answer = fallback_text
+
+    return answer or "I don't have information on that yet. Please check with the Admin Block or try rephrasing your question."
+
+
+# ==========================================
 # SERVER LIFECYCLE
 # ==========================================
 @asynccontextmanager
@@ -221,23 +626,22 @@ app = FastAPI(title="RNSIT Digital Receptionist", lifespan=lifespan)
 origins_raw = os.getenv("ALLOWED_ORIGINS", "")
 ALLOWED_ORIGINS = [origin.strip() for origin in origins_raw.split(",") if origin.strip()]
 
-# 2. Add the middleware with the processed list
-if not ALLOWED_ORIGINS or "*" in ALLOWED_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origin_regex=".*",
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-else:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=ALLOWED_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+# 2. Add the middleware - always allowing local dev and kiosk ports
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS if ALLOWED_ORIGINS else ["*"],
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Mount feature routers ────────────────────────────────────────────────────
+from backend.companion import router as companion_router
+from backend.escalation import router as escalation_router, staff_dashboard
+app.include_router(companion_router)
+app.include_router(escalation_router)
+app.add_api_route("/staff", staff_dashboard, response_class=HTMLResponse, methods=["GET"], tags=["escalation"])
 
 
 # ==========================================
@@ -272,7 +676,9 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             await ws.receive_text()
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
+        manager.disconnect(ws)
+    except Exception:
         manager.disconnect(ws)
 
 
@@ -302,6 +708,44 @@ def health():
 @app.get("/")
 def root():
     return {"status": "RNSIT Kiosk Backend is Live"}
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(..., description="Visitor's question, answered via the RAGService knowledge base")
+
+
+@app.post("/api/chat")
+async def proxy_to_rag(payload: QueryRequest):
+    """
+    Convenience POST endpoint: answers a question straight from the
+    RAGService knowledge base (port 8600 by default), then logs the
+    interaction to MongoDB and broadcasts it over the websocket so the
+    frontend and the /logs-dashboard admin view both see it — same as /ask.
+    """
+    global _last_activity_ts
+    _last_activity_ts = datetime.now().timestamp()
+
+    if not verify_input_safety(payload.query):
+        raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
+
+    sid = active_session["session_id"] if active_session else "unknown"
+    fid = active_session.get("face_id") if active_session else None
+
+    visitor_entry = _log_message(payload.query, "visitor")
+    await manager.broadcast({"type": "message", **visitor_entry})
+
+    answer = await query_rag_service(payload.query)
+
+    try:
+        user_n = (active_session.get("user_name") or "Guest") if active_session else "Guest"
+        await save_interaction(sid, payload.query, answer, face_id=fid, user_name=user_n)
+    except Exception as exc:
+        logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
+
+    kiosk_entry = _log_message(answer, "kiosk")
+    await manager.broadcast({"type": "message", **kiosk_entry})
+
+    return {"query": payload.query, "answer": answer, "source": "rag_service"}
 
 
 # ==========================================================
@@ -334,13 +778,12 @@ async def delete_face(face_id: str, username: str = Depends(authenticate_admin))
 async def update_face_name(face_id: str, payload: FaceUpdateRequest, username: str = Depends(authenticate_admin)):
     if db is None:
         raise HTTPException(status_code=500, detail="Database connection is inactive.")
-    result = await db.faces.update_one(
-        {"face_id": face_id},
-        {"$set": {"name": payload.name}}
-    )
-    if result.matched_count == 0:
+    updated = await update_face_name_with_alias(face_id, payload.name)
+    if not updated:
         raise HTTPException(status_code=404, detail="Face record not found.")
-    return {"message": f"Renamed profile to {payload.name}"}
+    if active_session and active_session.get("face_id") == face_id:
+        active_session["user_name"] = payload.name
+    return {"message": f"Renamed profile to '{payload.name}' and updated all associated sessions."}
 
 @app.delete("/api/admin/sessions/{session_id}")
 async def delete_session(session_id: str, username: str = Depends(authenticate_admin)):
@@ -382,9 +825,9 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         )
 
     # 1. Pull data concurrently from all four MongoDB collections
-    interactions_list = await db.interactions.find().sort("timestamp", -1).limit(50).to_list(length=50)
-    faces_list = await db.faces.find().sort("detected_at", -1).limit(50).to_list(length=50)
-    sessions_list = await db.sessions.find().sort("start_time", -1).limit(50).to_list(length=50)
+    interactions_list = await db.interactions.find().sort("timestamp", -1).limit(200).to_list(length=200)
+    faces_list = await db.faces.find().sort([("last_seen", -1), ("detected_at", -1)]).limit(100).to_list(length=100)
+    sessions_list = await db.sessions.find().sort([("started_at", -1), ("last_activity", -1)]).limit(100).to_list(length=100)
     profile_list = await db.college_profile.find().limit(100).to_list(length=100)
 
     # --- Tab 1: Build Interactions rows ---
@@ -393,13 +836,22 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
         ts = item.get("timestamp")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
+        u_name = item.get('user_name') or 'Guest'
+        input_t = item.get('input_text', '') or ''
+        # Detect name-change interactions so admin can spot them quickly
+        is_name_change = bool(__import__('re').search(
+            r'\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name|\bcall me\b|\bmy name is\b',
+            input_t, __import__('re').IGNORECASE
+        ))
+        name_change_badge = '<span style="background:#fef3c7;color:#92400e;font-size:10px;padding:2px 6px;border-radius:4px;font-weight:700;margin-left:5px;">🏷️ Name Changed</span>' if is_name_change else ''
         interaction_rows += f"""
         <tr id="interaction-{sess_id}">
             <td>{idx + 1}</td>
-            <td><code>{sess_id}</code></td>
-            <td><strong>{item.get('input_text', 'N/A')}</strong></td>
+            <td><strong style="color: #0066cc;">{u_name}</strong></td>
+            <td><code>{sess_id[:8] if sess_id != 'N/A' else 'N/A'}</code></td>
+            <td><strong>{input_t}</strong>{name_change_badge}</td>
             <td>{item.get('response_text', 'N/A')}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-danger" onclick="deleteInteraction('{sess_id}')">Delete Log</button>
             </td>
@@ -409,17 +861,33 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     # --- Tab 2: Build Faces rows ---
     face_rows = ""
     for idx, item in enumerate(faces_list):
-        ts = item.get("detected_at") or item.get("last_seen")
+        ts = item.get("last_seen") or item.get("detected_at")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         face_id = item.get('face_id', 'N/A')
         current_name = item.get('name', 'Unknown Visitor')
+        name_history = item.get('name_history', [])
+        name_updated_at = item.get('name_updated_at', '')
+        alias_html = ""
+        if name_history:
+            original_names = ', '.join(name_history)
+            # Prominent rename badge — shows old → new with timestamp
+            alias_html = (
+                f'<br><span style="display:inline-flex;align-items:center;gap:4px;margin-top:3px;'
+                f'background:#dbeafe;color:#1e40af;font-size:11px;padding:2px 7px;'
+                f'border-radius:4px;font-weight:600;">'
+                f'✏️ {original_names} → {current_name}</span>'
+            )
+            if name_updated_at:
+                alias_html += f'<br><span style="font-size:10px;color:#bbb;">Renamed at: {name_updated_at[:19]}</span>'
+        has_encoding = item.get('has_encoding', True)
+        encoding_badge = '' if has_encoding else '<br><span style="font-size:10px;color:#e67e22;background:#fff3e0;padding:1px 5px;border-radius:3px;font-weight:600;">Name only · no face scan</span>'
         face_rows += f"""
         <tr id="face-{face_id}">
             <td>{idx + 1}</td>
             <td><code>{face_id}</code></td>
-            <td><strong id="face-name-text-{face_id}">{current_name}</strong></td>
+            <td><strong id="face-name-text-{face_id}">{current_name}</strong>{alias_html}{encoding_badge}</td>
             <td>{item.get('visit_count', 1)}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
                 <button class="btn btn-edit" onclick="editFaceName('{face_id}', '{current_name}')">Rename</button>
                 <button class="btn btn-danger" onclick="deleteFace('{face_id}')">Delete</button>
@@ -430,17 +898,22 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
     # --- Tab 3: Build Sessions rows ---
     session_rows = ""
     for idx, item in enumerate(sessions_list):
-        ts = item.get("start_time")
+        ts = item.get("started_at") or item.get("start_time") or item.get("last_activity")
         time_str = ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(ts, datetime) else str(ts or "N/A")
         sess_id = item.get('session_id', 'N/A')
+        u_name = item.get('user_name', 'Guest')
+        s_face_id = item.get('face_id') or ''
+        guest_badge = ''
+        if not s_face_id:
+            guest_badge = ' <span style="font-size:10px;background:#f3f4f6;color:#6b7280;padding:2px 6px;border-radius:4px;font-weight:600;">No face scan</span>'
         session_rows += f"""
         <tr id="session-{sess_id}">
             <td><code>{sess_id}</code></td>
-            <td>{item.get('user_name', 'Guest')}</td>
+            <td><strong style="color: #0066cc;">{u_name}</strong>{guest_badge}</td>
             <td>{item.get('visit_count', 1)}</td>
-            <td><span class="badge">{time_str}</span></td>
+            <td><span class="badge">{time_str[:19]}</span></td>
             <td>
-                <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End & Delete</button>
+                <button class="btn btn-danger" onclick="deleteSession('{sess_id}')">End &amp; Delete</button>
             </td>
         </tr>
         """
@@ -517,16 +990,17 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
                     <table>
                         <thead>
                             <tr>
-                                <th style="width: 5%">#</th>
-                                <th style="width: 15%">Session ID</th>
+                                <th style="width: 4%">#</th>
+                                <th style="width: 14%">Visitor</th>
+                                <th style="width: 12%">Session ID</th>
                                 <th style="width: 25%">User Query</th>
-                                <th style="width: 35%">Kiosk Response</th>
-                                <th style="width: 12%">Timestamp</th>
-                                <th style="width: 8%">Action</th>
+                                <th style="width: 32%">Kiosk Response</th>
+                                <th style="width: 7%">Time</th>
+                                <th style="width: 6%">Action</th>
                             </tr>
                         </thead>
                         <tbody>
-                            {interaction_rows if interaction_rows else "<tr><td colspan='6' style='text-align:center;'>No interactions recorded yet.</td></tr>"}
+                            {interaction_rows if interaction_rows else "<tr><td colspan='7' style='text-align:center;'>No interactions recorded yet.</td></tr>"}
                         </tbody>
                     </table>
                 </div>
@@ -692,17 +1166,46 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
 
 INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
-def build_greeting(name: str, is_returning: bool, resumed: bool) -> str:
-    """The exact spoken lines for first-time vs returning visitors."""
-    who = name if name and name not in ("Guest", "Unknown", "") else "there"
-    if not is_returning:
-        return (f"Welcome {who}! I am the digital receptionist of {INSTITUTE_NAME}. "
-                f"I can help you with admissions, departments, placements, fees, "
-                f"and finding your way around campus. How may I assist you today?")
-    if resumed:
-        return (f"Welcome back, {who}! Good to see you again. "
-                f"We can continue where we left off. How may I assist you today?")
-    return f"Welcome back, {who}! How may I assist you today?"
+def build_greeting(name: str, is_returning: bool, resumed: bool,
+                    previous_topic: str | None = None) -> str:
+    """The exact spoken lines for first-time vs returning/named visitors."""
+    who = name if name and name not in ("Guest", "Unknown", "", "Friend") else ""
+    if who:
+        if resumed and previous_topic:
+            return (f"Welcome back, {who}! Good to see you again. Last time you were asking about "
+                    f"{previous_topic} — would you like to continue with that, "
+                    f"or help with something else today?")
+        if resumed:
+            return (f"Welcome back, {who}! Good to see you again. "
+                    f"We can continue where we left off. How may I assist you today?")
+        return f"Welcome back, {who}! How may I assist you today?"
+
+    return (f"Welcome! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
+            f"I can help you with admissions, departments, placements, fees, "
+            f"and finding your way around campus. How may I assist you today?")
+
+
+async def _issue_companion_token_async(session_id: str) -> None:
+    """Background task: issue a companion token and broadcast the QR URL."""
+    try:
+        from backend.companion import _issue_token, COMPANION_BASE_URL
+        snap = {
+            "session_id": session_id,
+            "user_name":  (active_session or {}).get("user_name", "Guest"),
+            "face_id":    (active_session or {}).get("face_id", ""),
+            "issued_at":  datetime.now().isoformat(),
+        }
+        token = _issue_token(snap)
+        url = f"{COMPANION_BASE_URL}/companion/{token}"
+        await manager.broadcast({
+            "type":    "companion_qr",
+            "url":     url,
+            "token":   token,
+            "expires_in_seconds": COMPANION_TOKEN_TTL_MINUTES * 60,
+        })
+        logger.info("[COMPANION] QR token issued and broadcast for session=%s", session_id[:8])
+    except Exception as e:
+        logger.warning("[COMPANION] Token issuance failed: %s", e)
 
 
 async def resume_or_create_session(face_id: str, user_name: str,
@@ -717,6 +1220,7 @@ async def resume_or_create_session(face_id: str, user_name: str,
     resumed = False
     continued_from = None
     session_id = None
+    previous_topic = None
 
     if face_id:
         prev = await find_recent_session_by_face(face_id, days=30)
@@ -729,6 +1233,29 @@ async def resume_or_create_session(face_id: str, user_name: str,
     if not session_id:
         session_id = str(uuid.uuid4())               # never face_id
 
+    # ── Memory-aware re-engagement: look up what they last asked about ──
+    # Pulls the last few (not just one) stored questions from their
+    # previous session so the topic summary covers everything they were
+    # asking about (e.g. "hostel facilities and fees"), not only their
+    # final message. Only attempted for resumed sessions; failures here
+    # are non-fatal and simply fall back to the generic greeting (see
+    # build_greeting).
+    if resumed:
+        try:
+            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=3)
+            recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
+            if recent_questions:
+                previous_topic = await extract_topic_label(recent_questions)
+                logger.info(
+                    "[SESSION] Re-engagement lookup: last_qs=%r -> topic=%r",
+                    recent_questions, previous_topic,
+                )
+            else:
+                logger.info("[SESSION] Re-engagement lookup: no prior interaction on file for face=%s session=%s", face_id, session_id)
+        except Exception as e:
+            logger.warning(f"[SESSION] Skipping re-engagement topic lookup: {e}")
+            previous_topic = None
+
     sess = {
         "session_id":   session_id,
         "user_name":    user_name,
@@ -739,7 +1266,14 @@ async def resume_or_create_session(face_id: str, user_name: str,
         "asking_name":  False,
         "resumed":      resumed,
         "resumed_at":   datetime.now().isoformat(),
-        "greeting":     build_greeting(user_name, is_returning, resumed),
+        "previous_topic": previous_topic,
+        # True only when the greeting actually named a topic and asked a
+        # "continue with that, or something else?" question — the NEXT
+        # visitor reply, if it's a short accept/decline like "something
+        # else" or "yes", is about THAT offer, not a new RAG-worthy
+        # question, and must be intercepted before RAG (see /ask).
+        "awaiting_topic_choice": bool(previous_topic),
+        "greeting":     build_greeting(user_name, is_returning, resumed, previous_topic),
     }
 
     await save_session(session_id, face_id or None, user_name,
@@ -784,9 +1318,10 @@ async def start_session(
             "session":    active_session,
         }
 
-    active_session    = new_sess
-    message_log       = []
-    _last_activity_ts = datetime.now().timestamp()
+    active_session      = new_sess
+    message_log         = []
+    _last_activity_ts   = datetime.now().timestamp()
+    _low_confidence_count = 0  # reset escalation counter on new session
 
     # NOTE: resume_or_create_session() already persisted this session.
     await manager.broadcast({
@@ -794,23 +1329,56 @@ async def start_session(
         "session": active_session,
         "tts_text": active_session.get("greeting", ""),
     })
+
+    # Issue companion QR token and broadcast URL to the kiosk frontend
+    asyncio.create_task(_issue_companion_token_async(final_session_id))
+
     return {"status": "success", "session_id": final_session_id, "session": active_session}
 
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
-    global active_session, _last_activity_ts
+    global active_session, _last_activity_ts, _low_confidence_count
     sid = session_id or (active_session["session_id"] if active_session else None)
-    
-    active_session    = None
-    _last_activity_ts = 0.0
+
+    # Clean up companion tokens for this session
+    if sid:
+        try:
+            from backend.companion import _invalidate_session_tokens
+            _invalidate_session_tokens(sid)
+        except Exception as _ce:
+            logger.warning("[SESSION] Companion token cleanup failed: %s", _ce)
+
+    active_session      = None
+    _last_activity_ts   = 0.0
+    _low_confidence_count = 0
     await manager.broadcast({"type": "session_end", "session_id": sid})
     return {"status": "success"}
 
 
+@app.post("/session/are_you_there")
+async def are_you_there_endpoint():
+    global active_session
+    if active_session:
+        user_name = active_session.get("user_name") or "there"
+        sid = active_session.get("session_id") or ""
+        logger.info(f"[SESSION] Triggering 3s departure prompt for '{user_name}'")
+        tts_prompt = f"Are you there, {user_name}?" if user_name not in ("Guest", "there", "Unknown", "") else "Are you there?"
+        await manager.broadcast({
+            "type": "are_you_there",
+            "user_name": user_name,
+            "session_id": sid,
+            "tts_text": tts_prompt,
+        })
+        return {"status": "ok", "user_name": user_name}
+    return {"status": "no_active_session"}
+
+
 @app.get("/session/current")
 def get_current_session():
+    global _last_activity_ts
     if active_session:
+        _last_activity_ts = datetime.now().timestamp()
         return {"active": True, **active_session}
     return {"active": False}
 
@@ -846,6 +1414,302 @@ async def post_message(payload: MessagePayload):
 # ==========================================
 # CORE WORKFLOW ROUTING ENGINE (ASK)
 # =========================================
+# Fallback/apology-shaped answers are NEVER cached at the normal 1-hour
+# TTL. Without this guard, a question asked during a temporary outage
+# (RAGService down, LLM down) gets its "I don't know" answer cached as
+# if it were correct, and keeps serving that same apology for an hour
+# even after everything recovers — exactly what happened with "where is
+# canteen" during a RAGService outage tonight.
+# Module-level (was previously defined inline inside ask_kiosk) so both
+# /ask and /ask/stream share the exact same cacheability rule.
+_UNCACHEABLE_PATTERNS = (
+    "i don't have that detail",
+    "temporarily unavailable",
+    "having trouble accessing",
+    "having trouble processing",
+    "having trouble formatting",
+    "connectivity issues",
+    "couldn't generate a conversational response",   # Tier-3 degraded answer
+)
+
+
+def _is_cacheable(ans: str) -> bool:
+    a = (ans or "").lower()
+    return not any(p in a for p in _UNCACHEABLE_PATTERNS)
+
+
+async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
+    """
+    All the fast, deterministic pre-RAG routes — greeting, farewell,
+    memory-recall, and topic-choice reply — factored out of ask_kiosk so
+    /ask and /ask/stream take EXACTLY the same fast path for these and can
+    never drift apart. Performs whatever side effects each route needs
+    (session-state mutation, the farewell's session_end broadcast) itself,
+    since those don't depend on which endpoint is asking.
+
+    Returns (answer, source, session_action) if one of these matched, or
+    None if the question needs the real RAG/LLM pipeline.
+    """
+    global active_session, _last_activity_ts
+
+    # ─── Explicit human-handover intent → escalate before RAG ──────────────
+    # Import lazily to avoid circular import at module load time
+    try:
+        from backend.escalation import _detect_human_intent, _trigger_escalation
+        if _detect_human_intent(q_normalized):
+            # Build transcript from current message_log for staff context
+            transcript = [
+                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+                for m in message_log[-10:]
+            ]
+            asyncio.create_task(_trigger_escalation(
+                session_id=sid,
+                face_id=active_session.get("face_id") if active_session else None,
+                user_name=visitor_name,
+                reason="user_request",
+                transcript=transcript,
+            ))
+            logger.info("[ROUTE] ESCALATION (deterministic) — '%s'", q_normalized)
+            return (
+                "I'm connecting you to a staff member at the front desk right now. "
+                "Please wait a moment — someone will be with you shortly.",
+                "escalation",
+                "CONTINUE",
+            )
+    except Exception as _esc_err:
+        logger.warning("[ROUTE] Escalation intent check failed: %s", _esc_err)
+
+    # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
+    if _matches_short_phrase(q_normalized, GREETING_PHRASES):
+        answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
+        logger.info("[ROUTE] GREETING (deterministic) — '%s'", q_normalized)
+        return answer, "greeting", "CONTINUE"
+
+    # ─── Easter eggs → instant, deterministic, zero RAG/LLM round-trip ──────
+    # Same short-utterance safety net as GREETING_PHRASES: only fires for a
+    # standalone match (<=4 words), never for a real question that happens
+    # to contain one of these phrases as a fragment.
+    for phrase, responses in EASTER_EGGS.items():
+        if _matches_short_phrase(q_normalized, {phrase}):
+            answer = responses[hash(sid + phrase) % len(responses)]
+            logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
+            return answer, "easter_egg", "CONTINUE"
+
+    # ─── Change Name Request ────────────────────────────────────────────────
+    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
+    INVALID_NAME_STARTS = (
+        "a student", "student", "a visitor", "visitor", "a parent", "parent",
+        "looking for", "interested in", "here for", "going to", "from",
+        "trying to", "asking", "calling", "an engineering", "ordering",
+    )
+    INVALID_NAME_WORDS = {
+        "all", "right", "alright", "sure", "fine", "cool", "done", "wait", "stop",
+        "cancel", "yeah", "yep", "nope", "got", "good", "morning", "evening",
+        "afternoon", "night", "understood", "talk", "speak", "staff", "human",
+        "person", "student", "university", "bengaluru", "bangalore", "task", "nature",
+    }
+
+    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"^(?:i am|iam|myself)\s+([a-zA-Z\s,.-]+)", q_normalized)
+
+    if name_change_match:
+        test_raw = name_change_match.group(1).strip().lower()
+        if any(test_raw.startswith(prefix) for prefix in INVALID_NAME_STARTS):
+            name_change_match = None
+    if name_change_match:
+        new_name_raw = name_change_match.group(1).strip()
+        if "," in new_name_raw:
+            new_name_raw = new_name_raw.split(",")[0].strip()
+        new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
+        if (
+            new_name_words
+            and len(new_name_words) <= 3
+            and all(w.isalpha() for w in new_name_words)
+            and not any(w.lower() in INVALID_NAME_WORDS for w in new_name_words)
+            and not any(x in new_name_raw.lower() for x in ["blink", "twice", "yes", "no", "eye", "emoji"])
+        ):
+            new_name = " ".join(new_name_words)
+            if active_session:
+                active_session["user_name"] = new_name
+                face_id_for_rename = active_session.get("face_id") or ""
+                sid_for_rename = active_session.get("session_id") or ""
+                if sid_for_rename:
+                    await update_session_user_name(sid_for_rename, new_name)
+                    await interactions_collection.update_many(
+                        {"session_id": sid_for_rename},
+                        {"$set": {"user_name": new_name}}
+                    )
+                if face_id_for_rename:
+                    await update_face_name_with_alias(face_id_for_rename, new_name)
+                    logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
+                                face_id_for_rename[:8], new_name)
+                else:
+                    # Register face for guest who provided a name so they appear in face tracks
+                    try:
+                        from backend.detection import ST, _load_known_faces
+                        anchor = ST.snapshot().get("anchor")
+                        new_fid = str(uuid.uuid4())
+                        if anchor:
+                            await save_face_encoding(new_fid, new_name, anchor, [anchor])
+                            ST.set(face_id=new_fid, identity=new_name)
+                        else:
+                            await save_face_encoding(new_fid, new_name, [], [])
+                        active_session["face_id"] = new_fid
+                        if sid_for_rename:
+                            await sessions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                            await interactions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                        _load_known_faces(force=True)
+                        logger.info(f"[ROUTE] Registered face for former guest '{new_name}' face_id={new_fid[:8]}")
+                    except Exception as ex:
+                        logger.warning(f"[ROUTE] Could not register face anchor: {ex}")
+                await manager.broadcast({
+                    "type": "session_update",
+                    "session": active_session,
+                    "user_name": new_name,
+                    "face_id": active_session.get("face_id", ""),
+                })
+            answer = f"Done! I have changed your name to {new_name}. How may I assist you today?"
+            logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
+            return answer, "name_change", "CONTINUE"
+
+    if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
+       re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
+        answer = "Sure! You can say \"change my name to [Your Name]\" anytime, and I'll update it for you."
+        return answer, "name_change_help", "CONTINUE"
+
+    # ─── Stop / Cancel escalation or cancel staff request ──────────────────
+    STOP_PHRASES = (
+        "stop", "cancel", "cancel staff", "no staff", "stop connecting",
+        "dont connect", "don't connect", "never mind", "nevermind",
+        "go back", "back to nova", "continue with nova", "i don't need staff",
+        "i dont need staff", "no human", "continue with bot", "cancel request",
+        "no thanks", "stop it", "abort",
+    )
+    is_stop = any(q_normalized == sp or q_normalized.startswith(sp + " ") or q_normalized.endswith(" " + sp) for sp in STOP_PHRASES)
+    if is_stop:
+        from backend.escalation import _get_escalation_state, cancel_escalation
+        esc_state = _get_escalation_state(sid) if sid else None
+        if esc_state and esc_state.get("status") in ("STAFF_NOTIFIED", "STAFF_CONNECTED"):
+            await cancel_escalation(sid, reason="visitor_cancelled")
+            answer = "Cancelled! Nova will continue assisting you right here. What would you like to know?"
+            logger.info("[ROUTE] ESCALATION_CANCEL (deterministic) — session=%s", sid[:8])
+            return answer, "escalation_cancel", "CONTINUE"
+        elif q_normalized in ("stop", "cancel", "stop it", "abort"):
+            answer = "Sure, I'm here! What would you like to know about RNSIT?"
+            logger.info("[ROUTE] STOP_COMMAND (deterministic) — session=%s", sid[:8])
+            return answer, "stop_command", "CONTINUE"
+
+    # ─── Voice-only Escalation (Pre-RAG Deterministic Handover) ─────────────
+    # Intercept human staff requests and sensitive emergencies BEFORE RAG/LLM
+    # so we never return "I don't have that detail" when the visitor asks for staff!
+    from backend.escalation import _detect_human_intent, _detect_sensitive, _trigger_escalation
+
+    if _detect_sensitive(q_normalized):
+        esc_transcript = [
+            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+            for m in message_log[-10:]
+        ]
+        fid = active_session.get("face_id") if active_session else None
+        await _trigger_escalation(
+            session_id=sid,
+            face_id=fid,
+            user_name=visitor_name,
+            reason="sensitive_topic",
+            transcript=esc_transcript,
+        )
+        answer = "I am alerting campus security and front desk staff immediately to assist you. Please wait right here."
+        logger.info("[ROUTE] SENSITIVE_ESCALATION (deterministic) — session=%s", sid[:8])
+        return answer, "escalation_sensitive", "CONTINUE"
+
+    if _detect_human_intent(q_normalized):
+        esc_transcript = [
+            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+            for m in message_log[-10:]
+        ]
+        fid = active_session.get("face_id") if active_session else None
+        await _trigger_escalation(
+            session_id=sid,
+            face_id=fid,
+            user_name=visitor_name,
+            reason="user_request",
+            transcript=esc_transcript,
+        )
+        answer = "I am connecting you to our front desk staff right now. Please hold on a moment while I alert them to assist you directly at this kiosk. If you want to continue with me instead, simply say 'stop' at any time."
+        logger.info("[ROUTE] HUMAN_ESCALATION (deterministic) — session=%s", sid[:8])
+        return answer, "escalation_request", "CONTINUE"
+
+    # ─── Thank you / bye / natural sign-off → end session immediately ───────
+    if _is_farewell(q_normalized):
+        farewell = (
+            f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
+            "Have a great day. Goodbye!"
+        )
+        logger.info("[ROUTE] FAREWELL (deterministic) — '%s'", q_normalized)
+        active_session    = None
+        _last_activity_ts = 0.0
+        await manager.broadcast({
+            "type":       "session_end",
+            "session_id": sid,
+            "reason":     "thank_you",
+        })
+        return farewell, "farewell", "END"
+
+    # ─── "What was my last session about?" → answer from stored memory ──────
+    MEMORY_RECALL_PHRASES = (
+        "last session", "last time", "previous session", "previous time",
+        "what did i ask", "what did we talk about", "what did i talk about",
+        "earlier session", "my last visit", "last visit",
+    )
+    if any(phrase in q_normalized for phrase in MEMORY_RECALL_PHRASES):
+        prev_topic = (active_session or {}).get("previous_topic")
+        if not prev_topic and active_session and (active_session.get("face_id") or active_session.get("session_id")):
+            try:
+                recent = await get_recent_interactions(
+                    session_id=active_session.get("session_id"),
+                    face_id=active_session.get("face_id"),
+                    limit=3,
+                )
+                recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
+                if recent_questions:
+                    prev_topic = await extract_topic_label(recent_questions)
+            except Exception as e:
+                logger.warning(f"[MEMORY RECALL] Lookup failed: {e}")
+
+        if prev_topic:
+            answer = (f"Last time you were asking about {prev_topic}. "
+                      f"Want me to continue with that, or help with something else?")
+        else:
+            answer = ("I don't have a record of an earlier session for you — "
+                      "this looks like the start of a fresh conversation. "
+                      "What would you like help with today?")
+        logger.info("[ROUTE] MEMORY_RECALL (deterministic) — '%s' -> topic=%r", q_normalized, prev_topic)
+        return answer, "memory_recall", "CONTINUE"
+
+    # ─── Reply to "continue with X, or something else?" re-engagement ───────
+    if active_session and active_session.get("awaiting_topic_choice"):
+        active_session["awaiting_topic_choice"] = False  # applies to this one reply only
+        prev_topic = active_session.get("previous_topic")
+
+        if _matches_short_phrase(q_normalized, TOPIC_DECLINE_PHRASES):
+            answer = "Sure! What would you like help with today?"
+            logger.info("[ROUTE] TOPIC_CHOICE_DECLINE (deterministic) — '%s'", q_normalized)
+            return answer, "topic_choice_decline", "CONTINUE"
+
+        if _matches_short_phrase(q_normalized, TOPIC_CONTINUE_PHRASES):
+            if prev_topic:
+                answer = f"Great, let's continue with {prev_topic}. What would you like to know?"
+            else:
+                answer = "Sure, what would you like to know?"
+            logger.info("[ROUTE] TOPIC_CHOICE_CONTINUE (deterministic) — '%s'", q_normalized)
+            return answer, "topic_choice_continue", "CONTINUE"
+        # else: not a short accept/decline — treat as a real question and
+        # fall straight through to the normal pipeline.
+
+    return None
+
+
 @app.get("/ask")
 async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     global _last_activity_ts, active_session
@@ -858,47 +1722,43 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
     q_clean = question.lower().strip()
     q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
 
+    # Multi-word mis-hearings (e.g. "r n s fit") first, then single-word
+    # ones — both feed into q_normalized, which is what's actually sent
+    # to retrieval below (see the "corrected_question" note further down).
+    for wrong_phrase, right_phrase in PHRASE_CORRECTIONS.items():
+        q_clean = re.sub(rf"(?:^|\s){re.escape(wrong_phrase)}(?:$|\s)", f" {right_phrase} ", q_clean)
+    q_clean = q_clean.strip()
+
     words           = q_clean.split()
     corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
     q_normalized    = " ".join(corrected_words)
 
     sid          = active_session["session_id"] if active_session else "unknown"
+    fid          = active_session.get("face_id") if active_session else None
     visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
 
     visitor_entry = _log_message(question, "visitor")
     await manager.broadcast({"type": "message", **visitor_entry})
 
-    async def _respond(answer: str, source: str = "") -> dict:
+    async def _respond(answer: str, source: str = "", session_action: str = "CONTINUE") -> dict:
         try:
-            await save_interaction(sid, question, answer)
+            await save_interaction(sid, question, answer, face_id=fid, user_name=visitor_name)
         except Exception as exc:
             logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
         kiosk_entry = _log_message(answer, "kiosk")
         await manager.broadcast({"type": "message", **kiosk_entry})
-        result = {"question": question, "answer": answer}
+        result = {"question": question, "answer": answer, "session_action": session_action}
         if source:
             result["source"] = source
         return result
 
-    # ─── Thank you → end session immediately ─────────────────────────────────
-    THANK_YOU_PHRASES = {
-        "thank you", "thanks", "thank u", "thankyou",
-        "ok thanks", "okay thanks", "ok thank you", "okay thank you",
-        "thats all", "thats all thanks", "bye", "goodbye", "that is all",
-    }
-    if any(phrase in q_normalized for phrase in THANK_YOU_PHRASES):
-        farewell = (
-            f"You're welcome{', ' + visitor_name if visitor_name != 'there' else ''}! "
-            "Have a great day. Goodbye!"
-        )
-        active_session    = None
-        _last_activity_ts = 0.0
-        await manager.broadcast({
-            "type":       "session_end",
-            "session_id": sid,
-            "reason":     "thank_you",
-        })
-        return await _respond(farewell)
+    # ─── Deterministic fast paths (greeting/farewell/memory-recall/topic-
+    # choice), shared with /ask/stream — see _deterministic_route for why
+    # this is factored out instead of inlined here. ─────────────────────
+    det = await _deterministic_route(q_normalized, sid, visitor_name)
+    if det is not None:
+        answer, source, session_action = det
+        return await _respond(answer, source=source, session_action=session_action)
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
     cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
@@ -911,36 +1771,223 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
-    # ─── External Team LLM RAG Pipeline Handoff ─────────────────────────────────
-    logger.info("[CACHE MISS] Invoking external team's custom RAG pipeline for: '%s'", q_normalized)
-    
-    # Process memory bounds safely matching the structure they parse
-    safe_history = message_log[-6:] if len(message_log) > 0 else []
-    
+    # ─── RNSIT_RAG / GENERAL_LLM / LIVE_INFO / UNSUPPORTED_EXTERNAL ─────────
+    # generate_rag_kiosk_response is the real pipeline: condense follow-up
+    # questions using recent history -> semantic search against RAGService
+    # -> threshold check -> ground the LOCAL LLM in the retrieved context (or
+    # route off-topic questions through _handle_offtopic) -> natural answer.
+    # This is the function that was previously built but never wired up to
+    # any live endpoint — /ask used to call the LLM-free query_rag_service
+    # instead, which is why answers kept working with the LLM disconnected.
+    recent_history = [
+        {"speaker": m["speaker"], "text": m["text"]}
+        for m in message_log[-6:]
+        if m.get("index") != visitor_entry.get("index")
+    ]
+
     try:
-        # Call the other team's function directly. It reads its own env vars, 
-        # manages context from college_info.json, and contacts their LLM platform.
-        answer = await generate_rag_kiosk_response(q_normalized, history=safe_history)
-        
-        # Cache the successful response back in Redis
+        # THE FIX: q_normalized already has DOMAINS_CORRECTIONS/PHRASE_
+        # CORRECTIONS applied (typos, and STT mis-hearings of "RNSIT"
+        # itself) but was previously only used for greeting/farewell/
+        # memory-recall matching — RAG retrieval was still getting the
+        # raw, uncorrected `question`, so a misheard "RNSFIT" never got
+        # normalized back to "RNSIT" before the embedding search ran.
+        answer = await generate_rag_kiosk_response(q_normalized, history=recent_history)
+
         if redis_client and answer:
             try:
-                redis_client.set(cache_key, answer, ex=3600)
+                if _is_cacheable(answer):
+                    redis_client.set(cache_key, answer, ex=3600)
+                else:
+                    logger.info("[REDIS] Skipped caching a fallback/apology answer "
+                               "(would have poisoned this question for 1 hour): %r", answer[:80])
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
-                
+
     except Exception as exc:
-        logger.error("External team's LLM engine failed or threw an exception: %s", exc)
+        logger.error("[LLM PIPELINE] generate_rag_kiosk_response failed: %s", exc)
         answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
 
-    return await _respond(answer, source="external_team_llm")
+    # ── Escalation check: low-confidence / sensitive topic detection ──────────
+    global _low_confidence_count
+    answer_is_low_confidence = not _is_cacheable(answer)
+    if answer_is_low_confidence:
+        _low_confidence_count += 1
+    else:
+        _low_confidence_count = max(0, _low_confidence_count - 1)  # decay on good answer
+
+    try:
+        from backend.escalation import maybe_escalate, _detect_sensitive
+        # Build transcript for escalation context
+        esc_transcript = [
+            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+            for m in message_log[-10:]
+        ]
+        escalated = await maybe_escalate(
+            question=question,
+            answer=answer,
+            session_id=sid,
+            face_id=fid,
+            user_name=visitor_name,
+            low_confidence_count=_low_confidence_count,
+            transcript=esc_transcript,
+        )
+        if escalated:
+            answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
+    except Exception as _esc_err:
+        logger.warning("[ASK] Escalation check failed: %s", _esc_err)
+
+    return await _respond(answer, source="rag_llm")
+
+
+@app.get("/ask/stream")
+async def ask_kiosk_stream(question: str = Query(..., description="Visitor question")):
+    """
+    Streaming sibling of /ask — sends the answer as Server-Sent Events,
+    one event per SENTENCE, as soon as each sentence is ready, instead of
+    one big JSON blob after the whole answer (and its whole LLM generation)
+    is done. Lets the frontend start speaking the first sentence while the
+    rest is still being generated (see generate_rag_kiosk_response_stream
+    and chat_completion_with_fallback_stream in llm.py for where the actual
+    streaming happens).
+
+    Event shapes sent (each a `data: {...}\\n\\n` line):
+      {"sentence": "..."}   — one for each completed sentence, in order
+      {"done": true, "answer": "...", "session_action": "CONTINUE"|"END"}
+        — always sent last, with the full reconstructed answer (so the
+        frontend can still show/log the complete text) and whatever
+        session_action a matched deterministic route (e.g. farewell) needs.
+
+    Shares ALL the same routing (deterministic fast paths, Redis cache) as
+    /ask via _deterministic_route — the only thing that's actually
+    different between the two endpoints is HOW the RNSIT_RAG/LLM answer is
+    delivered to the client once we know it's going through the slow path.
+    """
+    global _last_activity_ts, active_session
+    _last_activity_ts = datetime.now().timestamp()
+
+    if not verify_input_safety(question):
+        raise HTTPException(status_code=400, detail="Security Exception: Request contains blocked sequences.")
+
+    q_clean = question.lower().strip()
+    q_clean = q_clean.translate(str.maketrans('', '', string.punctuation)).strip()
+    for wrong_phrase, right_phrase in PHRASE_CORRECTIONS.items():
+        q_clean = re.sub(rf"(?:^|\s){re.escape(wrong_phrase)}(?:$|\s)", f" {right_phrase} ", q_clean)
+    q_clean = q_clean.strip()
+    words           = q_clean.split()
+    corrected_words = [DOMAINS_CORRECTIONS.get(w, w) for w in words]
+    q_normalized    = " ".join(corrected_words)
+
+    sid          = active_session["session_id"] if active_session else "unknown"
+    fid          = active_session.get("face_id") if active_session else None
+    visitor_name = (active_session.get("user_name") or "there") if active_session else "there"
+
+    visitor_entry = _log_message(question, "visitor")
+    await manager.broadcast({"type": "message", **visitor_entry})
+
+    async def _finish(answer: str, session_action: str = "CONTINUE"):
+        try:
+            await save_interaction(sid, question, answer, face_id=fid, user_name=visitor_name)
+        except Exception as exc:
+            logger.error("[DATABASE ERROR] Failed to log interaction: %s", exc)
+        kiosk_entry = _log_message(answer, "kiosk")
+        await manager.broadcast({"type": "message", **kiosk_entry})
+
+    async def _sse_gen():
+        # ── Deterministic fast paths — identical decision to /ask ────────
+        det = await _deterministic_route(q_normalized, sid, visitor_name)
+        if det is not None:
+            answer, source, session_action = det
+            yield f"data: {json.dumps({'sentence': answer})}\n\n"
+            await _finish(answer, session_action)
+            yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': session_action})}\n\n"
+            return
+
+        # ── Redis cache — also a single instant chunk, same as /ask ──────
+        cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
+        if redis_client:
+            try:
+                cached = redis_client.get(cache_key)
+                if cached:
+                    logger.info("[REDIS HIT] For normalized key: '%s'", q_normalized)
+                    yield f"data: {json.dumps({'sentence': cached})}\n\n"
+                    await _finish(cached, "CONTINUE")
+                    yield f"data: {json.dumps({'done': True, 'answer': cached, 'session_action': 'CONTINUE'})}\n\n"
+                    return
+            except Exception as e:
+                logger.warning("Redis read error: %s", e)
+
+        # ── Real streaming path: RNSIT_RAG / off-topic / etc. ─────────────
+        recent_history = [
+            {"speaker": m["speaker"], "text": m["text"]}
+            for m in message_log[-6:]
+            if m.get("index") != visitor_entry.get("index")
+        ]
+
+        parts: list[str] = []
+        try:
+            async for sentence in generate_rag_kiosk_response_stream(q_normalized, history=recent_history):
+                parts.append(sentence)
+                yield f"data: {json.dumps({'sentence': sentence})}\n\n"
+            answer = "".join(parts).strip()
+            if not answer:
+                answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
+                yield f"data: {json.dumps({'sentence': answer})}\n\n"
+        except Exception as exc:
+            logger.error("[LLM PIPELINE] generate_rag_kiosk_response_stream failed: %s", exc)
+            answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
+            yield f"data: {json.dumps({'sentence': answer})}\n\n"
+
+        if redis_client and answer:
+            try:
+                if _is_cacheable(answer):
+                    redis_client.set(cache_key, answer, ex=3600)
+                else:
+                    logger.info("[REDIS] Skipped caching a fallback/apology answer "
+                               "(would have poisoned this question for 1 hour): %r", answer[:80])
+            except Exception as e:
+                logger.warning("Redis write error: %s", e)
+
+        # ── Escalation check for streaming path ───────────────────────────────
+        global _low_confidence_count
+        if not _is_cacheable(answer):
+            _low_confidence_count += 1
+        else:
+            _low_confidence_count = max(0, _low_confidence_count - 1)
+        try:
+            from backend.escalation import maybe_escalate
+            esc_transcript = [
+                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
+                for m in message_log[-10:]
+            ]
+            escalated = await maybe_escalate(
+                question=question,
+                answer=answer,
+                session_id=sid,
+                face_id=fid,
+                user_name=visitor_name,
+                low_confidence_count=_low_confidence_count,
+                transcript=esc_transcript,
+            )
+            if escalated:
+                answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
+        except Exception as _esc_err:
+            logger.warning("[STREAM] Escalation check failed: %s", _esc_err)
+
+        await _finish(answer, "CONTINUE")
+        yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': 'CONTINUE'})}\n\n"
+
+    return StreamingResponse(_sse_gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",   # nginx: don't buffer the stream if this ever sits behind one
+    })
 # ==========================================
 # BIOMETRICS / FACE REGISTRATION ENDPOINTS
 # ==========================================
 class RegisterFacePayload(BaseModel):
     face_id:  str         = Field(..., description="Unique face id")
     name:     str         = Field(..., description="Person's name")
-    encoding: List[float] = Field(..., description="Face encoding vector")
+    encoding: List[float] = Field(default_factory=list, description="Face encoding vector")
     encodings: List[List[float]] = Field(default_factory=list,
                                          description="Multi-template encodings (preferred)")
 
@@ -999,15 +2046,17 @@ async def stt_websocket_endpoint(ws: WebSocket):
       browser -> binary frame : one COMPLETE utterance (16 kHz mono int16 PCM)
       backend -> JSON frame   : {text, confidence, language, latency_ms}
     """
-    await ws.accept()
-    logger.info("[WS/STT] Kiosk connected")
     try:
+        await ws.accept()
+        logger.info("[WS/STT] Kiosk connected")
         while True:
             pcm_bytes = await ws.receive_bytes()
             result = await asyncio.to_thread(transcribe_pcm, pcm_bytes, "en")
             await ws.send_json(result)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         logger.info("[WS/STT] Kiosk disconnected")
+    except Exception as e:
+        logger.info(f"[WS/STT] Kiosk disconnected: {e}")
 
 
 @app.websocket("/ws/detect")
@@ -1016,13 +2065,17 @@ async def detect_websocket(ws: WebSocket):
     Browser-camera detection pipeline (cross-platform, no native window needed).
 
     Browser → backend : JSON  {"frame": "<base64 JPEG>"}
-    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders}
+    Backend → browser : JSON  {present, state, identity, verified, bbox, bystanders, blink}
 
     bbox format when present: {x, y, w, h}  — pixel coords in the captured frame
+    `blink` is an experimental, debounced one-frame blink EVENT (true for
+    exactly the frame the blink completed on) — the frontend can use it as
+    an optional "yes" gesture. It never affects detection.py's own state
+    machine.
     """
-    await ws.accept()
-    logger.info("[WS/DETECT] Browser camera connected")
     try:
+        await ws.accept()
+        logger.info("[WS/DETECT] Browser camera connected")
         while True:
             raw = await ws.receive_text()
             try:
@@ -1044,17 +2097,23 @@ async def detect_websocket(ws: WebSocket):
                         "h": result.bbox.h,
                     }
                 await ws.send_json({
-                    "present":    result.present,
-                    "state":      result.state,
-                    "identity":   result.identity or "",
-                    "verified":   result.verified,
-                    "bbox":       bbox,
-                    "bystanders": result.bystanders,
+                    "present":      result.present,
+                    "state":        result.state,
+                    "identity":     result.identity or "",
+                    "verified":     result.verified,
+                    "bbox":         bbox,
+                    "bystanders":   result.bystanders,
+                    "blink":        bool(getattr(result, "blink", False)),
+                    "double_blink": bool(getattr(result, "double_blink", False)),
                 })
+            except (WebSocketDisconnect, RuntimeError):
+                break
             except Exception as frame_err:
                 logger.warning(f"[WS/DETECT] Frame processing error: {frame_err}")
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, RuntimeError):
         logger.info("[WS/DETECT] Browser camera disconnected")
+    except Exception as e:
+        logger.info(f"[WS/DETECT] Browser camera disconnected: {e}")
 
 
 @app.post("/tts")
@@ -1088,9 +2147,14 @@ async def greet_visitor(payload: GreetVisitorPayload):
     Orchestration gateway intercepting hits from detection.py hardware loop.
     Routes tracked users directly into session pipelines or triggers identity checks.
     """
-    global active_session, visitor_name_response, _last_activity_ts
+    global active_session, visitor_name_response, _last_activity_ts, message_log
     _last_activity_ts = datetime.now().timestamp()
-    
+    message_log = []  # BUG FIX: this used to be a same-name local shadowing the
+    # module-level `message_log`, so it never actually cleared — a returning or
+    # new visitor's conversation would silently inherit the PREVIOUS visitor's
+    # message history, which corrupts follow-up context resolution ("its",
+    # "what about ISE", etc. could resolve against a stranger's conversation).
+
     # Context handling for unrecognized/new visitors
     if not payload.face_id or payload.name.lower() == "unknown":
         logger.info("[GREET BLOCK] Unrecognized presence captured. Redirecting to initialization context.")
@@ -1110,7 +2174,7 @@ async def greet_visitor(payload: GreetVisitorPayload):
         await manager.broadcast({
             "type": "asking_name", 
             "session": active_session,
-            "tts_text": "Hello! Welcome to RNSIT Kiosk. Please say your name, or say Guest to continue."
+            "tts_text": "Hi! May I know your name?"
         })
         return {"status": "asking", "session_id": active_session["session_id"]}
 
@@ -1126,14 +2190,18 @@ async def greet_visitor(payload: GreetVisitorPayload):
     )
     final_session_id = active_session["session_id"]
     message_log = []
-    _last_activity_ts = datetime.now().timestamp()
+    _last_activity_ts   = datetime.now().timestamp()
+    _low_confidence_count = 0  # reset escalation counter
 
     await manager.broadcast({
         "type": "session_start",
         "session": active_session,
         "tts_text": active_session["greeting"],
     })
-    
+
+    # Issue companion QR token
+    asyncio.create_task(_issue_companion_token_async(final_session_id))
+
     logger.info(f"[GREET SUCCESS] Session established for user context: '{payload.name}'")
     return {"status": "recognized", "session_id": final_session_id, "session": active_session}
 
@@ -1160,19 +2228,151 @@ async def visitor_unknown():
     else:
         active_session["asking_name"] = True
 
-    await manager.broadcast({"type": "asking_name", "session": active_session})
+    await manager.broadcast({
+        "type": "asking_name",
+        "session": active_session,
+        "tts_text": "Hi! May I know your name?",
+    })
     return {"status": "asking", "session_id": active_session["session_id"]}
 
 
 @app.post("/visitor/submit_name")
 async def submit_name(name: str = "Guest", save: bool = True):
+    """
+    Called by the frontend when the visitor speaks their name (or chooses Guest).
+
+    FIXED: previously this only renamed a face if `fid` was already set on
+    the session — for a fresh guest (the normal case) fid is empty, so no
+    embedding was ever registered and the visitor was 'unknown' again on
+    their next visit. Now it calls register_or_resume_face(), which uses
+    the live camera anchor embedding detection.py already captured for the
+    current visitor, registers-or-links a real face_id, and includes the
+    same duplicate-hard-block _enroll_worker uses (so if detection's own
+    camera-driven ENROLLING path also fires for this visit, they converge
+    on the same face_id instead of minting two).
+    """
     global visitor_name_response, active_session
+    # Signal to _enroll_worker (camera path) that the name is ready, in case
+    # it's still waiting on /visitor/name_response.
     visitor_name_response = {"ready": True, "name": name, "save": save}
-    if active_session:
-        active_session["asking_name"] = False
-        active_session["user_name"]   = name
-    logger.info(f"[VISITOR] Name submitted: '{name}' save={save}")
+    logger.info(f"[VISITOR] submit_name called: name='{name}' save={save}")
+
+    if not active_session:
+        active_session = {
+            "session_id": str(uuid.uuid4()),
+            "user_name": name,
+            "is_returning": False,
+            "visit_count": 1,
+            "face_id": "",
+            "trigger": "camera",
+            "asking_name": False,
+        }
+        logger.info(f"[VISITOR] submit_name: created minimal session for '{name}'")
+
+    active_session["asking_name"] = False
+    active_session["user_name"] = name
+    sid = active_session.get("session_id")
+    fid = active_session.get("face_id") or ""
+
+    if sid:
+        await update_session_user_name(sid, name)
+        await interactions_collection.update_many(
+            {"session_id": sid},
+            {"$set": {"user_name": name}}
+        )
+
+    if save and name not in ("Guest", "Unknown", ""):
+        from backend.detection import register_or_resume_face, ST, _load_known_faces
+        if fid:
+            await update_face_name_with_alias(fid, name)
+            logger.info(f"[VISITOR] submit_name: renamed existing face_id={fid[:8]} to '{name}'")
+        else:
+            result = register_or_resume_face(name, save=True)
+            new_fid = result.get("face_id") or ""
+            if not new_fid:
+                new_fid = str(uuid.uuid4())
+            snap_anchor = ST.snapshot().get("anchor") or []
+            await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+            ST.set(face_id=new_fid, identity=name)
+            _load_known_faces(force=True)
+            active_session["face_id"] = new_fid
+            fid = new_fid
+            if sid:
+                await sessions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+                await interactions_collection.update_many(
+                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            logger.info(
+                f"[VISITOR] submit_name: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+            )
+
+    # Broadcast the updated name to all connected frontends immediately so the
+    # admin dashboard, GoodbyeScreen, etc. all see the real name right away.
+    await manager.broadcast({
+        "type":     "session_update",
+        "session":  active_session,
+        "user_name": name,
+        "face_id":  fid,
+    })
+    logger.info(f"[VISITOR] submit_name: broadcasted session_update name='{name}'")
     return {"status": "ok"}
+
+
+
+@app.post("/visitor/rename")
+async def rename_visitor(name: str, face_id: str = ""):
+    """Mid-session name change: updates the active_session, the DB face record
+    (with old-name archival), updates sessions collection everywhere, and broadcasts
+    the change so all UI and admin components reflect it immediately.
+    """
+    global active_session
+    fid = face_id or (active_session.get("face_id") if active_session else "") or ""
+    sid = active_session.get("session_id") if active_session else ""
+    if active_session:
+        active_session["user_name"] = name
+
+    if sid:
+        await update_session_user_name(sid, name)
+        await interactions_collection.update_many(
+            {"session_id": sid},
+            {"$set": {"user_name": name}}
+        )
+
+    updated_db = False
+    if fid:
+        updated_db = await update_face_name_with_alias(fid, name)
+    else:
+        from backend.detection import register_or_resume_face, ST, _load_known_faces
+        result = register_or_resume_face(name, save=True)
+        new_fid = result.get("face_id") or ""
+        if not new_fid:
+            new_fid = str(uuid.uuid4())
+        snap_anchor = ST.snapshot().get("anchor") or []
+        await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+        ST.set(face_id=new_fid, identity=name)
+        _load_known_faces(force=True)
+        if active_session:
+            active_session["face_id"] = new_fid
+        if sid:
+            await sessions_collection.update_many(
+                {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+            await interactions_collection.update_many(
+                {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+        updated_db = True
+        logger.info(
+            f"[VISITOR] rename: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+        )
+
+    if active_session:
+        await manager.broadcast({
+            "type": "session_update",
+            "session": active_session,
+            "user_name": name,
+            "face_id": active_session.get("face_id", ""),
+        })
+
+    logger.info("[VISITOR] rename: '%s' face_id=%s db_updated=%s", name, fid[:8] if fid else '-', updated_db)
+    return {"status": "ok", "db_updated": updated_db}
 
 
 @app.get("/visitor/name_response")
@@ -1187,32 +2387,12 @@ def clear_response():
     return {"status": "cleared"}
 
 
-@app.post("/visitor/delete_my_data")
-async def delete_my_data(name: str):
-    """Erase a visitor's face data (GDPR-style right to be forgotten)."""
-    try:
-        face_ids = await delete_face_by_name(name)
-        if not face_ids:
-            return {"success": False, "message": f"No data found for '{name}'."}
-
-        for face_id in face_ids:
-            face_dir = PROJECT_ROOT / "faces" / face_id
-            if face_dir.exists():
-                shutil.rmtree(face_dir)
-                logger.info(f"[DELETE] Removed face dir: {face_dir}")
-
-        await manager.broadcast({"type": "cache_reload"})
-        return {"success": True, "message": f"All data for '{name}' has been permanently deleted."}
-    except Exception as e:
-        logger.error(f"[DELETE] Error: {e}")
-        return {"success": False, "message": "Deletion failed. Please contact staff."}
-
-
 # ==========================================
 # RAG KNOWLEDGE BASE MANAGEMENT
 # ==========================================
-_RAG_URL  = os.getenv("RAG_SERVICE_URL", "http://localhost:8600").rstrip("/")
-_RAG_COLL = os.getenv("RAG_COLLECTION",  "kiosk-rnsit")
+# NOTE: these reuse RAG_SERVICE_URL / RAG_COLLECTION defined near the top of
+# this file — do not re-declare them here, or you'll re-introduce the same
+# kind of NameError bug that used to crash this app on startup.
 
 
 @app.post("/api/rag/upload")
@@ -1225,7 +2405,7 @@ async def rag_upload_file(
     content = await file.read()
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
-            f"{_RAG_URL}/v1/collections/{_RAG_COLL}/index/file",
+            f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/index/file",
             files={"file": (file.filename, content, file.content_type or "application/octet-stream")},
             data={"source": source or file.filename},
         )
@@ -1238,7 +2418,7 @@ async def rag_upload_file(
 async def rag_list_files(username: str = Depends(authenticate_admin)):
     """List all files indexed in the RAG knowledge base."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{_RAG_URL}/v1/collections/{_RAG_COLL}/files")
+        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/files")
     if resp.status_code != 200:
         return {"files": []}
     return resp.json()
@@ -1248,7 +2428,7 @@ async def rag_list_files(username: str = Depends(authenticate_admin)):
 async def rag_stats(username: str = Depends(authenticate_admin)):
     """Return collection stats (chunk count, indexed files) from RAGService."""
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(f"{_RAG_URL}/v1/collections/{_RAG_COLL}")
+        resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}")
     if resp.status_code != 200:
         return {"error": "RAGService unreachable"}
     return resp.json()
@@ -1259,7 +2439,7 @@ async def rag_delete_file(filename: str, username: str = Depends(authenticate_ad
     """Remove a specific file's chunks from the RAG knowledge base."""
     async with httpx.AsyncClient(timeout=10.0) as client:
         resp = await client.delete(
-            f"{_RAG_URL}/v1/collections/{_RAG_COLL}/files/{filename}"
+            f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/files/{filename}"
         )
     if resp.status_code not in (200, 404):
         raise HTTPException(status_code=502, detail=f"RAGService error: {resp.text}")
