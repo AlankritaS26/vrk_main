@@ -151,6 +151,15 @@ DOMAIN_KEYWORDS = {
     "technology", "telecommunication", "instrumentation",
 }
 
+# Extra scope keywords: generic facility questions and both spellings of
+# counselling, so on-topic queries aren't refused as out-of-scope.
+DOMAIN_KEYWORDS |= {
+    "facility", "facilities", "amenity", "amenities", "infrastructure",
+    "provide", "provides", "provided",
+    "counseling", "counselling", "counselor", "counselors", "counsellor", "counsellors",
+    "wellness", "health",
+}
+
 
 def _is_in_domain_keyword(question: str) -> bool:
     words = set(re.findall(r"[a-z]+", (question or "").lower()))
@@ -206,6 +215,35 @@ def is_broad_department_query(query: str) -> bool:
         if any(w in q for w in ("good", "better", "best", "choose", "suggest", "recommend", "compare", "preferred", "scope")):
             return True
     return False
+
+
+_HOD_MENTION_RE = re.compile(r"\b(?:hod|h\.?o\.?d\.?|head\s+of\s+(?:the\s+)?(?:dept|department)\b)")
+
+# Any of these mentioned alongside "HOD" is enough to know WHICH department's
+# HOD is being asked about, so it isn't ambiguous.
+_DEPT_MENTION_RE = re.compile(
+    r"\b(?:cse|ise|ece|eee|aiml|aids|mech|civil|mca|mba|"
+    r"computer\s+science|information\s+science|electronics|electrical|"
+    r"artificial\s+intelligence|mechanical|civil\s+engineering|"
+    r"data\s+science|cyber\s+security)\b"
+)
+
+
+def is_ambiguous_hod_query(query: str) -> bool:
+    """True when the query asks about 'the HOD' / 'head of department' but
+    names no specific department, so we can't know which HOD to answer with
+    (e.g. a bare 'HOD.' or 'Who is the HOD?'). Queries that name a department
+    ('AIML HOD?', 'CSE HOD?') or a specific HOD's name are NOT ambiguous —
+    those are handled by entity_mapping's exact-match rules before this is
+    ever reached."""
+    q = (query or "").lower().strip()
+    if not q:
+        return False
+    if not _HOD_MENTION_RE.search(q):
+        return False
+    if _DEPT_MENTION_RE.search(q):
+        return False
+    return True
 
 
 # Known valid RNSIT department abbreviations / names
@@ -742,12 +780,84 @@ _SYSTEM_PROMPT_TMPL = (
 )
 
 
-def _naturalize_rag_only_fallback(context_text: str, max_chars: int = 450) -> str:
+# ── Relevance guard for the RAG-only fallback formatter ─────────────────
+# The bug this fixes: _naturalize_rag_only_fallback() (below) used to
+# aggregate EVERY retrieved chunk regardless of whether it actually
+# related to the question, so a query like "Is there any workshop
+# available?" — where the KB has no workshop content, but RETRIEVAL still
+# returns *something* (address, research centers, library...) because
+# vector search always returns its top-K nearest neighbours even when none
+# of them are truly close — got answered with a nonsense concatenation of
+# unrelated facts instead of an honest "I don't have that detail". This
+# happened every time the LLM correctly refused to answer from irrelevant
+# context and the "Critical Fallback Rule" below force-overrode that
+# correct refusal. Filtering by keyword overlap makes both the override
+# AND the Tier-3-only aggregator only ever speak from chunks that are
+# actually about what was asked.
+_RELEVANCE_STOPWORDS = {
+    "the", "a", "an", "is", "are", "was", "were", "of", "in", "on", "at", "for",
+    "to", "and", "or", "rnsit", "rns", "college", "institute", "technology",
+    "about", "tell", "me", "what", "where", "when", "how", "why", "who", "which",
+    "does", "do", "can", "you", "please", "available", "there", "any", "some",
+    "this", "that", "it", "its", "with", "from", "have", "has", "will",
+    "yes", "not", "let", "get", "our", "out", "now", "two", "one",
+}
+
+
+def _relevance_keywords(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) >= 3 and w not in _RELEVANCE_STOPWORDS}
+
+
+def _stem(w: str) -> str:
+    """Minimal plural stemmer so 'bus'/'buses', 'facility'/'facilities' etc.
+    still overlap for relevance matching. Approximate on purpose (not a
+    real linguistic stemmer) — it only needs to map the SAME word's
+    singular/plural forms to the same bucket consistently, not produce a
+    linguistically correct root."""
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if len(w) > 3 and w.endswith("es") and w[-3] in "sxzh":
+        return w[:-2]
+    if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+        return w[:-1]
+    return w
+
+
+def _kw_match(w: str, pool: set[str]) -> bool:
+    """True if `w` appears in `pool` exactly, via the plural stemmer, or as a
+    near-identical spelling (counseling/counselling, facilty/facility).
+    Fuzzy matching is limited to words >= 5 chars to avoid false positives."""
+    if w in pool:
+        return True
+    if _stem(w) in {_stem(p) for p in pool}:
+        return True
+    if len(w) >= 5:
+        return bool(difflib.get_close_matches(w, list(pool), n=1, cutoff=0.85))
+    return False
+
+
+def _relevance_overlap(kw_a: set[str], kw_b: set[str]) -> bool:
+    return any(_kw_match(w, kw_b) for w in kw_a)
+
+
+def _context_is_relevant(question: str, context_text: str) -> bool:
+    """True if the retrieved context shares at least one meaningful keyword
+    with the question. If the question has no meaningful keywords at all
+    (e.g. it's just filler), don't block — nothing to check against."""
+    q_kw = _relevance_keywords(question)
+    if not q_kw:
+        return True
+    return _relevance_overlap(q_kw, _relevance_keywords(context_text))
+
+
+def _naturalize_rag_only_fallback(context_text: str, max_chars: int = 450,
+                                   question: str | None = None) -> str:
     """
     Tier-3 (RAG-only, no LLM available) fallback formatter — used only when
     BOTH LLM tiers (local Qwen + Gemini) have failed and there's no model
     left to phrase an answer, so this has to work from the raw retrieved
-    context alone. Fixes two production bugs that were both living in this
+    context alone. Fixes three production bugs that were all living in this
     one spot (duplicated at both call sites below):
 
     1. Previously prefixed the answer with the literal internal phrase
@@ -768,12 +878,27 @@ def _naturalize_rag_only_fallback(context_text: str, max_chars: int = 450) -> st
        max_chars — so a broad/category question is represented properly
        instead of being truncated to whichever chunk happened to rank
        first.
+
+    3. When `question` is given, chunks are filtered to only those that
+       actually share a keyword with the question BEFORE aggregating —
+       vector search always returns its top-K nearest neighbours even when
+       none of them are truly relevant, and blindly gluing all of them
+       together for a specific, narrow question ("any workshops?") produced
+       an incoherent dump of unrelated facts (address + research centers +
+       library, for example) instead of an honest "I don't have that
+       detail". If no chunk survives the filter, this returns "" so the
+       caller falls back to an honest apology instead of a fabricated
+       aggregate. `question=None` (or omitted) keeps the old unfiltered
+       aggregate behaviour, used only where a caller already knows the
+       content is meant to be broad (e.g. broad-department overview text
+       that was never RAG-retrieved chunk-by-chunk in the first place).
     """
     if not context_text:
         return ""
 
     seen: set[str] = set()
     cleaned_chunks: list[str] = []
+    q_kw = _relevance_keywords(question) if question else None
     for raw_chunk in context_text.split("\n\n"):
         cleaned = _QA_LABEL_RE_LLM.sub("", raw_chunk).strip()
         cleaned = _FACILITY_LABEL_RE_LLM.sub("", cleaned).strip()
@@ -782,6 +907,8 @@ def _naturalize_rag_only_fallback(context_text: str, max_chars: int = 450) -> st
         key = cleaned.lower()
         if key in seen:
             continue
+        if q_kw and not _relevance_overlap(q_kw, _relevance_keywords(cleaned)):
+            continue  # chunk shares no keyword with the actual question — skip it
         seen.add(key)
         cleaned_chunks.append(cleaned)
 
@@ -795,6 +922,108 @@ def _naturalize_rag_only_fallback(context_text: str, max_chars: int = 450) -> st
             out = out[:max_chars].rsplit(" ", 1)[0].strip()
             break
     return out
+
+
+def _classify_relevance(question: str, context_text: str) -> str:
+    """
+    Classifies how well `context_text` (the concatenated top-K RAG chunks)
+    actually covers `question`, into three tiers used by
+    _generate_rag_answer() below:
+
+      "strong"  — most/all of the question's meaningful keywords are
+                  present in the retrieved context (directly, or via the
+                  light stemmer above) -> answer normally from context.
+      "related" — SOME overlap, but weak -> the retrieved context is
+                  probably about a nearby topic, not the exact thing
+                  asked, so answer with the nearest info AND an explicit
+                  "this isn't the exact answer" disclaimer instead of
+                  pretending it's a direct answer.
+      "none"    — ZERO overlap -> never fabricate or dump unrelated
+                  chunks; ask the visitor to rephrase instead.
+
+    Deliberately keyword-based, not vector-similarity-based: RAGService's
+    top-K search always returns its K nearest neighbours even when none of
+    them are genuinely close, so a raw similarity score alone can't tell
+    strong/related/none apart — see _naturalize_rag_only_fallback's
+    docstring (point 3) for the concrete bug this tiering replaces.
+    """
+    q_kw = _relevance_keywords(question)
+    if not q_kw:
+        return "strong"  # nothing meaningful to check against — don't block
+    ctx_kw = _relevance_keywords(context_text)
+    if not ctx_kw:
+        return "none"
+    ctx_stems = {_stem(w) for w in ctx_kw}
+    matched = {w for w in q_kw if _kw_match(w, ctx_kw)}
+    if not matched:
+        return "none"
+    ratio = len(matched) / len(q_kw)
+    return "strong" if ratio >= 0.5 else "related"
+
+
+# Strips a leading interrogative opener off a question so it can be used
+# inline in the tier-2 "I don't have the exact information about X, but
+# here's what I found..." disclaimer. Best-effort only — if nothing usable
+# is left after stripping, falls back to the generic word "that".
+_QUESTION_OPENER_RE = re.compile(
+    r"^(?:is\s+there\s+(?:any|an|a)?\s*|are\s+there\s+(?:any)?\s*|"
+    r"do\s+you\s+have\s+(?:any|an|a)?\s*|does\s+rnsit\s+have\s+(?:any|an|a)?\s*|"
+    r"can\s+you\s+tell\s+me\s+about\s+|please\s+tell\s+me\s+about\s+|tell\s+me\s+about\s+|"
+    r"what\s+is\s+|what\s+are\s+|where\s+is\s+|where\s+are\s+|"
+    r"who\s+is\s+|who\s+are\s+|how\s+many\s+|how\s+much\s+)",
+    re.IGNORECASE,
+)
+
+
+def _extract_question_topic(question: str) -> str:
+    q = (question or "").strip().rstrip("?!.").strip()
+    if not q:
+        return "that"
+    stripped = _QUESTION_OPENER_RE.sub("", q, count=1).strip()
+    if len(stripped) < 2:
+        return "that"
+    return stripped.lower()
+
+
+async def _generate_rag_answer(question: str, context_text: str, history: list | None) -> tuple[str, str]:
+    """
+    3-level fallback wrapper used ONLY by the generic RAG top-K synthesis
+    path (_handle_high, below) — i.e. answers NOT already grounded in a
+    curated/verified fact (entity_kb, department comparison, broad-
+    department overview, college overview), which keep calling
+    _generate_answer() directly and are completely unaffected by this.
+
+    RAG search always returns its top-K nearest chunks even when the KB
+    genuinely has nothing relevant, so this classifies how well the
+    retrieved context actually covers the question BEFORE generating:
+
+      STRONG  -> normal LLM-grounded answer (delegates to _generate_answer,
+                 unchanged behaviour — this is the "answer normally" case).
+      RELATED -> the closest retrieved info, with an explicit "this isn't
+                 the exact answer" disclaimer, built directly from the
+                 (relevance-filtered) chunks rather than risking the LLM
+                 inventing detail beyond what was actually retrieved.
+      NONE    -> never fabricate or dump unrelated chunks; ask the visitor
+                 to rephrase instead.
+    """
+    relevance = _classify_relevance(question, context_text)
+
+    if relevance == "none":
+        logger.info("[CONF-RAG] No keyword-relevant context for %r — asking to rephrase instead of fabricating.", question)
+        return "I couldn't find information about that. Could you rephrase your question?", "NO_MATCH"
+
+    if relevance == "related":
+        nearest = _naturalize_rag_only_fallback(context_text, question=question)
+        if not nearest:
+            logger.info("[CONF-RAG] 'related' tier but no chunk survived the relevance filter for %r — asking to rephrase.", question)
+            return "I couldn't find information about that. Could you rephrase your question?", "NO_MATCH"
+        topic = _extract_question_topic(question)
+        answer = f"I don't have the exact information about {topic}, but here's what I found: {nearest}"
+        logger.info("[CONF-RAG] 'related' tier for %r — nearest-info + disclaimer.", question)
+        return answer, "RELATED_NEAREST"
+
+    # relevance == "strong" — normal grounded generation, unchanged behaviour.
+    return await _generate_answer(question, context_text, history)
 
 
 async def _generate_answer(question: str, context_text: str, history: list | None) -> tuple[str, str]:
@@ -814,20 +1043,29 @@ async def _generate_answer(question: str, context_text: str, history: list | Non
             messages, temperature=0.2, max_tokens=180
         )
         cleaned = _clean_repetitive_greeting((text or "").strip())
-        # Critical Fallback Rule: if context exists, do not let LLM casually refuse
-        if context_text and len(context_text.strip()) > 30 and any(ref in cleaned.lower() for ref in ("i don't have that detail", "i don't know", "i do not know", "i don't have information")):
-            fallback_synth = _naturalize_rag_only_fallback(context_text)
+        # Critical Fallback Rule: if context exists AND is actually relevant
+        # to the question, don't let the LLM casually refuse — synthesize
+        # from the context instead. But if the LLM refused because the
+        # context genuinely has nothing to do with the question (e.g. "any
+        # workshops?" against address/library/research-center chunks), that
+        # refusal was CORRECT — keep it rather than overriding it with an
+        # unrelated fact dump. This is the fix for the recurring
+        # off-topic-answer bug (see _naturalize_rag_only_fallback's
+        # docstring, point 3).
+        if (context_text and len(context_text.strip()) > 30
+                and any(ref in cleaned.lower() for ref in ("i don't have that detail", "i don't know", "i do not know", "i don't have information"))
+                and _context_is_relevant(question, context_text)):
+            fallback_synth = _naturalize_rag_only_fallback(context_text, question=question)
             if fallback_synth:
                 cleaned = fallback_synth
         return cleaned, tier.upper()
     except Exception as e:
         logger.error("[CONF-RAG] Local+Gemini both failed, using RAG-only nearest context: %s", e)
-        fallback = _naturalize_rag_only_fallback(context_text)
+        fallback = _naturalize_rag_only_fallback(context_text, question=question)
         if fallback:
             return fallback, "RAG_ONLY"
         return (
-            "I'm having trouble reaching my knowledge base right now — "
-            "please check with the Admin Block.",
+            "I don't have that detail on hand — please check with the Admin Block.",
             "RAG_ONLY_EMPTY",
         )
 
@@ -963,7 +1201,7 @@ async def _handle_high(question: str, context_text: str, raw_results: list[dict]
         return {"answer": answer, "route": "HIGH_AMBIGUOUS", "session_action": "CONTINUE",
                 "session_state": state}
 
-    answer, gen_tier = await _generate_answer(question, context_text, history)
+    answer, gen_tier = await _generate_rag_answer(question, context_text, history)
     await log_decision(
         session_id=session_id, question=question,
         top_score=best_score, second_score=second_score,
@@ -1112,6 +1350,15 @@ async def _resolve_pending(question: str, pending: dict, history: list | None,
     ptype = pending.get("type")
     decision_id = pending.get("decision_id", "")
 
+    # A garbled/incomplete utterance should never be fuzzy-scored against a
+    # stale pending candidate (that risks an accidental token-overlap match
+    # on filler words) — treat it as a fresh, unresolved turn instead so the
+    # caller's incomplete/garbled check can ask for clarification cleanly.
+    # Plain "yes"/"no" replies are short by nature and would otherwise trip
+    # the garbled heuristic themselves, so they're exempted here.
+    if yn is None and is_incomplete_or_garbled_query(question):
+        return None
+
     if ptype == "confirm":
         candidate = pending["candidate"]
         if yn == "yes":
@@ -1216,7 +1463,7 @@ async def handle_query(question: str, history: list | None = None,
 
     # ── 1.2) Incomplete / Garbled Utterance Check ─────────────────────────
     if is_incomplete_or_garbled_query(question, question_clean):
-        clarify_ans = "Sure, what would you like to know?"
+        clarify_ans = "Sure — could you clarify what you'd like to know?"
         logger.info("[CONF-RAG] Incomplete/garbled query detected: %r -> clarification", question)
         state["pending"] = None
         state["clarify_streak"] = 0
@@ -1337,6 +1584,23 @@ async def handle_query(question: str, history: list | None = None,
             "detected_entity": detected.entity_id,
             "entity_confidence": detected.confidence,
             "source": "entity_kb",
+        }
+
+    # ── 1.75) Ambiguous HOD Query (e.g. bare 'HOD.' with no department) ────
+    # Entity detection above already handles 'AIML HOD?', 'CSE HOD?', etc.
+    # If we get here and the query is still asking about "the HOD" with no
+    # department named, don't dump every HOD we know — ask which one.
+    if is_ambiguous_hod_query(question_clean) or is_ambiguous_hod_query(question):
+        clarify_ans = "Sure — which department's HOD would you like to know about?"
+        logger.info("[CONF-RAG] Ambiguous HOD query detected: %r -> clarification", question)
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        return {
+            "answer": clarify_ans,
+            "route": "CLARIFICATION_AMBIGUOUS_HOD",
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": "clarification_ambiguous_hod",
         }
 
     # ── 1.8) Specific Department Comparison Routing (e.g. 'Which is good, CSE or ECE?') ──
@@ -1646,7 +1910,7 @@ async def handle_query_stream(question: str, history: list | None = None,
 
     # ── 1.2) Incomplete / Garbled Utterance Check ─────────────────────────
     if is_incomplete_or_garbled_query(question, question_clean):
-        clarify_ans = "Sure, what would you like to know?"
+        clarify_ans = "Sure — could you clarify what you'd like to know?"
         logger.info("[CONF-RAG-STREAM] Incomplete/garbled query detected: %r -> clarification", question)
         yield {"sentence": clarify_ans, "partial": False}
         state["pending"] = None
@@ -1788,6 +2052,22 @@ async def handle_query_stream(question: str, history: list | None = None,
             "detected_entity": detected.entity_id,
             "entity_confidence": detected.confidence,
             "source": "entity_kb",
+        }
+        return
+
+    # ── 1.75) Ambiguous HOD Query (streaming) — e.g. bare 'HOD.' ────────────
+    if is_ambiguous_hod_query(question_clean) or is_ambiguous_hod_query(question):
+        clarify_ans = "Sure — which department's HOD would you like to know about?"
+        logger.info("[CONF-RAG-STREAM] Ambiguous HOD query detected: %r -> clarification", question)
+        yield {"sentence": clarify_ans, "partial": False}
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        yield {
+            "done": True,
+            "answer": clarify_ans,
+            "session_action": "CONTINUE",
+            "session_state": state,
+            "source": "clarification_ambiguous_hod",
         }
         return
 
@@ -2167,7 +2447,41 @@ async def handle_query_stream(question: str, history: list | None = None,
                    "session_state": state}
             return
 
-    # Not ambiguous -> real sentence-by-sentence streaming generation.
+    # ── 3-tier relevance gate (streaming) — mirrors _generate_rag_answer()
+    # used by the non-streaming _handle_high(). RAG search always returns
+    # its top-K nearest chunks even when none are genuinely related, so
+    # streaming a free-form LLM answer straight from irrelevant context
+    # risked the exact same off-topic-dump bug as the non-streaming path.
+    # NONE/RELATED tiers are short, deterministic strings — nothing to
+    # stream — so they're yielded as one chunk, same pattern as the
+    # HIGH_AMBIGUOUS branch just above.
+    relevance = _classify_relevance(question, context_text)
+    if relevance == "none":
+        answer = "I couldn't find information about that. Could you rephrase your question?"
+        logger.info("[CONF-RAG-STREAM] No keyword-relevant context for %r — asking to rephrase instead of fabricating.", question)
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        yield {"answer": answer, "route": "HIGH_NO_MATCH", "session_action": "CONTINUE",
+               "session_state": state}
+        return
+    if relevance == "related":
+        nearest = _naturalize_rag_only_fallback(context_text, question=question)
+        if nearest:
+            topic = _extract_question_topic(question)
+            answer = f"I don't have the exact information about {topic}, but here's what I found: {nearest}"
+            route = "HIGH_RELATED_NEAREST"
+            logger.info("[CONF-RAG-STREAM] 'related' tier for %r — nearest-info + disclaimer.", question)
+        else:
+            answer = "I couldn't find information about that. Could you rephrase your question?"
+            route = "HIGH_NO_MATCH"
+            logger.info("[CONF-RAG-STREAM] 'related' tier but no chunk survived the relevance filter for %r — asking to rephrase.", question)
+        state["pending"] = None
+        state["clarify_streak"] = 0
+        yield {"answer": answer, "route": route, "session_action": "CONTINUE",
+               "session_state": state}
+        return
+
+    # relevance == "strong" — normal sentence-by-sentence streaming generation.
     system_prompt = _SYSTEM_PROMPT_TMPL.format(context=context_text or "(none)")
     messages = [{"role": "system", "content": system_prompt}]
     for msg in (history or [])[-4:]:
@@ -2206,10 +2520,9 @@ async def handle_query_stream(question: str, history: list | None = None,
                        "session_action": "CONTINUE", "partial": True}
     except Exception as e:
         logger.error("[CONF-RAG-STREAM] Local+Gemini both failed, RAG-only fallback: %s", e)
-        fallback = _naturalize_rag_only_fallback(context_text)
+        fallback = _naturalize_rag_only_fallback(context_text, question=question)
         final_answer = fallback if fallback else (
-            "I'm having trouble reaching my knowledge base right now — "
-            "please check with the Admin Block."
+            "I don't have that detail on hand — please check with the Admin Block."
         )
         await log_decision(
             session_id=session_id, question=question,

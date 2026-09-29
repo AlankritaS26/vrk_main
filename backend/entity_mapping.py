@@ -527,6 +527,19 @@ def _build_verified_answers() -> dict[str, dict]:
                 f"The cultural fest of RNSIT is called {kb.get('academics', {}).get('cultural_fest', 'Aperture')}."
             ),
         },
+        "CAMPUS_FACILITIES": {
+            "name": "Campus Facilities Overview",
+            "type": "facility",
+            # Same wording/source as the "Campus Facilities Overview" RAG chunk
+            # in llm.py so the deterministic and retrieved answers never drift.
+            "answer": (
+                "RNSIT provides campus-wide facilities including "
+                + ", ".join(k.replace("_", " ").title() for k in facs.keys())
+                + ". Key facilities on campus include Central Library, Canteen, Shivaram Karanth Auditorium, "
+                "Boys and Girls Hostels, Gym, Sports Ground, Placement Cell, Medical & 24/7 Ambulance service, "
+                "Campus-wide Wi-Fi, Canara Bank ATM, Toyota Center of Excellence, and Student Counselling."
+            ),
+        },
         "CAPABILITIES": {
             "name": "Nova Capabilities",
             "type": "meta",
@@ -1053,6 +1066,14 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
             re.compile(r"\bwhat\s+can\s+you\s+do\b"),
             re.compile(r"\bhow\s+can\s+you\s+help\b"),
             re.compile(r"\bwho\s+are\s+you\b"),
+        ],
+    ),
+    # Generic "what facilities does RNSIT provide?" — LAST on purpose: every
+    # specific facility rule above (library, hostel, gym, wifi, bus...) wins first.
+    (
+        "CAMPUS_FACILITIES",
+        [
+            re.compile(r"\b(?:facilit(?:y|ies)|amenit(?:y|ies))\b"),
         ],
     ),
 ]

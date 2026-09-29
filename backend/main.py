@@ -1,4 +1,4 @@
-"""
+﻿"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (from repository root):
@@ -2003,6 +2003,62 @@ def _is_cacheable_route(route: str) -> bool:
     return not any(m in r for m in _UNCACHEABLE_ROUTE_MARKERS)
 
 
+# ==========================================
+# NAME_CHANGE detection — EXPLICIT intent only
+# ==========================================
+# NAME_CHANGE must fire ONLY when the user explicitly asks to
+# change/set/update/rename their name, or explicitly instructs Nova to
+# address them by a new name ("call me X"). It must NEVER fire on a plain
+# self-introduction ("I'm Sneha", "My name is Sneha", bare "Sneha") or on
+# an unrelated "I'm <word>" statement ("I'm sorry", "I'm sad", "I'm good",
+# "I'm stressed") — those are not requests to change anything and are
+# handled by other routing (greeting/emotion), not this one.
+#
+# This is intentionally a small, closed set of IMPERATIVE patterns rather
+# than a growing blacklist of words/names to exclude. The captured name is
+# bounded to 1-3 word-shaped tokens directly by the regex structure (not
+# by scanning for "stop words" after the fact), so trailing conversation
+# ("...and I also wanted to ask about hostel fees") can never be swallowed
+# into the name in the first place.
+_NAME_TOKEN = r"[a-zA-Z][a-zA-Z'-]*"
+_NAME_CAPTURE_GREEDY = rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,2}})"
+_NAME_CAPTURE_LAZY = rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,2}}?)"
+
+# "change/set/update/rename my name to|as X"
+_NAME_CHANGE_VERB_RE = re.compile(
+    rf"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+(?:to|as)\s+{_NAME_CAPTURE_GREEDY}\b"
+)
+# "call me X from now on" — tried first, with a LAZY capture so "from now
+# on" is never swallowed into the name (e.g. "call me Sneha from now on"
+# captures "Sneha", not "Sneha from now").
+_CALL_ME_SUFFIXED_RE = re.compile(
+    rf"\bcall\s+me\s+{_NAME_CAPTURE_LAZY}\s+from\s+now\s+on\b"
+)
+# bare "call me X" (no "from now on" suffix) — still an explicit instruction
+# to be addressed by a new name.
+_CALL_ME_BARE_RE = re.compile(rf"\bcall\s+me\s+{_NAME_CAPTURE_GREEDY}\b")
+
+
+def _detect_name_change(q_normalized: str) -> str | None:
+    """
+    Returns the requested new name (Title Case) if `q_normalized` is an
+    EXPLICIT name-change request, else None.
+
+    Deliberately does NOT infer intent from capitalization, a detected
+    person-name entity, "I'm <word>" phrasing, or conversation context —
+    only the imperative patterns above count. See module comment above.
+    """
+    match = (
+        _NAME_CHANGE_VERB_RE.search(q_normalized)
+        or _CALL_ME_SUFFIXED_RE.search(q_normalized)
+        or _CALL_ME_BARE_RE.search(q_normalized)
+    )
+    if not match:
+        return None
+    name = " ".join(w.capitalize() for w in match.group(1).split())
+    return name or None
+
+
 async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
     """
     All the fast, deterministic pre-RAG routes — greeting, farewell,
@@ -2068,94 +2124,54 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             )
 
     # ─── Change Name Request ────────────────────────────────────────────────
-    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul"
-    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:change|update|set|rename)\s+my\s+name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized)
+    # Explicit-intent-only detection — see _detect_name_change() above.
+    # Matches: "change/set/update/rename my name to|as X", "call me X
+    # [from now on]". Does NOT match "I'm X", "My name is X", or bare "X".
+    new_name = _detect_name_change(q_normalized)
 
-    if name_change_match:
-        new_name_raw = name_change_match.group(1).strip()
-        if "," in new_name_raw:
-            new_name_raw = new_name_raw.split(",")[0].strip()
-        # Cut the captured group at the first sentence boundary — the regex's
-        # `[a-zA-Z\s,.-]+` group is greedy and, since normalize_query() has
-        # already stripped end-of-sentence punctuation, it can swallow an
-        # ENTIRE following sentence as part of the "name" (e.g. "my name is
-        # Rahul and I also wanted to ask about hostel fees" -> "Rahul And I
-        # Also Wanted To Ask About Hostel Fees"). Conjunctions/fillers that
-        # a real one-to-few-word name would never contain mark where the
-        # actual name ends.
-        _NAME_STOP_WORDS = (
-            "and", "but", "so", "also", "actually", "interested", "tell",
-            "more", "about", "in", "for", "to", "department", "departments",
-            "branch", "branches", "course", "courses", "college", "campus",
-            "admission", "admissions", "placement", "placements", "fee",
-            "fees", "hostel", "electronics", "software", "computing",
-            "engineering", "good", "better", "best", "information", "info",
-            "details", "help", "know", "want", "need", "going", "doing",
-            "feeling", "that", "this", "one", "area",
-        )
-        _stop_idx = None
-        _raw_words = new_name_raw.split()
-        for _i, _w in enumerate(_raw_words):
-            if _w.lower().strip(".,") in _NAME_STOP_WORDS:
-                _stop_idx = _i
-                break
-        if _stop_idx is not None:
-            new_name_raw = " ".join(_raw_words[:_stop_idx]).strip()
-        new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
-        # Sanity cap: a real spoken/typed name is 1-4 words. If nothing
-        # name-shaped survives the stop-word cut (e.g. the whole utterance
-        # was noise like "interested in electronics" with no stop word this
-        # module recognizes, or a garbled STT capture), or what's left is
-        # implausibly long, don't treat it as a name change at all — fall
-        # through to normal routing instead of saving garbage to the DB.
-        if len(new_name_words) > 4:
-            new_name_words = []
-        if new_name_words:
-            new_name = " ".join(new_name_words)
-            if active_session:
-                active_session["user_name"] = new_name
-                face_id_for_rename = active_session.get("face_id") or ""
-                sid_for_rename = active_session.get("session_id") or ""
-                if sid_for_rename:
-                    await update_session_user_name(sid_for_rename, new_name)
-                    await interactions_collection.update_many(
-                        {"session_id": sid_for_rename},
-                        {"$set": {"user_name": new_name}}
-                    )
-                if face_id_for_rename:
-                    await update_face_name_with_alias(face_id_for_rename, new_name)
-                    logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
-                                face_id_for_rename[:8], new_name)
-                else:
-                    # Register face for guest who provided a name so they appear in face tracks
-                    try:
-                        from backend.detection import ST, _load_known_faces
-                        anchor = ST.snapshot().get("anchor")
-                        new_fid = str(uuid.uuid4())
-                        if anchor:
-                            await save_face_encoding(new_fid, new_name, anchor, [anchor])
-                            ST.set(face_id=new_fid, identity=new_name)
-                        else:
-                            await save_face_encoding(new_fid, new_name, [], [])
-                        active_session["face_id"] = new_fid
-                        if sid_for_rename:
-                            await sessions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
-                            await interactions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
-                        _load_known_faces(force=True)
-                        logger.info(f"[ROUTE] Registered face for former guest '{new_name}' face_id={new_fid[:8]}")
-                    except Exception as ex:
-                        logger.warning(f"[ROUTE] Could not register face anchor: {ex}")
-                await manager.broadcast({
-                    "type": "session_update",
-                    "session": active_session,
-                    "user_name": new_name,
-                    "face_id": active_session.get("face_id", ""),
-                })
-            answer = f"Done! I have changed your name to {new_name}. How may I assist you today?"
-            logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
-            return answer, "name_change", "CONTINUE"
+    if new_name:
+        if active_session:
+            active_session["user_name"] = new_name
+            face_id_for_rename = active_session.get("face_id") or ""
+            sid_for_rename = active_session.get("session_id") or ""
+            if sid_for_rename:
+                await update_session_user_name(sid_for_rename, new_name)
+                await interactions_collection.update_many(
+                    {"session_id": sid_for_rename},
+                    {"$set": {"user_name": new_name}}
+                )
+            if face_id_for_rename:
+                await update_face_name_with_alias(face_id_for_rename, new_name)
+                logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
+                            face_id_for_rename[:8], new_name)
+            else:
+                # Register face for guest who provided a name so they appear in face tracks
+                try:
+                    from backend.detection import ST, _load_known_faces
+                    anchor = ST.snapshot().get("anchor")
+                    new_fid = str(uuid.uuid4())
+                    if anchor:
+                        await save_face_encoding(new_fid, new_name, anchor, [anchor])
+                        ST.set(face_id=new_fid, identity=new_name)
+                    else:
+                        await save_face_encoding(new_fid, new_name, [], [])
+                    active_session["face_id"] = new_fid
+                    if sid_for_rename:
+                        await sessions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                        await interactions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
+                    _load_known_faces(force=True)
+                    logger.info(f"[ROUTE] Registered face for former guest '{new_name}' face_id={new_fid[:8]}")
+                except Exception as ex:
+                    logger.warning(f"[ROUTE] Could not register face anchor: {ex}")
+            await manager.broadcast({
+                "type": "session_update",
+                "session": active_session,
+                "user_name": new_name,
+                "face_id": active_session.get("face_id", ""),
+            })
+        answer = f"Done! I have changed your name to {new_name}. How may I assist you today?"
+        logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
+        return answer, "name_change", "CONTINUE"
 
     if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
        re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
