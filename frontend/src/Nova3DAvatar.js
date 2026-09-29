@@ -261,6 +261,7 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
       let targetVisemeWeight = 0, currentVisemeWeight = 0;
       let currentJawWeight = 0, targetJawWeight = 0;
       let smileWeight = 0.2;
+      const audioSamples = new Uint8Array(128);
       const headDelta = { x: 0, y: 0, z: 0 };
       const neckDelta = { x: 0, y: 0 };
       const qTmp = new THREE.Quaternion();
@@ -287,19 +288,30 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
         setMorphWeight('eyeBlinkLeft', bv); setMorphWeight('eyeBlinkRight', bv);
 
         if (cst === 'speaking') {
+          let audioLevel = 0.18;
+          const analyser = window.__novaTtsAnalyser;
+          if (window.__novaTtsActive && analyser) {
+            analyser.getByteTimeDomainData(audioSamples);
+            let sum = 0;
+            for (const sample of audioSamples) {
+              const centered = (sample - 128) / 128;
+              sum += centered * centered;
+            }
+            audioLevel = THREE.MathUtils.clamp(Math.sqrt(sum / audioSamples.length) * 4.2, 0, 1);
+          }
           visemeTimer -= delta;
           if (visemeTimer <= 0) {
             visemeTimer = 0.1 + Math.random() * 0.12;
             if (currentViseme) setMorphWeight(currentViseme, 0);
             currentViseme      = VISEME_SEQUENCE[Math.floor(Math.random() * VISEME_SEQUENCE.length)];
-            targetVisemeWeight = 0.22 + Math.random() * 0.26;
-            targetJawWeight    = 0.17 + Math.random() * 0.23;
+            targetVisemeWeight = 0.08 + Math.random() * 0.12;
           }
           currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, targetVisemeWeight, delta * 24);
-          currentJawWeight    = THREE.MathUtils.lerp(currentJawWeight, targetJawWeight, delta * 24);
+          targetJawWeight     = 0.04 + audioLevel * 0.48;
+          currentJawWeight    = THREE.MathUtils.lerp(currentJawWeight, targetJawWeight, delta * 18);
           if (currentViseme) setMorphWeight(currentViseme, currentVisemeWeight);
           setMorphWeight('jawOpen', currentJawWeight);
-          setMorphWeight('mouthOpen', currentJawWeight * 0.4);
+          setMorphWeight('mouthOpen', currentJawWeight * 0.35);
           smileWeight = THREE.MathUtils.lerp(smileWeight, 0.3, delta * 4);
           setMorphWeight('mouthSmile', smileWeight);
           setMorphWeight('browInnerUp', 0.15 + Math.sin(elapsed * 4) * 0.1);

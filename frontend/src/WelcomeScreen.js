@@ -34,6 +34,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
+  const ttsAnalyserRef = useRef(null);           // live TTS level for the 3D avatar mouth
 
   // Browsers create AudioContext 'suspended' until a user gesture.
   // Unlock on the first pointer/key event and replay anything pending.
@@ -515,6 +516,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const finish = () => {
       if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
       isSpeaking.current = false;
+      window.__novaTtsActive = false;
       if (isMounted.current) startListening();   // resume mic for barge-in regardless
       // Only settle on 'ready' if there's genuinely nothing left to do. If
       // this was the instant-acknowledgment ("let me check that for you")
@@ -529,6 +531,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
     const fireStart = () => {
       setStatus('speaking');    // avatar flips to "speaking" exactly when audio starts
+      window.__novaTtsActive = true;
       if (onStart) { onStart(); onStart = null; }
     };
 
@@ -589,6 +592,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ttsGainRef.current = pctx.createGain();
       ttsGainRef.current.connect(pctx.destination);
     }
+    if (!ttsAnalyserRef.current) {
+      ttsAnalyserRef.current = pctx.createAnalyser();
+      ttsAnalyserRef.current.fftSize = 256;
+      ttsAnalyserRef.current.smoothingTimeConstant = 0.72;
+      ttsAnalyserRef.current.connect(ttsGainRef.current);
+      window.__novaTtsAnalyser = ttsAnalyserRef.current;
+    }
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);   // full volume for this new utterance
 
@@ -607,7 +617,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
         const node = pctx.createBufferSource();
         node.buffer = buf;
-        node.connect(ttsGainRef.current);
+        node.connect(ttsAnalyserRef.current || ttsGainRef.current);
         activeNodesRef.current.push(node);
         node.onended = () => {
           activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
