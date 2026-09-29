@@ -1,7 +1,26 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { createKioskMic, float32ToInt16 } from './kioskMic';
+import { normalizeSpelledName, resolveSingleLetter, isSpellingSkipOrGuest } from './utils/spellingNormalizer';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
+
+export const CONV_STATE = {
+  IDLE: 'IDLE',
+  GREETING: 'GREETING',
+  ASKING_NAME: 'ASKING_NAME',
+  CAPTURING_NAME: 'CAPTURING_NAME',
+  ASKING_SPELLING: 'ASKING_SPELLING',
+  CAPTURING_SPELLING: 'CAPTURING_SPELLING',
+  CONFIRMING_SPELLING: 'CONFIRMING_SPELLING',
+  RETRY_SPELLING: 'RETRY_SPELLING',
+  CONFIRMED: 'CONFIRMED',
+  GUEST: 'GUEST',
+  LISTENING: 'LISTENING',
+  PROCESSING: 'PROCESSING',
+  SPEAKING: 'SPEAKING',
+  INTERRUPTED: 'INTERRUPTED',
+  GOODBYE: 'GOODBYE'
+};
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
@@ -88,12 +107,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // blinking once for "yes". A single tap fallback ("Continue as Guest")
   // stays available for accessibility/robustness, but there is no keyboard
   // entry anywhere in this flow.
-  const [nameStage, setNameStage] = useState('idle');
-  // idle | asking | listening_name | confirming | listening_confirm | saving | done
+  const [convState, setConvState] = useState(CONV_STATE.IDLE);
+  const convStateRef = useRef(CONV_STATE.IDLE);
+  useEffect(() => { convStateRef.current = convState; }, [convState]);
+  const sttModeRef = useRef('normal');
+  const candidateNameRef = useRef('');
+  const lastQuestionHadAckRef = useRef(false);
   const nameFlowIdRef = useRef(0);          // bumped to invalidate an in-flight run
 
   const [localName, setLocalName] = useState('');
-  const pendingCandidateNameRef = useRef('');
   const visitorName = localName || (session?.user_name && session.user_name !== 'Unknown' ? session.user_name : 'Guest');
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
@@ -149,29 +171,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }]);
   }, [setMessages]);
 
-  // Starts a kiosk bubble with optional initial text (e.g. first sentence)
-  // so text is displayed immediately when answer arrives, then grows as Nova speaks.
-  const startProgressiveMessage = useCallback((speaker, initialText = '') => {
-    const cleanedInitial = cleanText(initialText);
-    setMessages(prev => [...prev, {
-      text: cleanedInitial, speaker,
-      timestamp: new Date().toLocaleTimeString()
-    }]);
-    return (sentence) => {
-      setMessages(prev => {
-        if (!prev.length) return prev;
-        const next = prev.slice();
-        const last = next[next.length - 1];
-        const cleanedSentence = cleanText(sentence);
-        if (last.text && (last.text === cleanedSentence || last.text.endsWith(cleanedSentence))) {
-          return prev;
-        }
-        const sep = last.text ? ' ' : '';
-        next[next.length - 1] = { ...last, text: cleanText(last.text + sep + sentence) };
-        return next;
-      });
-    };
-  }, [setMessages]);
+
 
   // ── WAVEFORM ─────────────────────────────────────────────────────────────
   const stopWaveform = useCallback(() => {
@@ -255,15 +255,22 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setStatus('processing');
 
     try {
+      const tSttStart = performance.now();
+      const currentMode = sttModeRef.current || 'normal';
       const i16 = float32ToInt16(float32Audio);
       const response = await fetch(BACKEND + '/stt/pcm', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'X-STT-Mode': currentMode,
+          'X-STT-Candidate': candidateNameRef.current || ''
+        },
         body: i16.buffer
       });
 
       const result = await response.json();
-      console.log('[STT WHISPER]', result);
+      const tSttEnd = performance.now();
+      console.log(`[LATENCY-FLOW] STT_RESULT_RECEIVED in ${(tSttEnd - tSttStart).toFixed(0)}ms (mode: ${currentMode}, conf: ${result.confidence ?? 0}, whisper: ${result.latency_ms ?? 0}ms)`, result);
       const heard = (result.text || '').trim();
 
       // If a specific conversation prompt (e.g. name prompt, Yes/No confirm) is waiting for speech:
@@ -274,7 +281,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (isMounted.current) setLiveText(heard);
           statusRef.current = 'ready';
           setStatus('ready');
-          resolver(heard);
+          resolver(heard, result);
           return;
         } else {
           console.log('[STT] Empty transcript during prompt wait, continuing to wait for speech');
@@ -478,74 +485,30 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const speakStream = useCallback(async (text, { onStart, onSentence, onDone, initialClipPromise, timingBase } = {}) => {
     // CRITICAL: stop any audio still playing from a PREVIOUS speak() call
-    // (e.g. an acknowledgment like "let me check that" that hasn't finished
-    // yet) before starting this one. Without this, two clips play at once —
-    // this was the cause of garbled/overlapping speech after we added the
-    // instant-acknowledgment feature.
     if (isSpeaking.current) interruptSpeaking();
 
     window.speechSynthesis.cancel();
-    const myId = Symbol('speak');           // identifies this call so interruptSpeaking() can invalidate it
+    const myId = Symbol('speak');
     activeSpeakIdRef.current = myId;
-    // Mic is intentionally NOT paused here (unlike before) — it stays live
-    // through TTS so the visitor can barge in. echoCancellation on the mic
-    // stream (kioskMic.js) is what keeps it from hearing its own voice.
     isSpeaking.current = true;
-    // NOTE: status is intentionally NOT set to 'speaking' here. Setting it
-    // this early makes the avatar (and anything else keyed off `status`)
-    // start its "speaking" animation before any audio has actually started
-    // playing — e.g. right after the network answer arrives, while TTS is
-    // still being fetched/synthesized. That reads as the avatar "speaking"
-    // before the voice/text actually show up. It's set inside fireStart()
-    // below instead, at the exact moment the first clip's audio begins.
 
-    const finish = () => {
-      if (activeSpeakIdRef.current !== myId) return;   // superseded/interrupted — do nothing
-      isSpeaking.current = false;
-      if (isMounted.current) startListening();   // resume mic for barge-in regardless
-      // Only settle on 'ready' if there's genuinely nothing left to do. If
-      // this was the instant-acknowledgment ("let me check that for you")
-      // finishing before the real answer has arrived, go back to
-      // 'processing' instead — otherwise the avatar sits idle/ready for a
-      // few seconds while the kiosk is still actually working, which reads
-      // as "did it hear me?" to the visitor. startListening() above may
-      // have just set 'ready' synchronously; this runs right after and wins.
-      setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
-      if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
-    };
+    let hasStartedAvatar = false;
+    let firstAudioPlayStart = 0;
 
     const fireStart = () => {
-      setStatus('speaking');    // avatar flips to "speaking" exactly when audio starts
+      if (hasStartedAvatar) return;
+      hasStartedAvatar = true;
+      setStatus('speaking');    // avatar flips to "speaking" ONLY when first audio buffer starts
       if (onStart) { onStart(); onStart = null; }
     };
 
-    // Fallback: robotic browser voice, only if backend TTS is unavailable.
-    const browserSpeak = async () => {
-      fireStart();
-      for (let i = 0; i < sentences.length; i++) {
-        if (activeSpeakIdRef.current !== myId) break;
-        if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
-        console.log('TTS PLAYING:', sentences[i]);
-        await new Promise((resolveEnd) => {
-          const utter = new SpeechSynthesisUtterance(sentences[i]);
-          utter.lang = 'en-US';
-          utter.rate = 1.0;
-          utter.volume = 1;
-          utter.onend = () => resolveEnd();
-          utter.onerror = () => resolveEnd();
-          window.speechSynthesis.speak(utter);
-        });
-        console.log('TTS COMPLETED:', sentences[i]);
-      }
-      finish();
+    const finish = () => {
+      if (activeSpeakIdRef.current !== myId) return;
+      isSpeaking.current = false;
+      if (isMounted.current) startListening();
+      setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+      if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
     };
-
-    const fetchClip = (s) =>
-      fetch(BACKEND + '/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: s })
-      }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
 
     // Web Audio setup
     if (!playCtxRef.current) {
@@ -561,14 +524,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
 
-    // Sentence splitting
+    // Sentence splitting with natural chunking
     const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
       .map(s => s.trim()).filter(Boolean);
 
     const sentences = [];
     if (raw.length) {
       let first = raw[0];
-      if (first.length > 60) {
+      if (first.length > 55) {
         const cut = first.indexOf(',');
         if (cut > 15) {
           sentences.push(first.slice(0, cut + 1));
@@ -579,32 +542,96 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       let buf = '';
       for (let i = 1; i < raw.length; i++) {
         buf = buf ? buf + ' ' + raw[i] : raw[i];
-        if (buf.length >= 90) { sentences.push(buf); buf = ''; }
+        if (buf.length >= 80) { sentences.push(buf); buf = ''; }
       }
       if (buf) sentences.push(buf);
     }
 
-    if (sentences.length > 1 && sentences[0].length < 25) {
+    if (sentences.length > 1 && sentences[0].length < 20) {
       sentences[1] = sentences[0] + ' ' + sentences[1];
       sentences.shift();
     }
 
     console.log('TTS QUEUE:', sentences);
 
+    // Fallback: browser speech synthesis
+    const browserSpeak = async () => {
+      fireStart();
+      for (let i = 0; i < sentences.length; i++) {
+        if (activeSpeakIdRef.current !== myId) break;
+        if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
+        await new Promise((resolveEnd) => {
+          const utter = new SpeechSynthesisUtterance(sentences[i]);
+          utter.lang = 'en-US';
+          utter.rate = 1.05;
+          utter.volume = 1;
+          utter.onstart = () => fireStart();
+          utter.onend = () => resolveEnd();
+          utter.onerror = () => resolveEnd();
+          window.speechSynthesis.speak(utter);
+        });
+      }
+      finish();
+    };
+
     if (pctx.state === 'suspended') {
-      console.warn('[TTS] AudioContext blocked by autoplay policy — using browser voice. ' +
-        'Launch the kiosk browser with --autoplay-policy=no-user-gesture-required (run.py does this).');
+      console.warn('[TTS] AudioContext suspended — using browser voice.');
       await browserSpeak();
       return;
     }
 
+    // Helper: fetch base64 AND pre-decode into AudioBuffer in parallel
+    const fetchAndDecodeClip = async (sentenceText) => {
+      if (!sentenceText) return null;
+      const tReq = performance.now();
+      try {
+        const b64 = await fetch(BACKEND + '/tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: sentenceText })
+        }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
+
+        const tAudioRecv = performance.now();
+        if (!b64) return { buf: null, tReq, tAudioRecv, tDecoded: tAudioRecv };
+
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
+        const buf = await pctx.decodeAudioData(bytes.buffer);
+        const tDecoded = performance.now();
+        return { buf, tReq, tAudioRecv, tDecoded };
+      } catch (e) {
+        console.warn('[TTS] Fetch or decode error for sentence:', sentenceText, e);
+        return { buf: null, tReq, tAudioRecv: performance.now(), tDecoded: performance.now() };
+      }
+    };
+
+    // Helper: decode an already-in-flight initialClipPromise
+    const decodeInitialClipPromise = async (promise) => {
+      const tReq = performance.now();
+      try {
+        const b64 = await promise;
+        const tAudioRecv = performance.now();
+        if (!b64) return { buf: null, tReq, tAudioRecv, tDecoded: tAudioRecv };
+
+        const bin = atob(b64);
+        const bytes = new Uint8Array(bin.length);
+        for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
+        const buf = await pctx.decodeAudioData(bytes.buffer);
+        const tDecoded = performance.now();
+        return { buf, tReq, tAudioRecv, tDecoded };
+      } catch (e) {
+        return { buf: null, tReq, tAudioRecv: performance.now(), tDecoded: performance.now() };
+      }
+    };
+
     try {
       console.log('TTS START:', text);
-      fireStart();
-      // Sequential audio queue:
-      // Prefetch chunk N+1 in parallel while chunk N plays,
-      // but only start playing chunk N+1 once chunk N has completely finished.
-      let prefetchNext = initialClipPromise || (sentences.length > 0 ? fetchClip(sentences[0]) : null);
+
+      // Pre-pipeline: Chunk 0 is preloaded immediately; Chunk 1 prefetch starts while Chunk 0 plays
+      let prefetchNextPromise = (initialClipPromise && sentences.length > 0)
+        ? decodeInitialClipPromise(initialClipPromise)
+        : (sentences.length > 0 ? fetchAndDecodeClip(sentences[0]) : null);
 
       for (let i = 0; i < sentences.length; i++) {
         if (activeSpeakIdRef.current !== myId) break;
@@ -612,25 +639,20 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         const currentSentence = sentences[i];
         if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
 
-        const nextPrefetch = (i + 1 < sentences.length) ? fetchClip(sentences[i + 1]) : null;
-        const b64 = await prefetchNext;
-        prefetchNext = nextPrefetch;
+        // Trigger pre-fetch & pre-decode of chunk N+1 WHILE chunk N is prepared/played
+        const nextPromise = (i + 1 < sentences.length) ? fetchAndDecodeClip(sentences[i + 1]) : null;
+        const clipData = await prefetchNextPromise;
+        prefetchNextPromise = nextPromise;
 
         if (activeSpeakIdRef.current !== myId) break;
 
-        console.log('TTS PLAYING:', currentSentence);
         let playedSuccessfully = false;
 
-        if (b64) {
+        if (clipData && clipData.buf) {
           try {
-            const bin = atob(b64);
-            const bytes = new Uint8Array(bin.length);
-            for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
-            const buf = await pctx.decodeAudioData(bytes.buffer);
-
             if (activeSpeakIdRef.current === myId) {
               const node = pctx.createBufferSource();
-              node.buffer = buf;
+              node.buffer = clipData.buf;
               node.connect(ttsGainRef.current);
               activeNodesRef.current.push(node);
 
@@ -639,44 +661,60 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
                   resolveEnd();
                 };
-                if (i === 0 && timingBase != null) {
-                  const tAudioPlayStart = performance.now();
-                  console.log(`[LATENCY] AUDIO_PLAY_START t=${tAudioPlayStart.toFixed(1)}ms (+${(tAudioPlayStart - timingBase).toFixed(1)}ms since answer received)`);
+
+                const tPlayStart = performance.now();
+                if (i === 0) {
+                  firstAudioPlayStart = tPlayStart;
+                  fireStart(); // Avatar flips to speaking EXACTLY when buffer starts playing!
+
+                  const tAns = timingBase != null ? timingBase : clipData.tReq;
+                  const ttsSynthNet = clipData.tAudioRecv - clipData.tReq;
+                  const decodeMs = clipData.tDecoded - clipData.tAudioRecv;
+                  const timeToFirstAudio = tPlayStart - tAns;
+
+                  console.log(`[LATENCY-FLOW] ANSWER_RECEIVED: t=${tAns.toFixed(1)}ms`);
+                  console.log(`[LATENCY-FLOW] TTS_REQUEST_START: t=${clipData.tReq.toFixed(1)}ms (+${(clipData.tReq - tAns).toFixed(1)}ms)`);
+                  console.log(`[LATENCY-FLOW] TTS_AUDIO_RECEIVED: t=${clipData.tAudioRecv.toFixed(1)}ms (TTS synth+net: ${ttsSynthNet.toFixed(0)}ms)`);
+                  console.log(`[LATENCY-FLOW] AUDIO_DECODED: t=${clipData.tDecoded.toFixed(1)}ms (decode: ${decodeMs.toFixed(0)}ms)`);
+                  console.log(`[LATENCY-FLOW] AUDIO_PLAY_START: t=${tPlayStart.toFixed(1)}ms (time-to-first-audio: ${timeToFirstAudio.toFixed(0)}ms)`);
                 }
                 node.start(0);
               });
               playedSuccessfully = true;
             }
-          } catch (decodeErr) {
-            console.warn('[TTS] Web Audio playback failed for chunk, falling back to browser voice:', decodeErr);
+          } catch (playbackErr) {
+            console.warn('[TTS] Web Audio playback error, falling back to browser voice:', playbackErr);
           }
         }
 
         // Fallback recovery if backend TTS returned null or decode failed
         if (!playedSuccessfully && activeSpeakIdRef.current === myId) {
           console.log('[TTS] Browser voice fallback for:', currentSentence);
+          fireStart();
           await new Promise((resolveEnd) => {
             const utter = new SpeechSynthesisUtterance(currentSentence);
             utter.lang = 'en-US';
-            utter.rate = 1.0;
+            utter.rate = 1.05;
             utter.volume = 1;
             utter.onend = () => resolveEnd();
             utter.onerror = () => resolveEnd();
             window.speechSynthesis.speak(utter);
           });
         }
-
-        console.log('TTS COMPLETED:', currentSentence);
       }
 
       if (activeSpeakIdRef.current !== myId) return;
+      const tAudioPlayEnd = performance.now();
+      if (firstAudioPlayStart > 0) {
+        console.log(`[LATENCY-FLOW] AUDIO_PLAY_END: t=${tAudioPlayEnd.toFixed(1)}ms (Total playback: ${(tAudioPlayEnd - firstAudioPlayStart).toFixed(0)}ms)`);
+      }
       finish();
     } catch (e) {
       if (activeSpeakIdRef.current !== myId) return;
-      console.error('[TTS] Error in sequential queue, falling back to browser voice:', e);
+      console.error('[TTS] Sequential queue error, falling back to browser voice:', e);
       await browserSpeak();
     }
-  }, [startListening]);
+  }, [startListening, interruptSpeaking]);
 
   // Thin wrapper over speakStream for callers that don't need per-sentence
   // sync (ack bubble, farewell, greeting, error fallback, name flow) — same
@@ -699,395 +737,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     })
   ), [speak]);
 
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  const sendToBackend = useCallback(async (text) => {
-    if (!text) return;
-    setLiveText('');
-    setProcessingHint('');
-    const sid = session?.session_id || 'guest';
-    const myReqSeq = ++requestSeqRef.current;   // this question's sequence number
-    addMessage(text, 'user');
-
-    // ── Check if visitor is affirming a pending name confirmation ──────
-    const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
-      || /\b(?:yes that is my name|yes that is correct|yes that is me|thats my name|that's my name)\b/i.test(text.trim());
-    if (pendingCandidateNameRef.current && isAffirmation) {
-      const confirmedName = pendingCandidateNameRef.current;
-      pendingCandidateNameRef.current = '';
-      setLocalName(confirmedName);
-      await submitVoiceName(confirmedName, true);
-      const greetNamed = `Great to meet you, ${confirmedName}! How may I assist you today?`;
-      addMessage(greetNamed, 'kiosk');
-      speak(greetNamed);
-      return;
-    }
-
-    // ── Resume-interrupted-answer intent ───────────────────────────────
-    // If noise cut Nova off mid-answer and the visitor says "continue",
-    // "full answer", "repeat", etc. — replay the stored answer without
-    // hitting the backend again.
-    // Also catches "yes"/"yeah" when Nova already asked "Would you like me to continue?"
-    const resumeKeywords = /\b(continue|go on|full answer|complete|finish|what else|rest of|repeat that|say again|resume|give me the full|tell me more|carry on)\b/i.test(text.trim());
-    const resumeYes = wasInterruptedRef.current && /^(yes|yeah|yep|sure|ok|okay|please|go ahead|sure please)[.!?]*$/i.test(text.trim());
-    if ((resumeKeywords || resumeYes) && lastAnswerRef.current) {
-      wasInterruptedRef.current = false;   // reset — visitor acknowledged
-      const storedAnswer = lastAnswerRef.current;
-      console.log('ANSWER RECEIVED:', storedAnswer);
-      console.log('TEXT RENDER START:', storedAnswer);
-      addMessage(storedAnswer, 'kiosk');
-      await new Promise(resolve => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(resolve);
-        });
-      });
-      console.log('TEXT DOM RENDERED:', storedAnswer);
-      console.log('TTS START:', storedAnswer);
-      speakStream(storedAnswer, {
-        onDone: () => { wasInterruptedRef.current = false; },
-      });
-      return;
-    }
-
-    // ── Mid-session bare "change my name" prompt (no name given yet) ──────
-    // Explicit "change my name to X" / "call me X" patterns are handled by
-    // the backend _deterministic_route via /ask below — do NOT early-return
-    // for those, or save_interaction will be skipped and the DB won't log it.
-    const bareNameChange = /\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text)
-      || /\b(?:i want to|can i|can you|please|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text);
-
-    // Only fire the interactive prompt when NO name was provided inline
-    const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
-      || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
-
-    // Fix 1: Only auto-rename when the utterance contains an EXPLICIT name-introduction phrase.
-    // Garbled noise, filler words, or partial questions must never trigger a rename.
-    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text);
-    if (isExplicitNameIntro && !bareNameChange) {
-      const candidateName = extractVisitorName(text);
-      if (candidateName && candidateName.length >= 2 && candidateName.split(' ').length <= 3
-          && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you|done|then|well|so|and|but|or|the|a|an)$/i.test(candidateName)) {
-        setLocalName(candidateName);
-        fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(candidateName), { method: 'POST' }).catch(() => {});
-        const doneMsg = `Done! I have changed your name to ${candidateName}. How may I assist you today?`;
-        addMessage(doneMsg, 'kiosk');
-        speak(doneMsg);
-        return;
-      }
-    }
-
-    if (bareNameChange && !hasInlineName) {
-      // ── Step 1: Ask for the new name ────────────────────────────────────
-      const promptChange = 'Sure! What should I change your name to?';
-      addMessage(promptChange, 'kiosk');
-      await speakAndWait(promptChange);
-      const heardNewName = await captureUtteranceText(25000);
-
-      if (!heardNewName) {
-        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
-        addMessage(cancelMsg, 'kiosk');
-        speak(cancelMsg);
-        return;
-      }
-
-      addMessage(heardNewName, 'user');
-      let extracted = extractVisitorName(heardNewName) || heardNewName.trim();
-      extracted = extracted.replace(/[.!?]+$/, '').trim();
-      const cleanWords = extracted.split(/\s+/).filter(w =>
-        !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
-
-      if (cleanWords.length === 0) {
-        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
-        addMessage(cancelMsg, 'kiosk');
-        speak(cancelMsg);
-        return;
-      }
-
-      extracted = cleanWords.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
-
-      // ── Step 2: Confirm with voice OR double-blink ───────────────────────
-      const confirmMsg = `Got it — should I call you ${extracted}? Say yes or blink twice to confirm, or say no to spell it out.`;
-      addMessage(confirmMsg, 'kiosk');
-      await speakAndWait(confirmMsg);
-      const confirmed = await captureYesNo(25000);
-
-      // Helper: apply the final name to DB + session
-      const applyName = async (finalName) => {
-        setLocalName(finalName);
-        await fetch(BACKEND + '/visitor/rename?name=' + encodeURIComponent(finalName), { method: 'POST' }).catch(() => {});
-        const doneMsg = `Done! I have changed your name to ${finalName}. How may I assist you today?`;
-        addMessage(doneMsg, 'kiosk');
-        speak(doneMsg);
-      };
-
-      // ── Helper: letter-by-letter spelling mode ────────────────────────────
-      // Nova echoes each letter as it is heard so the visitor can track
-      // progress. Phonetic alphabet (alpha/bravo/charlie…) is also accepted.
-      const runSpellingMode = async () => {
-        const PHONETIC = {
-          alpha:'a', bravo:'b', charlie:'c', delta:'d', echo:'e', foxtrot:'f',
-          golf:'g', hotel:'h', india:'i', juliet:'j', kilo:'k', lima:'l',
-          mike:'m', november:'n', oscar:'o', papa:'p', quebec:'q', romeo:'r',
-          sierra:'s', tango:'t', uniform:'u', victor:'v', whiskey:'w',
-          xray:'x', 'x-ray':'x', yankee:'y', zulu:'z',
-        };
-        const spellPrompt = 'Sure! Please spell out your name — say each letter one at a time. Say "done" when you are finished.';
-        addMessage(spellPrompt, 'kiosk');
-        await speakAndWait(spellPrompt);
-
-        let spelled = '';
-        let attempts = 0;
-        while (attempts < 25) {
-          const letter = await captureUtteranceText(7000);
-          if (!letter) break;
-
-          const t = letter.trim().toLowerCase();
-          // Finish words
-          if (/^(done|finish|finished|that.?s it|stop|end|complete|that.?s all|ok done)$/i.test(t)) break;
-
-          let ch = '';
-          if (t.length === 1 && /[a-z]/.test(t)) {
-            ch = t.toUpperCase();
-          } else if (PHONETIC[t]) {
-            ch = PHONETIC[t].toUpperCase();
-          } else if (/^[a-z]\s/i.test(t)) {
-            // e.g. STT returns "P." or "P " for a single letter
-            ch = t[0].toUpperCase();
-          }
-
-          if (ch) {
-            spelled += ch;
-            const soFar = spelled.split('').join('-');
-            const echoMsg = `${ch}. So far: ${soFar}`;
-            addMessage(echoMsg, 'kiosk');
-            speak(echoMsg);
-          } else {
-            // Unrecognised syllable — ask them to repeat
-            const retryMsg = "Sorry, I did not catch that letter. Please say it again.";
-            addMessage(retryMsg, 'kiosk');
-            speak(retryMsg);
-          }
-          attempts++;
-        }
-
-        if (spelled.length === 0) return;
-
-        // Capitalise first letter, rest lowercase
-        const spelledName = spelled.charAt(0).toUpperCase() + spelled.slice(1).toLowerCase();
-
-        // Final confirmation after spelling
-        const spelledConfirmMsg = `I have ${spelledName}. Is that correct? Say yes or blink twice.`;
-        addMessage(spelledConfirmMsg, 'kiosk');
-        await speakAndWait(spelledConfirmMsg);
-        const spelledOk = await captureYesNo(12000);
-
-        if (spelledOk !== false) {
-          // Accept on yes, double-blink, or timeout (visitor stayed silent)
-          await applyName(spelledName);
-        } else {
-          const giveUpMsg = 'No problem — I will keep your name as it is for now. You can try again anytime.';
-          addMessage(giveUpMsg, 'kiosk');
-          speak(giveUpMsg);
-        }
-      };
-
-      if (confirmed === true) {
-        // Voice "yes" or double-blink confirmed
-        await applyName(extracted);
-      } else if (
-        confirmed === false ||
-        (typeof confirmed === 'string' && /\b(no|nope|wrong|spell|spelling|incorrect|not right)\b/i.test(confirmed))
-      ) {
-        // User said no / "spell it" — enter spelling mode
-        await runSpellingMode();
-      } else {
-        // captureYesNo timed out (null) — accept the heard name
-        await applyName(extracted);
-      }
-      return;
-    }
-
-    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
-    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
-      const farewells = [
-        'You are most welcome! Have a wonderful day. Goodbye!',
-        'Happy to help! Take care and have a great day.',
-        'Anytime! Wishing you a lovely day ahead. Goodbye!',
-        'My pleasure! All the best, and see you around campus.',
-      ];
-      const farewell = farewells[Math.floor(Math.random() * farewells.length)];
-      micRef.current?.pause();
-      farewellPlayingRef.current = true;     // protect this audio from the session_end stop
-
-      // Switch to the goodbye screen NOW so the farewell voice plays OVER it
-      // (they should appear together). The audio uses Web Audio, which keeps
-      // playing across this component unmounting — and farewellPlayingRef
-      // keeps the session_end handler from stopping it. We clear the flag
-      // when the voice actually finishes.
-      speak(farewell, null, () => { farewellPlayingRef.current = false; });
-      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => { });
-      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell, userName: localName || session?.user_name } }));   // goodbye screen appears now
-      return;
-    }
-
-    // Set BEFORE the ack fires: from this point until the real answer's
-    // speech actually starts (or the request fails/is dropped), finish()
-    // in speakStream will treat any in-between "ready" moment (e.g. the ack
-    // finishing early) as still 'processing' — see awaitingAnswerRef above.
-    awaitingAnswerRef.current = true;
-
-    // INSTANT ACKNOWLEDGMENT: a real receptionist reacts the moment you
-    // finish speaking — not after a silent pause. We play a short filler
-    // right away while the actual answer is still being fetched, so there's
-    // never dead air with a spinner. Kept short so it doesn't collide with
-    // the real answer. Skipped for very short/greeting-like inputs.
-    // NOTE: these must match backend/tts.py's _PREWARM list byte-for-byte
-    // (including punctuation) or the prewarm cache silently misses and the
-    // filler phrase has to be synthesized live — right as the real answer's
-    // first TTS chunk is also being requested, so the two compete for the
-    // same CPU-bound Kokoro pipeline. ("Good question - one moment." was an
-    // em dash here vs. a hyphen in tts.py — that one always missed the cache.)
-    const acks = [
-      'Sure, let me check that for you.',
-      'Good question - one moment.',
-      'Let me look that up for you.',
-      'Of course, just a second.',
-      'Right, let me find that.',
-    ];
-    const isInstantCmd = hasInlineName || bareNameChange ||
-      /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
-
-    if (!isInstantCmd && text.split(' ').length >= 3) {
-      const ack = acks[Math.floor(Math.random() * acks.length)];
-      console.log('THINKING AUDIO START:', ack);
-      speak(ack, () => setProcessingHint(ack), () => {
-        console.log('THINKING AUDIO COMPLETED:', ack);
-      });
-    } else {
-      setProcessingHint('Thinking...');
-      statusRef.current = 'processing';
-      setStatus('processing');
-    }
-
-    // 35 s hard cap — prevents status getting stuck at 'processing' if the
-    // LLM is slow or the network drops after the request was sent.
-    const askController = new AbortController();
-    const askTimeout = setTimeout(() => askController.abort(), 35000);
-    try {
-      const [, askRes] = await Promise.all([
-        fetch(BACKEND + '/message', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
-        }),
-        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text),
-          { signal: askController.signal })
-      ]);
-      clearTimeout(askTimeout);
-      const data = await askRes.json();
-
-      // STALE-ANSWER GUARD: only drop if the backend explicitly says so, or if
-      // the visitor has since asked ANOTHER question that superseded this one.
-      // We intentionally do NOT compare session_id here anymore — the backend
-      // can end/resume a session (face-detection hiccups, re-engagement
-      // lookups) while a slow /ask call (e.g. local-LLM timeout -> Gemini
-      // fallback) is still in flight for the SAME visitor, which used to make
-      // this guard discard a perfectly valid, on-topic answer and leave the
-      // UI stuck on the "just a second" filler forever.
-      if (data.dropped || myReqSeq !== requestSeqRef.current) {
-        console.info('[sendToBackend] dropped stale answer for', sid);
-        awaitingAnswerRef.current = false;
-        isSpeaking.current = false;
-        setProcessingHint('');
-        setStatus('ready');
-        return;
-      }
-
-      const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
-      const tAnswerReceived = performance.now();
-      console.log(`[LATENCY] ANSWER_RECEIVED t=${tAnswerReceived.toFixed(1)}ms`, answer);
-
-      // Extracts just the first sentence/clause — this is all the first TTS
-      // request needs to send; the rest is chunked+prefetched inside speakStream.
-      const firstChunkText = (ans) => {
-        const raw = (ans.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [ans]).map(s => s.trim()).filter(Boolean);
-        let first = raw.length ? raw[0] : ans;
-        if (first.length > 60) {
-          const cut = first.indexOf(',');
-          if (cut > 15) first = first.slice(0, cut + 1);
-        }
-        return first;
-      };
-
-      // Store full answer so resume intent can replay it on interruption
-      lastAnswerRef.current = answer;
-      wasInterruptedRef.current = false;
-      fetch(BACKEND + '/message', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
-      });
-
-      setProcessingHint('');
-      awaitingAnswerRef.current = false;
-
-      // 1. Render FULL answer text into the response box (never sentence-by-sentence)
-      console.log('TEXT RENDER START:', answer);
-      addMessage(answer, 'kiosk');
-
-      // 2. WAIT only for DOM/browser paint before starting answer TTS.
-      //    Nothing TTS-related happens before this point — no prefetch, no
-      //    request — so the first TTS call can never race or contend with
-      //    the paint itself.
-      await new Promise(resolve => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(resolve);
-        });
-      });
-
-      const tDomPainted = performance.now();
-      console.log(`[LATENCY] TEXT_DOM_PAINTED t=${tDomPainted.toFixed(1)}ms (+${(tDomPainted - tAnswerReceived).toFixed(1)}ms since answer)`);
-
-      // 3. Fire the FIRST TTS request immediately after paint — not before.
-      const tTtsReqStart = performance.now();
-      console.log(`[LATENCY] TTS_REQUEST_START t=${tTtsReqStart.toFixed(1)}ms (+${(tTtsReqStart - tDomPainted).toFixed(1)}ms since paint)`);
-      const firstClipPromise = fetch(BACKEND + '/tts', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: firstChunkText(answer) })
-      }).then(r => r.json()).then(d => {
-        const tTtsResponse = performance.now();
-        console.log(`[LATENCY] TTS_RESPONSE t=${tTtsResponse.toFixed(1)}ms (+${(tTtsResponse - tTtsReqStart).toFixed(1)}ms since request)`);
-        return d.audio || null;
-      }).catch(() => null);
-
-      console.log('TEXT DOM RENDERED:', answer);
-
-      // 4. Nova voice plays the answer strictly AFTER visible text exists on screen
-      await speakStream(answer, { initialClipPromise: firstClipPromise, timingBase: tAnswerReceived });
-
-    } catch (e) {
-      clearTimeout(askTimeout);
-      awaitingAnswerRef.current = false;
-      setProcessingHint('');   // never leave the "thinking" bubble stuck on a failed request
-      console.error('[sendToBackend]', e);
-      const fallback = e.name === 'AbortError'
-        ? "I'm sorry, that's taking longer than expected. Please try asking again."
-        : 'Sorry, something went wrong. Please try again.';
-      console.log('TEXT RENDER START:', fallback);
-      addMessage(fallback, 'kiosk');
-      await new Promise(resolve => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(resolve);
-        });
-      });
-      console.log('TEXT DOM RENDERED:', fallback);
-      speak(fallback);
-    }
-  }, [session, addMessage, speakStream]);
-
   // ── Helper parsing for name & guest choices ──
   // Words that must NEVER be treated as a visitor name regardless of context.
-  const _REJECTION_WORDS = /^(no|nope|nah|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend|none|null|undefined|yes|yeah|yep|yup|sure|ok|okay)$/i;
+  const _REJECTION_WORDS = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend|none|null|undefined|yes|yeah|yep|yup|sure|ok|okay)$/i;
 
   const extractVisitorName = useCallback((raw) => {
     if (!raw) return '';
@@ -1137,11 +789,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, [doubleBlink]);
 
-  const wantsToGiveName = useCallback((text) => {
-    if (!text) return false;
-    return /\b(yes|yeah|yep|yup|sure|ok|okay|why not|of course|certainly|definitely|i do|i would|i want|give name|give my name|my name|tell name|tell my name|provide name|share name|enter name|yes please|i will|blink|blinked)\b/i.test(text)
-      || text.includes('👁️') || text.toLowerCase().includes('blink');
-  }, []);
 
   const isGuestOption = useCallback((text) => {
     if (!text) return false;
@@ -1188,7 +835,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     });
   }, []);
 
-
   // Waits for a spoken "yes"/"no" response, double blink, or direct correction
   const captureYesNo = useCallback((timeoutMs = 25000) => {
     return new Promise((resolve) => {
@@ -1233,14 +879,375 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     });
   }, []);
 
-
   const submitVoiceName = useCallback(async (finalName, save) => {
     try {
       await fetch(BACKEND + '/visitor/submit_name?name=' + encodeURIComponent(finalName) +
         '&save=' + save, { method: 'POST' });
     } catch (e) { console.error('[NAME FLOW] submit failed', e); }
-    if (isMounted.current) setNameStage('done');
   }, []);
+
+  // ── Unified Reusable Name Spelling & Confirmation State Machine ───────────
+  // Requirements:
+  //   Step 2: ALWAYS ask for spelling ("Thanks, [Name]. Could you spell your name for me, one letter at a time?")
+  //   Step 3: Capture spelling — conversational letter-by-letter or natural full utterance (NATO, phonetics)
+  //   Step 4: Spelling confirmation ("I have A-L-A-N-K-R-I-T-A. Is that correct?")
+  //   Step 5: NEVER save unconfirmed names. Only save upon explicit confirmation.
+  const runSpellingCaptureAndConfirm = useCallback(async (candidate, stillCurrent) => {
+    candidateNameRef.current = candidate || '';
+    setConvState(CONV_STATE.ASKING_SPELLING);
+    sttModeRef.current = 'spelling';
+
+    const cleanCandidate = (candidate || '').trim();
+    const spellPrompt = (cleanCandidate && !['Friend', 'Guest', 'there', 'Unknown'].includes(cleanCandidate))
+      ? `Thanks, ${cleanCandidate}. Could you please spell your name?`
+      : 'Could you please spell your name?';
+    const spellChatMsg = (cleanCandidate && !['Friend', 'Guest', 'there', 'Unknown'].includes(cleanCandidate))
+      ? `Thanks, ${cleanCandidate}! Could you please spell your name?\n\n• 🗣️ Say the letters (e.g. "A L A N K R I T A")\n• 🗣️ Say "Guest" to skip`
+      : 'Could you please spell your name?\n\n• 🗣️ Say the letters (e.g. "A L A N K R I T A")\n• 🗣️ Say "Guest" to skip';
+
+    addMessage(spellChatMsg, 'kiosk');
+    await speakAndWait(spellPrompt);
+    if (!stillCurrent()) return;
+
+    let accumulatedLetters = [];
+    let retryCount = 0;
+
+    while (stillCurrent() && retryCount < 3) {
+      setConvState(CONV_STATE.CAPTURING_SPELLING);
+      sttModeRef.current = 'spelling';
+      const heardSpelling = await captureUtteranceText(18000);
+      if (!stillCurrent()) return;
+
+      // Visitor chose to skip or continue as guest
+      if (isSpellingSkipOrGuest(heardSpelling)) {
+        setConvState(CONV_STATE.GUEST);
+        setLocalName('Guest');
+        await submitVoiceName('Guest', false);
+        const guestMsg = "That's okay. We can continue as Guest. How can I help you?";
+        addMessage(guestMsg, 'kiosk');
+        await speakAndWait(guestMsg);
+        if (stillCurrent()) startListening();
+        return;
+      }
+
+      if (!heardSpelling) {
+        retryCount++;
+        if (retryCount >= 3) break;
+        const promptRep = "Please spell your name, like A L A N K R I T A. Or say Guest to continue.";
+        addMessage(promptRep, 'kiosk');
+        await speakAndWait(promptRep);
+        continue;
+      }
+
+      addMessage(heardSpelling, 'user');
+
+      // Check if visitor said "done" or "finished"
+      const isDoneKeyword = /^(done|finish|finished|that.?s it|stop|end|complete|that.?s all|ok done)$/i.test(heardSpelling.trim());
+      if (isDoneKeyword) {
+        if (accumulatedLetters.length < 2) {
+          const needMoreMsg = "Please tell me the letters in your name before saying done.";
+          addMessage(needMoreMsg, 'kiosk');
+          await speakAndWait(needMoreMsg);
+          continue;
+        }
+      } else {
+        // 1. Check if user spoke a full multi-letter sequence in one utterance (e.g. "A L A N K R I T A", "A, L, A...", "A-L-A...")
+        const fullNorm = normalizeSpelledName(heardSpelling);
+        if (fullNorm && fullNorm.letters && fullNorm.letters.length >= 2) {
+          accumulatedLetters = fullNorm.letters;
+          console.log('[NAME-STATE] Full utterance spelling captured in one text:', fullNorm);
+        } else {
+          // If cleanCandidate exists and user's utterance has all letters together (e.g. "ALANKRITA")
+          const cleanLetters = heardSpelling.toUpperCase().replace(/[^A-Z]/g, '');
+          if (cleanLetters.length >= 2) {
+            accumulatedLetters = cleanLetters.split('');
+            console.log('[NAME-STATE] Clean letter string captured:', accumulatedLetters);
+          } else {
+            // 2. Check for single letter conversational utterance
+            const singleLetter = resolveSingleLetter(heardSpelling);
+            if (singleLetter) {
+              accumulatedLetters.push(singleLetter);
+              const soFarDashed = accumulatedLetters.join('-');
+              console.log(`[NAME-STATE] Captured letter: ${singleLetter}, so far: ${soFarDashed}`);
+
+              // If candidateName was provided and we have collected all its letters:
+              const expectedLen = cleanCandidate.replace(/[^a-zA-Z]/g, '').length;
+              if (expectedLen > 1 && accumulatedLetters.length >= expectedLen) {
+                // Collected all expected letters, move to confirmation
+              } else {
+                const nextPrompt = `${singleLetter}. Next letter?`;
+                addMessage(`${singleLetter}. So far: ${soFarDashed}`, 'kiosk');
+                await speakAndWait(nextPrompt);
+                continue;
+              }
+            } else {
+              // STT low confidence or unrecognised syllable
+              const retryLetterMsg = "Sorry, I missed that. Could you please spell your name, like A L A N K R I T A?";
+              addMessage(retryLetterMsg, 'kiosk');
+              await speakAndWait(retryLetterMsg);
+              continue;
+            }
+          }
+        }
+      }
+
+      // Step 4: Spelling Confirmation
+      const spelledDashed = accumulatedLetters.join('-');
+      const normalizedFinalName = accumulatedLetters.join('').charAt(0).toUpperCase() + accumulatedLetters.join('').slice(1).toLowerCase();
+
+      setConvState(CONV_STATE.CONFIRMING_SPELLING);
+      sttModeRef.current = 'normal';
+      const confirmSpokenMsg = `I have ${spelledDashed}. Is that correct?`;
+      const confirmChatMsg = `I have ${spelledDashed}. Is that correct?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to confirm\n• 🗣️ Say "No" to retry`;
+      addMessage(confirmChatMsg, 'kiosk');
+      await speakAndWait(confirmSpokenMsg);
+      if (!stillCurrent()) return;
+
+      const confirmed = await captureYesNo(25000);
+      if (!stillCurrent()) return;
+
+      if (confirmed === true) {
+        // YES or double-blink: SAVE confirmed name
+        setConvState(CONV_STATE.CONFIRMED);
+        setLocalName(normalizedFinalName);
+        await submitVoiceName(normalizedFinalName, true);
+        const meetMsg = `Lovely to meet you, ${normalizedFinalName}. How can I help you?`;
+        addMessage(meetMsg, 'kiosk');
+        await speakAndWait(meetMsg);
+        if (stillCurrent()) startListening();
+        return;
+      } else if (confirmed === false || (typeof confirmed === 'string' && /\b(no|nope|wrong|change|not|different|retry)\b/i.test(confirmed))) {
+        // NO: Do NOT save name! Prompt retry
+        retryCount++;
+        if (retryCount < 3) {
+          setConvState(CONV_STATE.RETRY_SPELLING);
+          const retryMsg = "No problem. Let's try that again. Please spell your name for me.";
+          addMessage(retryMsg, 'kiosk');
+          await speakAndWait(retryMsg);
+          accumulatedLetters = [];
+          continue;
+        } else {
+          break;
+        }
+      } else {
+        // Unclear or timeout: NEVER save unconfirmed name
+        break;
+      }
+    }
+
+    // Retries exhausted or abandoned: Fall back to Guest mode
+    setConvState(CONV_STATE.GUEST);
+    setLocalName('Guest');
+    await submitVoiceName('Guest', false);
+    const guestFallbackMsg = "That's okay. We can continue as Guest. How can I help you?";
+    addMessage(guestFallbackMsg, 'kiosk');
+    await speakAndWait(guestFallbackMsg);
+    if (stillCurrent()) startListening();
+  }, [addMessage, speakAndWait, captureUtteranceText, captureYesNo, submitVoiceName, startListening]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const sendToBackend = useCallback(async (text) => {
+    if (!text) return;
+    setLiveText('');
+    setProcessingHint('');
+    const sid = session?.session_id || 'guest';
+    const myReqSeq = ++requestSeqRef.current;   // this question's sequence number
+    addMessage(text, 'user');
+
+    // ── Resume-interrupted-answer intent ───────────────────────────────
+    const resumeKeywords = /\b(continue|go on|full answer|complete|finish|what else|rest of|repeat that|say again|resume|give me the full|tell me more|carry on)\b/i.test(text.trim());
+    const resumeYes = wasInterruptedRef.current && /^(yes|yeah|yep|sure|ok|okay|please|go ahead|sure please)[.!?]*$/i.test(text.trim());
+    if ((resumeKeywords || resumeYes) && lastAnswerRef.current) {
+      wasInterruptedRef.current = false;
+      const storedAnswer = lastAnswerRef.current;
+      addMessage(storedAnswer, 'kiosk');
+      speakStream(storedAnswer, {
+        onDone: () => { wasInterruptedRef.current = false; },
+      });
+      return;
+    }
+
+    // ── Mid-session name change or introduction ─────────────────────────
+    const bareNameChange = /\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text)
+      || /\b(?:i want to|can i|can you|please|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b/i.test(text);
+
+    const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
+      || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
+
+    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text);
+
+    if ((isExplicitNameIntro || hasInlineName) && !bareNameChange) {
+      const candidateName = extractVisitorName(text);
+      if (candidateName && candidateName.length >= 2 && candidateName.split(' ').length <= 3
+          && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you|done|then|well|so|and|but|or|the|a|an)$/i.test(candidateName)) {
+        // ALWAYS route through spelling capture before saving!
+        await runSpellingCaptureAndConfirm(candidateName, () => isMounted.current);
+        return;
+      }
+    }
+
+    if (bareNameChange && !hasInlineName) {
+      const promptChange = 'Sure! What should I change your name to?';
+      addMessage(promptChange, 'kiosk');
+      await speakAndWait(promptChange);
+      const heardNewName = await captureUtteranceText(20000);
+      if (!heardNewName) {
+        const cancelMsg = 'No problem. Let me know if you would like to change your name or ask a question.';
+        addMessage(cancelMsg, 'kiosk');
+        speak(cancelMsg);
+        return;
+      }
+      addMessage(heardNewName, 'user');
+      const candidateName = extractVisitorName(heardNewName) || heardNewName.trim().replace(/[.!?]+$/, '');
+      await runSpellingCaptureAndConfirm(candidateName, () => isMounted.current);
+      return;
+    }
+
+    // ── Farewell / Goodbye ─────────────────────────────────────────────
+    const goodbyeWords = ['thank you', 'thanks', 'bye', 'goodbye', 'see you', 'ok bye', 'thank you so much'];
+    if (goodbyeWords.some(w => text.toLowerCase().includes(w))) {
+      const farewells = [
+        'You are most welcome! Have a wonderful day. Goodbye!',
+        'Happy to help! Take care and have a great day.',
+        'Anytime! Wishing you a lovely day ahead. Goodbye!',
+        'My pleasure! All the best, and see you around campus.',
+      ];
+      const farewell = farewells[Math.floor(Math.random() * farewells.length)];
+      micRef.current?.pause();
+      farewellPlayingRef.current = true;
+      speak(farewell, null, () => { farewellPlayingRef.current = false; });
+      fetch(BACKEND + '/session/end?session_id=' + sid, { method: 'POST' }).catch(() => { });
+      window.dispatchEvent(new CustomEvent('vrk-session-ended', { detail: { farewell, userName: localName || session?.user_name } }));
+      return;
+    }
+
+    awaitingAnswerRef.current = true;
+    setConvState(CONV_STATE.PROCESSING);
+    sttModeRef.current = 'normal';
+
+    // ── Coordinated instant acknowledgment ────────────────────────────
+    const acks = [
+      'Sure, let me check that for you.',
+      'Good question - one moment.',
+      'Let me look that up for you.',
+      'Of course, just a second.',
+      'Right, let me find that.',
+    ];
+    const isInstantCmd = hasInlineName || bareNameChange ||
+      /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+
+    let ackTimer = null;
+
+    if (!isInstantCmd && text.split(' ').length >= 3 && !lastQuestionHadAckRef.current) {
+      ackTimer = setTimeout(() => {
+        if (!awaitingAnswerRef.current) return;
+        const ack = acks[Math.floor(Math.random() * acks.length)];
+        lastQuestionHadAckRef.current = true;
+        console.log('THINKING AUDIO START:', ack);
+        speak(ack, () => setProcessingHint(ack), () => {
+          console.log('THINKING AUDIO COMPLETED:', ack);
+        });
+      }, 750);
+    } else {
+      lastQuestionHadAckRef.current = false;
+      setProcessingHint('Thinking...');
+      statusRef.current = 'processing';
+      setStatus('processing');
+    }
+
+    const tAskStart = performance.now();
+    const askController = new AbortController();
+    const askTimeout = setTimeout(() => askController.abort(), 35000);
+    try {
+      const [, askRes] = await Promise.all([
+        fetch(BACKEND + '/message', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ session_id: sid, text, speaker: 'user' })
+        }),
+        fetch(BACKEND + '/ask?question=' + encodeURIComponent(text) + '&session_id=' + encodeURIComponent(sid),
+          { signal: askController.signal })
+      ]);
+      clearTimeout(askTimeout);
+      if (ackTimer) clearTimeout(ackTimer);
+
+      const data = await askRes.json();
+      const tAnswerReceived = performance.now();
+      const backendAnsLatency = tAnswerReceived - tAskStart;
+      console.log(`[LATENCY-FLOW] ANSWER_RECEIVED: at t=${tAnswerReceived.toFixed(1)}ms (backend answer latency: ${backendAnsLatency.toFixed(0)}ms)`, data);
+
+      if (data.dropped || myReqSeq !== requestSeqRef.current) {
+        awaitingAnswerRef.current = false;
+        isSpeaking.current = false;
+        setProcessingHint('');
+        setStatus('ready');
+        return;
+      }
+
+      // If backend returned a name spelling prompt (e.g. from _deterministic_route):
+      if (data.source === 'name_change_ask_spelling' || data.source === 'name_spelling_prompt') {
+        awaitingAnswerRef.current = false;
+        setProcessingHint('');
+        const cand = data.candidate_name || extractVisitorName(text);
+        await runSpellingCaptureAndConfirm(cand, () => isMounted.current);
+        return;
+      }
+
+      const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
+
+      const firstChunkText = (ans) => {
+        const raw = (ans.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [ans]).map(s => s.trim()).filter(Boolean);
+        let first = raw.length ? raw[0] : ans;
+        if (first.length > 55) {
+          const cut = first.indexOf(',');
+          if (cut > 15) first = first.slice(0, cut + 1);
+        }
+        return first;
+      };
+
+      lastAnswerRef.current = answer;
+      wasInterruptedRef.current = false;
+
+      fetch(BACKEND + '/message', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: sid, text: answer, speaker: 'kiosk' })
+      });
+
+      setProcessingHint('');
+      awaitingAnswerRef.current = false;
+
+      // Render FULL answer text into the response box
+      addMessage(answer, 'kiosk');
+
+      // Start prefetching chunk 0 immediately — zero artificial wait!
+      const tTtsReqStart = performance.now();
+      console.log(`[LATENCY-FLOW] TTS_REQUEST_START: chunk 0 at t=${tTtsReqStart.toFixed(1)}ms`);
+      const firstClipPromise = fetch(BACKEND + '/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: firstChunkText(answer) })
+      }).then(r => r.json()).then(d => {
+        const tTtsResponse = performance.now();
+        console.log(`[LATENCY-FLOW] TTS_AUDIO_RECEIVED: at t=${tTtsResponse.toFixed(1)}ms (+${(tTtsResponse - tTtsReqStart).toFixed(0)}ms)`);
+        return d.audio || null;
+      }).catch(() => null);
+
+      await speakStream(answer, { initialClipPromise: firstClipPromise, timingBase: tAnswerReceived });
+
+    } catch (e) {
+      clearTimeout(askTimeout);
+      if (ackTimer) clearTimeout(ackTimer);
+      awaitingAnswerRef.current = false;
+      setProcessingHint('');
+      console.error('[sendToBackend]', e);
+      const fallback = e.name === 'AbortError'
+        ? "I'm sorry, that's taking longer than expected. Please try asking again."
+        : 'Sorry, something went wrong. Please try again.';
+      addMessage(fallback, 'kiosk');
+      speak(fallback);
+    }
+  }, [session, addMessage, speakStream, runSpellingCaptureAndConfirm, extractVisitorName, speakAndWait, captureUtteranceText, speak]);
 
   // ── Integrated Conversation Start Flow (Voice + Double-Blink: Yes / No / Guest / Name) ──
   const greetedRef = useRef(null);
@@ -1274,28 +1281,27 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       setTimeout(() => setCelebrate(false), 2400);
 
       while (stillCurrent()) {
-        setNameStage('asking');
-        const askChatMsg = 'Welcome to RNS Institute of Technology! I am Nova, your digital receptionist.\n\nWould you like to give your name or continue as guest?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to give your name\n• 🗣️ Say "Guest" to continue as Guest';
-        const askSpokenMsg = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. Would you like to give your name, or continue as guest? You can say yes or blink twice to give your name, or say guest to continue as guest.';
+        setConvState(CONV_STATE.ASKING_NAME);
+        sttModeRef.current = 'name';
+
+        // Step 1: Nova asks "Hi! May I know your name?"
+        const askChatMsg = 'Welcome to RNS Institute of Technology! I am Nova, your digital receptionist.\n\nHi! May I know your name?\n\n• 🗣️ Speak your name\n• 🗣️ Say "Guest" to continue as Guest';
+        const askSpokenMsg = 'Welcome to R N S Institute of Technology! I am Nova, your digital receptionist. Hi! May I know your name?';
         addMessage(askChatMsg, 'kiosk');
         await speakAndWait(askSpokenMsg);
         if (!stillCurrent()) return;
 
-        setNameStage('listening_name');
-        const heard = await captureUtteranceText(6000);
+        setConvState(CONV_STATE.CAPTURING_NAME);
+        sttModeRef.current = 'name';
+        const heard = await captureUtteranceText(12000);
         if (!stillCurrent()) return;
-
-        let choseGiveName = false;
-        let directNameProvided = null;
 
         if (heard) {
           addMessage(heard, 'user');
 
-          if (wantsToGiveName(heard)) {
-            // User affirmed verbally or with double-blink: e.g. "Yes", "👁️ [Blinked twice — Yes]"
-            choseGiveName = true;
-          } else if (isGuestOption(heard)) {
-            // User chose Guest verbally
+          if (isGuestOption(heard) || isContinueOption(heard)) {
+            // User chose Guest
+            setConvState(CONV_STATE.GUEST);
             const guestMsg = 'Continuing as Guest! How may I assist you today?';
             addMessage(guestMsg, 'kiosk');
             setLocalName('Guest');
@@ -1303,40 +1309,74 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             await speakAndWait(guestMsg);
             if (stillCurrent()) startListening();
             break;
-          } else if (isContinueOption(heard)) {
-            // User chose skip/continue
-            const contMsg = "Sure, let's continue! How may I assist you today?";
-            addMessage(contMsg, 'kiosk');
+          }
+
+          // Check if user spoke a campus question directly (e.g. "Where is the admission office?")
+          const cleanNameCandidate = extractVisitorName(heard);
+          const isQuestion = heard.includes('?') || heard.split(' ').length >= 4 ||
+            /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod)\b/i.test(heard);
+
+          if (isQuestion && !cleanNameCandidate) {
+            setConvState(CONV_STATE.GUEST);
             setLocalName('Guest');
             await submitVoiceName('Guest', false);
-            await speakAndWait(contMsg);
-            if (stillCurrent()) startListening();
+            sendToBackend(heard);
+            break;
+          }
+
+          // Spoken candidate name: treat as candidate ONLY
+          const candidate = cleanNameCandidate || heard.trim().replace(/[.!?]+$/, '');
+          const isInvalidName = /^(yes|yeah|yep|no|nope|nah|guest|skip|continue|ok|okay|bye|thanks|thank you|friend|unknown)$/i.test(candidate);
+
+          if (candidate && candidate.length >= 2 && !isInvalidName) {
+            // Step 2, 3, 4: ALWAYS route through mandatory spelling capture & confirmation!
+            await runSpellingCaptureAndConfirm(candidate, stillCurrent);
             break;
           } else {
-            // Check if user spoke a campus question directly
-            const cleanNameCandidate = extractVisitorName(heard);
-            const isQuestion = heard.includes('?') || heard.split(' ').length >= 4 ||
-              /\b(where|what|how|when|who|which|can|tell|fees|admission|hostel|placement|library|department|principal|hod)\b/i.test(heard);
+            // Ambiguous response or rejection word: ask once more politely
+            const askRetry = "I want to make sure I get your name right. Could you say it once more?";
+            addMessage(askRetry, 'kiosk');
+            await speakAndWait(askRetry);
+            if (!stillCurrent()) return;
 
-            if (isQuestion && !cleanNameCandidate) {
-              setLocalName('Guest');
-              await submitVoiceName('Guest', false);
-              sendToBackend(heard);
-              break;
+            sttModeRef.current = 'name';
+            const retrySpoken = await captureUtteranceText(12000);
+            if (retrySpoken) {
+              addMessage(retrySpoken, 'user');
+              if (isGuestOption(retrySpoken) || isContinueOption(retrySpoken)) {
+                setConvState(CONV_STATE.GUEST);
+                setLocalName('Guest');
+                await submitVoiceName('Guest', false);
+                const gMsg = "No problem! Continuing as Guest. How can I help you today?";
+                addMessage(gMsg, 'kiosk');
+                await speakAndWait(gMsg);
+                if (stillCurrent()) startListening();
+                break;
+              }
+              const retryCand = extractVisitorName(retrySpoken) || retrySpoken.trim().replace(/[.!?]+$/, '');
+              if (retryCand && retryCand.length >= 2 && !/^(yes|no|guest|skip|continue|ok|okay)$/i.test(retryCand)) {
+                await runSpellingCaptureAndConfirm(retryCand, stillCurrent);
+                break;
+              }
             }
-
-            // User directly provided their name: e.g. "Rahul", "Akshatha", "My name is John"
-            directNameProvided = cleanNameCandidate || heard.trim();
-          }
-        } else {
-          // Timeout — check if anyone is still in front of the camera before
-          // defaulting to Guest. If the person walked away while we were
-          // waiting, silently abort rather than creating a phantom session.
-          const stateNow = detStateRef.current;
-          if (stateNow === 'IDLE' || stateNow === 'COOLDOWN') {
-            // Nobody there — abort the flow entirely
+            // Fall back to Guest
+            setConvState(CONV_STATE.GUEST);
+            setLocalName('Guest');
+            await submitVoiceName('Guest', false);
+            const guestFallback = "That's okay. We can continue as Guest. How can I help you?";
+            addMessage(guestFallback, 'kiosk');
+            await speakAndWait(guestFallback);
+            if (stillCurrent()) startListening();
             break;
           }
+        } else {
+          // Timeout — check if anyone is still in front of the camera
+          const stateNow = detStateRef.current;
+          if (stateNow === 'IDLE' || stateNow === 'COOLDOWN') {
+            // Nobody there — abort silently
+            break;
+          }
+          setConvState(CONV_STATE.GUEST);
           const noAnsMsg = 'Continuing as Guest! How may I assist you today?';
           addMessage(noAnsMsg, 'kiosk');
           setLocalName('Guest');
@@ -1345,144 +1385,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (stillCurrent()) startListening();
           break;
         }
-
-        // If user indicated they want to give their name (or direct name not provided yet)
-        let finalName = directNameProvided;
-        if (choseGiveName && !finalName) {
-          setNameStage('asking');
-          const askNamePrompt = 'Great! What is your name?';
-          addMessage(askNamePrompt, 'kiosk');
-          await speakAndWait(askNamePrompt);
-          if (!stillCurrent()) return;
-
-          setNameStage('listening_name');
-          const heardSpokenName = await captureUtteranceText(25000);
-          if (!stillCurrent()) return;
-
-          if (heardSpokenName) {
-            addMessage(heardSpokenName, 'user');
-            // Guard: never treat a single rejection/negation word as a visitor name
-            const _NAME_REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
-            const extractedName = extractVisitorName(heardSpokenName);
-            if (extractedName && !_NAME_REJECTION.test(extractedName.trim())) {
-              finalName = extractedName;
-            } else if (!_NAME_REJECTION.test(heardSpokenName.trim())) {
-              finalName = heardSpokenName.trim();
-            } else {
-              finalName = null; // will trigger the retry below
-            }
-          } else {
-            // Ask once more if missed
-            const askRetry = "Could you please say your name?";
-            addMessage(askRetry, 'kiosk');
-            await speakAndWait(askRetry);
-            if (!stillCurrent()) return;
-
-            const retrySpoken = await captureUtteranceText(25000);
-            if (retrySpoken) {
-              addMessage(retrySpoken, 'user');
-              finalName = extractVisitorName(retrySpoken) || retrySpoken.trim();
-            } else {
-              finalName = 'Friend';
-            }
-          }
-        }
-
-        if (!finalName) finalName = 'Friend';
-
-        // 3. Confirm name with voice ("Yes" / "No") or double blink ("Yes")
-        setNameStage('confirming');
-        pendingCandidateNameRef.current = finalName;
-        const confirmChatMsg = `I heard ${finalName}. Is that correct?\n\n• 🗣️ Say "Yes" or 👁️ Blink twice to confirm\n• 🗣️ Say "No" to change it`;
-        const confirmSpokenMsg = `I heard ${finalName}. Is that correct? Say yes or blink twice to confirm, or say no to change it.`;
-        addMessage(confirmChatMsg, 'kiosk');
-        await speakAndWait(confirmSpokenMsg);
-        if (!stillCurrent()) return;
-
-        setNameStage('listening_confirm');
-        const confirmed = await captureYesNo(45000);
-        if (!stillCurrent()) return;
-
-        if (confirmed === true) {
-          pendingCandidateNameRef.current = '';
-          setNameStage('saving');
-          const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
-          addMessage(greetNamed, 'kiosk');
-          setLocalName(finalName);
-          await submitVoiceName(finalName, true);
-          await speakAndWait(greetNamed);
-          if (stillCurrent()) startListening();
-          break;
-        } else if (confirmed === false || (typeof confirmed === 'string' && confirmed.length > 0)) {
-          pendingCandidateNameRef.current = '';
-          let correctedName = '';
-          if (typeof confirmed === 'string' && confirmed.length > 0 && !/\b(no|nope|nah|wrong|change|not)\b/i.test(confirmed)) {
-            correctedName = extractVisitorName(confirmed) || confirmed.trim();
-          } else {
-            setNameStage('asking');
-            const retryMsg = "My apologies! Could you please spell out your name?";
-            addMessage(retryMsg, 'kiosk');
-            await speakAndWait(retryMsg);
-            if (!stillCurrent()) return;
-
-            setNameStage('listening_name');
-            const retrySpokenName = await captureUtteranceText(25000);
-            if (!stillCurrent()) return;
-
-            // Guard: never accept rejection/negation words as a name
-            const _REJECTION = /^(no|nope|nah|wrong|incorrect|change|not|different|cancel|stop|skip|guest|unknown|friend)$/i;
-            const extracted = extractVisitorName(retrySpokenName);
-            if (extracted && !_REJECTION.test(extracted.trim())) {
-              correctedName = extracted;
-            } else if (retrySpokenName && retrySpokenName.trim().split(/\s+/).length > 1) {
-              // Multi-word response not matching rejection — treat as spelled name
-              correctedName = retrySpokenName.trim();
-            } else {
-              // Still got a rejection word or silence — fall back to Guest rather than saving garbage
-              correctedName = 'Guest';
-            }
-          }
-
-          if (!correctedName || correctedName === 'Guest') {
-            // Couldn't get a valid name — proceed as Guest
-            setNameStage('saving');
-            const guestFallback = 'No problem! Continuing as Guest. How may I assist you today?';
-            addMessage(guestFallback, 'kiosk');
-            await submitVoiceName('Guest', false);
-            await speakAndWait(guestFallback);
-            if (stillCurrent()) startListening();
-            break;
-          }
-
-          setNameStage('saving');
-          const changedMsg = `Done! Your name has been changed to ${correctedName}. How may I assist you today?`;
-          addMessage(changedMsg, 'kiosk');
-          setLocalName(correctedName);
-          await submitVoiceName(correctedName, true);
-          await speakAndWait(changedMsg);
-          if (stillCurrent()) startListening();
-          break;
-        }
-
-        // If captureYesNo timed out — check face presence before assuming name is confirmed
-        const stateAtTimeout = detStateRef.current;
-        if (stateAtTimeout === 'IDLE' || stateAtTimeout === 'COOLDOWN') {
-          // Nobody in front anymore — abort silently
-          break;
-        }
-        setNameStage('saving');
-        const greetNamed = `Great to meet you, ${finalName}! How may I assist you today?`;
-        addMessage(greetNamed, 'kiosk');
-        setLocalName(finalName);
-        await submitVoiceName(finalName, true);
-        await speakAndWait(greetNamed);
-        if (stillCurrent()) startListening();
-        break;
       }
     } finally {
       flowRunningRef.current = false;
     }
-  }, [session, isReturning, greeting, extractVisitorName, wantsToGiveName, isGuestOption, isContinueOption, captureUtteranceText, captureYesNo, submitVoiceName, speakAndWait, addMessage, sendToBackend, startListening]);
+  }, [session, isReturning, greeting, extractVisitorName, isGuestOption, isContinueOption, captureUtteranceText, submitVoiceName, speakAndWait, addMessage, sendToBackend, startListening, runSpellingCaptureAndConfirm]);
 
   useEffect(() => {
     runSessionStartFlow();

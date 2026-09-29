@@ -76,7 +76,7 @@ def _init_torch_threads():
 TTS_EXECUTOR.submit(_init_torch_threads)
 
 TTS_VOICE = os.getenv("TTS_VOICE", "af_bella")
-TTS_SPEED = float(os.getenv("TTS_SPEED", "1.05"))
+TTS_SPEED = float(os.getenv("TTS_SPEED", "1.12"))
 
 # ── Response cache: (text, engine, voice, speed) -> WAV bytes ────────────
 _TTS_CACHE: dict = {}
@@ -284,6 +284,18 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
                 "Right, let me find that.",
                 "You are most welcome! Have a wonderful day. Goodbye!",
                 "Happy to help! Take care and have a great day.",
+                # Pre-cached name flow and conversational phrases for instant 0ms synthesis
+                "Hi! May I know your name?",
+                "Could you spell your name for me, one letter at a time?",
+                "Next letter?",
+                "Is that correct?",
+                "No problem. Let's try that again. Please spell your name one letter at a time.",
+                "That's okay. We can continue as Guest.",
+                "Continuing as Guest. How may I assist you today?",
+                "Sorry, I didn't quite catch that. Could you say it again?",
+                "I want to make sure I get your name right. Could you say it once more?",
+                "Sorry, I missed that letter. Could you repeat it?",
+                "How can I help you?",
             ]
             for p in _PREWARM:
                 try:

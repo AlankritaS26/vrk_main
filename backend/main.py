@@ -1,4 +1,4 @@
-﻿"""
+r"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (from repository root):
@@ -1741,48 +1741,12 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
         new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
         if new_name_words:
             new_name = " ".join(new_name_words)
+            # Candidate name only — NEVER save or update DB until confirmed with spelling
             if active_session:
-                active_session["user_name"] = new_name
-                face_id_for_rename = active_session.get("face_id") or ""
-                sid_for_rename = active_session.get("session_id") or ""
-                if sid_for_rename:
-                    await update_session_user_name(sid_for_rename, new_name)
-                    await interactions_collection.update_many(
-                        {"session_id": sid_for_rename},
-                        {"$set": {"user_name": new_name}}
-                    )
-                if face_id_for_rename:
-                    await update_face_name_with_alias(face_id_for_rename, new_name)
-                    logger.info("[ROUTE] NAME_CHANGE — DB updated: face_id=%s new_name='%s'",
-                                face_id_for_rename[:8], new_name)
-                else:
-                    # Register face for guest who provided a name so they appear in face tracks
-                    try:
-                        from backend.detection import ST, _load_known_faces
-                        anchor = ST.snapshot().get("anchor")
-                        new_fid = str(uuid.uuid4())
-                        if anchor:
-                            await save_face_encoding(new_fid, new_name, anchor, [anchor])
-                            ST.set(face_id=new_fid, identity=new_name)
-                        else:
-                            await save_face_encoding(new_fid, new_name, [], [])
-                        active_session["face_id"] = new_fid
-                        if sid_for_rename:
-                            await sessions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
-                            await interactions_collection.update_many({"session_id": sid_for_rename}, {"$set": {"face_id": new_fid, "user_name": new_name}})
-                        _load_known_faces(force=True)
-                        logger.info(f"[ROUTE] Registered face for former guest '{new_name}' face_id={new_fid[:8]}")
-                    except Exception as ex:
-                        logger.warning(f"[ROUTE] Could not register face anchor: {ex}")
-                await manager.broadcast({
-                    "type": "session_update",
-                    "session": active_session,
-                    "user_name": new_name,
-                    "face_id": active_session.get("face_id", ""),
-                })
-            answer = f"Done! I have changed your name to {new_name}. How may I assist you today?"
-            logger.info("[ROUTE] NAME_CHANGE (deterministic) — set name to '%s'", new_name)
-            return answer, "name_change", "CONTINUE"
+                active_session["candidate_name"] = new_name
+            answer = f"Thanks, {new_name}. Could you spell your name for me, one letter at a time?"
+            logger.info("[ROUTE] NAME_CHANGE_CANDIDATE (unconfirmed) — candidate='%s', prompting spelling", new_name)
+            return answer, "name_change_ask_spelling", "CONTINUE"
 
     if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
        re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
@@ -2154,16 +2118,19 @@ async def record_face_visit(face_id: str):
 # SPEECH ENDPOINTS (STT / TTS)
 # ==========================================
 @app.post("/stt/pcm")
-async def speech_to_text_pcm(request: Request):
+async def speech_to_text_pcm(request: Request, mode: str = Query("normal")):
     """
     Primary STT path: raw 16 kHz mono int16 PCM from the browser VAD.
     No WebM, no ffmpeg — bytes go straight into numpy → Whisper.
+    Supports logical modes: "normal", "name", "spelling".
     """
     try:
         pcm_bytes = await request.body()
         if not pcm_bytes or len(pcm_bytes) < 4800:  # < 150 ms of audio
             return {"text": "", "confidence": 0.0, "error": "no_audio"}
-        result = await asyncio.to_thread(transcribe_pcm, pcm_bytes, "en")
+        req_mode = request.headers.get("X-STT-Mode") or mode or "normal"
+        candidate = request.headers.get("X-STT-Candidate") or ""
+        result = await asyncio.to_thread(transcribe_pcm, pcm_bytes, "en", req_mode, candidate)
         return result
     except Exception as e:
         logger.error(f"[STT/PCM] Endpoint error: {e}")
@@ -2171,19 +2138,29 @@ async def speech_to_text_pcm(request: Request):
 
 
 @app.websocket("/ws/stt")
-async def stt_websocket_endpoint(ws: WebSocket):
+async def stt_websocket_endpoint(ws: WebSocket, mode: str = "normal"):
     """
     Alternative STT transport:
       browser -> binary frame : one COMPLETE utterance (16 kHz mono int16 PCM)
-      backend -> JSON frame   : {text, confidence, language, latency_ms}
+      backend -> JSON frame   : {text, confidence, language, latency_ms, mode}
     """
     await ws.accept()
     logger.info("[WS/STT] Kiosk connected")
+    current_mode = mode
     try:
         while True:
-            pcm_bytes = await ws.receive_bytes()
-            result = await asyncio.to_thread(transcribe_pcm, pcm_bytes, "en")
-            await ws.send_json(result)
+            message = await ws.receive()
+            if "text" in message and message["text"]:
+                try:
+                    payload = json.loads(message["text"])
+                    if "mode" in payload:
+                        current_mode = payload["mode"]
+                except Exception:
+                    pass
+            elif "bytes" in message and message["bytes"]:
+                pcm_bytes = message["bytes"]
+                result = await asyncio.to_thread(transcribe_pcm, pcm_bytes, "en", current_mode)
+                await ws.send_json(result)
     except WebSocketDisconnect:
         logger.info("[WS/STT] Kiosk disconnected")
 

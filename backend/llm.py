@@ -1205,12 +1205,54 @@ async def condense_query(question: str, history: list | None) -> str:
     if not history:
         return question
 
-    bypass_keywords = {"where is", "location", "timing", "hours", "who is", "what is", "address"}
-    if any(keyword in q_lower for keyword in bypass_keywords):
-        return question
+    # 1. Direct conversational correction: e.g. "Wait, I mean the ISE block", "No, I meant civil"
+    correction_match = re.match(
+        r"^(?:wait\s*,?\s*(?:i\s*mean|i\s*meant)?|no\s*,?\s*(?:i\s*mean|i\s*meant)?|actually\s*,?\s*(?:i\s*mean|i\s*meant)?|sorry\s*,?\s*i\s*meant|i\s*meant)\s+(.*)$",
+        q_lower
+    )
+    if correction_match:
+        target = correction_match.group(1).strip()
+        for msg in reversed(history or []):
+            spk, txt = parse_history_message(msg)
+            if spk and spk.lower() in ("visitor", "user") and txt:
+                txt_l = txt.lower()
+                if "where is" in txt_l or "location" in txt_l or "how to reach" in txt_l:
+                    rewritten = f"where is {target}"
+                    logger.info("[CONTEXT CORRECTION] '%s' -> '%s'", question, rewritten)
+                    return rewritten
+                if "placement" in txt_l or "package" in txt_l:
+                    rewritten = f"how are placements for {target}"
+                    logger.info("[CONTEXT CORRECTION] '%s' -> '%s'", question, rewritten)
+                    return rewritten
+                if "course" in txt_l or "program" in txt_l:
+                    rewritten = f"what courses are offered in {target}"
+                    logger.info("[CONTEXT CORRECTION] '%s' -> '%s'", question, rewritten)
+                    return rewritten
+                if "fee" in txt_l or "fees" in txt_l:
+                    rewritten = f"what are the fees for {target}"
+                    logger.info("[CONTEXT CORRECTION] '%s' -> '%s'", question, rewritten)
+                    return rewritten
+                if "hod" in txt_l or "head of department" in txt_l:
+                    rewritten = f"who is the HOD of {target}"
+                    logger.info("[CONTEXT CORRECTION] '%s' -> '%s'", question, rewritten)
+                    return rewritten
+                break
+        return target
 
-    if len(question.split()) > 3:
-        return question
+    # 2. Check for explicit follow-up phrases
+    is_followup = any(q_lower.startswith(p) for p in ("what about", "how about", "what of", "and for", "and what about", "and in", "what for"))
+    words = question.split()
+
+    if not is_followup:
+        bypass_keywords = {"where is", "location", "timing", "hours", "who is", "what is", "address"}
+        if any(keyword in q_lower for keyword in bypass_keywords):
+            return question
+
+        if len(words) > 5:
+            return question
+    else:
+        if len(words) > 12:
+            return question
 
     history_lines = []
     for msg in history[-3:]:
