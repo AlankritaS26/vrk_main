@@ -50,11 +50,18 @@ function styleMaterial(mesh) {
       mat.metalness = 0.35;
       mat.transparent = true;
       mat.opacity = Math.min(mat.opacity ?? 1, 0.88);
+    } else if (/Wolf3D_Outfit_Top|Blazer|Jacket|Dress|Uniform/i.test(name)) {
+      // The asset has one textured top surface rather than a separate blazer mesh.
+      // Remove the texture tinting so the blue outerwear is visibly applied.
+      mat.map = null;
+      mat.color.set(0x111318);
+      mat.roughness = 0.62;
+      mat.metalness = 0.02;
     } else if (/Collar|Cuff|Shirt|Blouse|Lapels/i.test(name)) {
       mat.color.set(0xf7f4ec);
       mat.roughness = 0.72;
-    } else if (/Blazer|Jacket|Dress|Outfit|Uniform|Cloth|Bottom|Skirt|Pants|Footwear/i.test(name)) {
-      mat.color.set(0x173b70);
+    } else if (/Outfit_Bottom|Bottom|Skirt|Pants|Footwear/i.test(name)) {
+      mat.color.set(0x111827);
       mat.roughness = 0.62;
       mat.metalness = 0.02;
     } else if (/Outfit|Top|Bottom|Footwear/i.test(name)) {
@@ -82,6 +89,7 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
     let modelRoot = null;
 
     const morphMeshes = [];
+    const eyeObjects = [];
     let headBone = null, neckBone = null, spineBone = null, spine1Bone = null;
     let rightArmBone = null, rightForeArmBone = null, rightHandBone = null;
     let leftArmBone = null, leftForeArmBone = null, leftHandBone = null;
@@ -177,6 +185,7 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
           }
           if (child.isMesh) {
             child.frustumCulled = false;
+            if (/^Eye(Left|Right)$/.test(child.name)) eyeObjects.push(child);
             if (child.morphTargetDictionary && child.morphTargetInfluences) {
               morphMeshes.push(child);
             }
@@ -260,10 +269,12 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
       let visemeTimer = 0, currentViseme = '';
       let targetVisemeWeight = 0, currentVisemeWeight = 0;
       let currentJawWeight = 0, targetJawWeight = 0;
+      let speechEnvelope = 0;
       let smileWeight = 0.2;
       const audioSamples = new Uint8Array(128);
       const headDelta = { x: 0, y: 0, z: 0 };
       const neckDelta = { x: 0, y: 0 };
+      const eyeDelta = { x: 0, y: 0 };
       const qTmp = new THREE.Quaternion();
       const qCurl = new THREE.Quaternion();
 
@@ -275,6 +286,15 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
         const elapsed = clock.getElapsedTime();
         const cst     = statusRef.current;
         const thinking = cst === 'processing';
+        const eyeLookX = mousePos.x * 0.065 + Math.sin(elapsed * 0.9) * 0.008;
+        const eyeLookY = -mousePos.y * 0.045 + Math.sin(elapsed * 1.15) * 0.006;
+
+        setMorphWeight('eyeWideLeft', 0);
+        setMorphWeight('eyeWideRight', 0);
+        setMorphWeight('eyeSquintLeft', 0);
+        setMorphWeight('eyeSquintRight', 0);
+        setMorphWeight('cheekSquintLeft', 0);
+        setMorphWeight('cheekSquintRight', 0);
 
         if (elapsed > nextBlinkTime) {
           isBlinking = true;
@@ -288,7 +308,7 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
         setMorphWeight('eyeBlinkLeft', bv); setMorphWeight('eyeBlinkRight', bv);
 
         if (cst === 'speaking') {
-          let audioLevel = 0.18;
+          let audioLevel = 0;
           const analyser = window.__novaTtsAnalyser;
           if (window.__novaTtsActive && analyser) {
             analyser.getByteTimeDomainData(audioSamples);
@@ -297,21 +317,26 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
               const centered = (sample - 128) / 128;
               sum += centered * centered;
             }
-            audioLevel = THREE.MathUtils.clamp(Math.sqrt(sum / audioSamples.length) * 4.2, 0, 1);
+            const rms = Math.sqrt(sum / audioSamples.length);
+            audioLevel = THREE.MathUtils.clamp((rms - 0.012) * 7.5, 0, 1);
           }
+          const envelopeRate = audioLevel > speechEnvelope ? 28 : 12;
+          speechEnvelope = THREE.MathUtils.lerp(speechEnvelope, audioLevel, delta * envelopeRate);
+          const voiced = speechEnvelope > 0.055;
           visemeTimer -= delta;
           if (visemeTimer <= 0) {
-            visemeTimer = 0.1 + Math.random() * 0.12;
+            visemeTimer = 0.075 + Math.random() * 0.1;
             if (currentViseme) setMorphWeight(currentViseme, 0);
             currentViseme      = VISEME_SEQUENCE[Math.floor(Math.random() * VISEME_SEQUENCE.length)];
-            targetVisemeWeight = 0.08 + Math.random() * 0.12;
+            targetVisemeWeight = voiced ? 0.04 + speechEnvelope * (0.08 + Math.random() * 0.1) : 0;
           }
-          currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, targetVisemeWeight, delta * 24);
-          targetJawWeight     = 0.04 + audioLevel * 0.48;
-          currentJawWeight    = THREE.MathUtils.lerp(currentJawWeight, targetJawWeight, delta * 18);
+          if (!voiced) targetVisemeWeight = 0;
+          currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, targetVisemeWeight, delta * 30);
+          targetJawWeight     = voiced ? 0.02 + speechEnvelope * 0.34 : 0;
+          currentJawWeight    = THREE.MathUtils.lerp(currentJawWeight, targetJawWeight, delta * (voiced ? 24 : 15));
           if (currentViseme) setMorphWeight(currentViseme, currentVisemeWeight);
           setMorphWeight('jawOpen', currentJawWeight);
-          setMorphWeight('mouthOpen', currentJawWeight * 0.35);
+          setMorphWeight('mouthOpen', currentJawWeight * 0.28);
           smileWeight = THREE.MathUtils.lerp(smileWeight, 0.3, delta * 4);
           setMorphWeight('mouthSmile', smileWeight);
           setMorphWeight('browInnerUp', 0.15 + Math.sin(elapsed * 4) * 0.1);
@@ -319,6 +344,7 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
           if (currentViseme) { setMorphWeight(currentViseme, 0); currentViseme = ''; }
           currentVisemeWeight = THREE.MathUtils.lerp(currentVisemeWeight, 0, delta * 15);
           currentJawWeight    = THREE.MathUtils.lerp(currentJawWeight, 0, delta * 15);
+          speechEnvelope       = THREE.MathUtils.lerp(speechEnvelope, 0, delta * 12);
           setMorphWeight('jawOpen', currentJawWeight);
           setMorphWeight('mouthOpen', currentJawWeight);
           const idleSmile = (cst === 'idle' || cst === 'ready') ? 0.28 : cst === 'listening' ? 0.16 : 0.06;
@@ -336,6 +362,22 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
         } else if (cst === 'listening') {
           tHX = -0.02 + gy * 0.7; tHY = gx * 0.8; tHZ = 0.03; tBrow = 0.22;
           setMorphWeight('eyeWideLeft', 0.15); setMorphWeight('eyeWideRight', 0.15);
+        } else if (cst === 'happy' || cst === 'delighted') {
+          tHX = gy * 0.55; tHY = gx * 0.75; tHZ = -0.015; tBrow = 0.22;
+          setMorphWeight('eyeSquintLeft', 0.16); setMorphWeight('eyeSquintRight', 0.16);
+          setMorphWeight('cheekSquintLeft', 0.16); setMorphWeight('cheekSquintRight', 0.16);
+          smileWeight = THREE.MathUtils.lerp(smileWeight, 0.5, delta * 6);
+        } else if (cst === 'curious') {
+          tHX = -0.03 + gy * 0.65; tHY = gx * 0.8; tHZ = 0.12; tBrow = 0.3;
+          setMorphWeight('eyeWideLeft', 0.12); setMorphWeight('eyeWideRight', 0.12);
+        } else if (cst === 'confused') {
+          tHX = gy * 0.5; tHY = gx * 0.65; tHZ = Math.sin(elapsed * 2.2) * 0.08; tBrow = 0.12;
+          setMorphWeight('browDownLeft', 0.1); setMorphWeight('browDownRight', 0.2);
+          setMorphWeight('eyeWideLeft', 0.12);
+        } else if (cst === 'enthusiastic') {
+          tHX = gy * 0.6; tHY = gx * 0.85; tHZ = Math.sin(elapsed * 2) * 0.015; tBrow = 0.34;
+          setMorphWeight('eyeWideLeft', 0.2); setMorphWeight('eyeWideRight', 0.2);
+          smileWeight = THREE.MathUtils.lerp(smileWeight, 0.42, delta * 6);
         } else if (thinking) {
           tHX = 0.02 + Math.sin(elapsed * 1.6) * 0.008;
           tHY = -0.12;
@@ -368,6 +410,12 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
         if (neckBone) {
           neckBone.rotation.x = restNeckRotX + neckDelta.x;
           neckBone.rotation.y = restNeckRotY + neckDelta.y;
+        }
+        eyeDelta.x = THREE.MathUtils.lerp(eyeDelta.x, eyeLookY, delta * 9);
+        eyeDelta.y = THREE.MathUtils.lerp(eyeDelta.y, eyeLookX, delta * 9);
+        for (const eye of eyeObjects) {
+          eye.rotation.x = eyeDelta.x;
+          eye.rotation.y = eyeDelta.y;
         }
         const breath = Math.sin(elapsed * 1.35) * 0.014;
         if (spineBone)  spineBone.rotation.x  = restSpineRotX  + breath;
