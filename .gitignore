@@ -24,6 +24,7 @@ Thumbs.db
 # Data and generated assets
 faces/
 RAGService/data/vectorstore/
+RAGService/data/uploads/
 
 # Dependency lock files
 requirements.lock.txt
