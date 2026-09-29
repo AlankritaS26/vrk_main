@@ -53,8 +53,41 @@ class RAGCollection:
         chunks = _chunk([{"text": text, "loc": {}}], metadata or {"filename": "raw_text"})
         return self.upsert(chunks)
 
+    def upsert_entry(self, entry_id: str, text: str, metadata: dict | None = None) -> int:
+        """
+        Index/replace a single admin-managed knowledge entry identified by
+        a STABLE `entry_id` (e.g. a MongoDB knowledge_entries._id/entry_id).
+
+        This is the stale-data-prevention primitive: any existing chunks
+        tagged with this entry_id are deleted BEFORE the new text is
+        embedded and added, so editing a previously-verified answer always
+        REPLACES its vector chunk(s) rather than leaving the old wording
+        behind to compete with the new one at query time (which is how you
+        get two conflicting answers to the same question).
+        """
+        self._coll.delete(where={"entry_id": entry_id})
+        from file_parser import _chunk
+        meta = {**(metadata or {}), "entry_id": entry_id}
+        chunks = _chunk([{"text": text, "loc": {}}], meta)
+        return self.upsert(chunks)
+
+    def delete_entry(self, entry_id: str) -> None:
+        """Remove all chunks belonging to one admin-managed knowledge entry."""
+        self._coll.delete(where={"entry_id": entry_id})
+
     def delete_by_filename(self, filename: str) -> None:
         self._coll.delete(where={"filename": filename})
+
+    def delete_by_source(self, source: str) -> None:
+        """
+        Delete every chunk tagged with a given `source` metadata value —
+        e.g. "college_info.json". Used for safely re-seeding the static
+        seed data (to backfill new entity_type/entity_name metadata,
+        change chunking, etc.) WITHOUT touching admin-verified
+        knowledge_entries chunks, which are tagged `entry_id` instead and
+        never carry `source: "college_info.json"`.
+        """
+        self._coll.delete(where={"source": source})
 
     def delete_all(self) -> None:
         self._client.delete_collection(self._coll_name)

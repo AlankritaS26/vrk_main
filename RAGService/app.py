@@ -210,6 +210,54 @@ def index_text(collection: str, body: IndexTextRequest):
     )
 
 
+class UpsertEntryRequest(BaseModel):
+    entry_id: str                 = Field(..., description="Stable id owned by the caller (e.g. MongoDB knowledge_entries.entry_id)")
+    text: str                     = Field(..., description="Text to embed for this entry")
+    metadata: dict[str, Any]      = Field(default_factory=dict, description="Extra metadata (entity_type, entity_name, category, ...)")
+
+
+@app.post("/v1/collections/{collection}/entries",
+          response_model=IndexResponse, tags=["Knowledge Entries"])
+def upsert_entry(collection: str, body: UpsertEntryRequest):
+    """
+    Admin-managed knowledge-entry upsert (self-updating RAG / knowledge-
+    update loop). Any chunks previously indexed under this `entry_id` are
+    deleted FIRST, then the new text is embedded and added — so editing a
+    verified answer always REPLACES its vector chunk(s) instead of leaving
+    the old wording behind to conflict with the new one at query time.
+    This is the stale-data-prevention step in the admin verification flow.
+    """
+    coll  = _get_collection(collection)
+    added = coll.upsert_entry(body.entry_id, body.text, body.metadata)
+    return IndexResponse(
+        collection=collection,
+        added=added,
+        message=f"Entry '{body.entry_id}' upserted: {added} chunk(s).",
+    )
+
+
+@app.delete("/v1/collections/{collection}/entries/{entry_id}", tags=["Knowledge Entries"])
+def delete_entry(collection: str, entry_id: str):
+    """Remove all chunks for one admin-managed knowledge entry (e.g. when
+    an admin deletes/retracts a verified answer)."""
+    _get_collection(collection).delete_entry(entry_id)
+    return {"message": f"Entry '{entry_id}' removed from '{collection}'."}
+
+
+@app.delete("/v1/collections/{collection}/source/{source}", tags=["Indexing"])
+def delete_by_source(collection: str, source: str):
+    """
+    Delete every chunk tagged with a given `source` metadata value (e.g.
+    "college_info.json") — leaves everything else in the collection
+    (admin-verified knowledge_entries chunks, tagged `entry_id` instead)
+    untouched. This is the safe way to force a full re-seed of the static
+    JSON data after changing how it's chunked or tagged, without wiping
+    anything an admin has verified through the dashboard.
+    """
+    _get_collection(collection).delete_by_source(source)
+    return {"message": f"All chunks with source='{source}' removed from '{collection}'."}
+
+
 # ══════════════════════════════════════════════════════════════════════
 #  FILE MANAGEMENT
 # ══════════════════════════════════════════════════════════════════════

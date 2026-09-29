@@ -32,19 +32,22 @@ def apply_bandpass(audio: np.ndarray) -> np.ndarray:
     return filtfilt(b, a, audio).astype(np.float32)
 
 
+import os
+
 # ---------------------------------------------------------------- energy gate
 
 def rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(audio ** 2))) if len(audio) else 0.0
 
 
-def is_too_quiet(audio: np.ndarray, threshold: float = 0.010) -> bool:
+def is_too_quiet(audio: np.ndarray, threshold: float | None = None) -> bool:
     """
     Person standing at the kiosk is 10–15 dB louder than crowd noise.
-    Tune `threshold` on-site: log rms() values for real users vs ambient,
-    pick a value between the two clusters. 0.010 is a starting point for
-    a mic ~40 cm from the speaker.
+    0.0015 is a reliable threshold for browser float32 PCM @ 16kHz across typical mics.
+    Can be overridden via STT_ENERGY_THRESHOLD env var.
     """
+    if threshold is None:
+        threshold = float(os.getenv("STT_ENERGY_THRESHOLD", "0.0015"))
     return rms(audio) < threshold
 
 

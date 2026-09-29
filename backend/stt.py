@@ -16,6 +16,7 @@ Env vars (matches the provider-abstraction story in EP-03):
 """
 
 import os
+import re
 import time
 import logging
 import numpy as np
@@ -30,6 +31,23 @@ CAMPUS_PROMPT = (
     "USN, SGPA, CGPA, CIE, SEE, attendance, hostel, Block-C, "
     "ECE, CSE, ISE, AIML, principal, HOD, placement cell, library."
 )
+
+NAME_PROMPT = (
+    "Visitor names: Rahul, Priya, Alankrita, Rohan, Ananya, Aditya, Sneha, Amit, Vikram, Neha, "
+    "Akshatha, Suresh, Rajesh, Ramesh, Karthik, Kavya, Pooja, Divya, Sanjay, Deepak, Swathi, Meera, Arjun, "
+    "RNS Institute of Technology campus visitor."
+)
+
+SPELLING_PROMPT = (
+    "Letters: A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z. "
+    "Spelled letters: A B C D E F G H I J K L M N O P Q R S T U V W X Y Z. "
+    "NATO phonetic alphabet: Alpha, Bravo, Charlie, Delta, Echo, Foxtrot, Golf, Hotel, India, Juliet, "
+    "Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, Uniform, Victor, Whiskey, "
+    "X-ray, Yankee, Zulu. A as in Apple, B as in Boy, C as in Cat."
+)
+
+STT_BEAM_SIZE = int(os.getenv("STT_BEAM_SIZE", "1"))
+STT_NAME_BEAM_SIZE = int(os.getenv("STT_NAME_BEAM_SIZE", "3"))
 
 def _pick_device_and_model():
     device = os.getenv("STT_DEVICE", "auto")
@@ -82,14 +100,19 @@ def pcm16_bytes_to_float32(pcm_bytes: bytes) -> np.ndarray:
 logger = logging.getLogger('RNSIT_Kiosk.STT')
 
 
-def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
+def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en", mode: str = "normal", candidate: str = "") -> dict:
     """
     Transcribe one complete utterance of 16 kHz mono int16 PCM.
     (The browser VAD decides where the utterance starts/ends —
      by the time this is called we have exactly one turn of speech.)
 
-    Returns the normalized TranscriptResult dict from EP-03:
-      {text, confidence, language, latency_ms} or {..., error}
+    Supports two logical STT modes:
+      - "normal": fast, greedy (beam_size=STT_BEAM_SIZE), campus vocabulary
+      - "name" / "spelling": accuracy-focused (beam_size=STT_NAME_BEAM_SIZE),
+        letter / name prompt bias, confidence extraction and low confidence rejection.
+
+    Returns the normalized TranscriptResult dict:
+      {text, confidence, language, latency_ms, mode, low_confidence} or {..., error}
     """
     start = time.time()
     try:
@@ -98,12 +121,12 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
         import numpy as _np
         _rms = float(_np.sqrt(_np.mean(audio ** 2))) if len(audio) else 0.0
         logger.info(f"[STT] recv {len(audio)} samples "
-                    f"({len(audio)/SAMPLE_RATE:.2f}s) rms={_rms:.5f}")
+                    f"({len(audio)/SAMPLE_RATE:.2f}s) rms={_rms:.5f} mode={mode}")
 
         if len(audio) < SAMPLE_RATE * 0.3:                      # <300 ms
             logger.info("[STT] rejected: too_short")
             return {"text": "", "confidence": 0.0,
-                    "language": language or "en", "error": "too_short"}
+                    "language": language or "en", "mode": mode, "error": "too_short"}
 
         # cap runaway buffers at 30 s (EP-03 acceptance criteria)
         audio = audio[: SAMPLE_RATE * 30]
@@ -113,19 +136,49 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
         if audio is None:
             logger.info(f"[STT] rejected: too_quiet (rms={_rms:.5f} < gate)")
             return {"text": "", "confidence": 0.0,
-                    "language": language or "en", "error": "too_quiet"}
+                    "language": language or "en", "mode": mode, "error": "too_quiet"}
+
+        # Configure Whisper parameters based on logical mode
+        normalized_mode = (mode or "normal").lower().strip()
+        if normalized_mode == "spelling":
+            beam_size = STT_NAME_BEAM_SIZE
+            best_of = STT_NAME_BEAM_SIZE
+            if candidate and len(candidate.strip()) >= 2:
+                cand_clean = candidate.strip().title()
+                cand_letters = " ".join(list(re.sub(r'[^A-Za-z]', '', cand_clean).upper()))
+                prompt = (
+                    f"Spelling visitor name: {cand_clean}. Spelled letters: {cand_letters}. "
+                    f"Letters: A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z. "
+                    f"Spelled letters: A B C D E F G H I J K L M N O P Q R S T U V W X Y Z. "
+                    f"NATO: Alpha, Bravo, Charlie, Delta, Echo, Foxtrot, Golf, Hotel, India, Juliet, "
+                    f"Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, Uniform, Victor, "
+                    f"Whiskey, X-ray, Yankee, Zulu."
+                )
+            else:
+                prompt = SPELLING_PROMPT
+            min_silence = 250
+        elif normalized_mode == "name":
+            beam_size = STT_NAME_BEAM_SIZE
+            best_of = STT_NAME_BEAM_SIZE
+            prompt = NAME_PROMPT
+            min_silence = 300
+        else:
+            beam_size = STT_BEAM_SIZE
+            best_of = 1
+            prompt = CAMPUS_PROMPT
+            min_silence = 300
 
         segments, info = model.transcribe(
             audio,
             language=language,               # None = auto-detect (first turn)
-            beam_size=1,                     # greedy: fastest, ~no quality loss
-            best_of=1,
+            beam_size=beam_size,
+            best_of=best_of,
             temperature=0.0,
             condition_on_previous_text=False,
-            initial_prompt=CAMPUS_PROMPT,
+            initial_prompt=prompt,
             vad_filter=True,
             vad_parameters={
-                "min_silence_duration_ms": 300,
+                "min_silence_duration_ms": min_silence,
                 "speech_pad_ms": 150,
             },
             no_speech_threshold=0.6,
@@ -136,24 +189,33 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en") -> dict:
             text += seg.text
             logprobs.append(seg.avg_logprob)
         text = text.strip()
-        logger.info(f"[STT] transcript={text!r}")
+        logger.info(f"[STT] [{normalized_mode}] transcript={text!r}")
 
         confidence = (max(0.0, min(1.0, float(np.exp(np.mean(logprobs)))))
                       if logprobs else 0.0)
         latency_ms = int((time.time() - start) * 1000)
 
-        print(f"[STT] '{text}' | conf {confidence:.2f} | {latency_ms}ms")
+        # Flag low confidence in name or spelling mode for rejection/retry
+        is_low_confidence = False
+        if normalized_mode in ("name", "spelling") and text:
+            if confidence < 0.35:
+                is_low_confidence = True
+                logger.info(f"[STT] [{normalized_mode}] low confidence flagged: {confidence:.2f}")
+
+        print(f"[STT] [{normalized_mode}] '{text}' | conf {confidence:.2f} | {latency_ms}ms")
         return {
             "text": text,
             "confidence": round(confidence, 2),
             "language": info.language,
             "latency_ms": latency_ms,
+            "mode": normalized_mode,
+            "low_confidence": is_low_confidence,
         }
 
     except Exception as e:
         print(f"[STT] Error: {e}")
         return {"text": "", "confidence": 0.0,
-                "language": language or "en", "error": str(e)}
+                "language": language or "en", "mode": mode, "error": str(e)}
 
 
 # ---------------------------------------------------------------- legacy path

@@ -123,13 +123,39 @@ def start(name: str, args, cwd=None, shell=False, env=None) -> subprocess.Popen:
 
 
 def wait_for_backend(timeout: float = 180) -> bool:
+    """
+    Waits for /health to report 200 AND warmed: true — not just process-alive.
+    Backend's TTS warmup (see backend/tts.py's TTS_EXECUTOR) synthesizes all
+    fixed phrases on a single dedicated worker thread before it's done, and
+    ANY real /tts request that arrives before warmup finishes queues behind
+    the rest of it on that same thread. Previously this only waited for a
+    200, so the kiosk browser could open — and a real visitor could get
+    greeted — while warmup still had several phrases left to go, producing
+    multi-second-to-tens-of-seconds delays on that visitor's very first
+    interaction. Backend's /health now returns {"status": "healthy",
+    "warmed": bool}; this polls until warmed is explicitly true. Falls back
+    to accepting a bare 200 if the field is ever missing (older backend),
+    so this doesn't hang forever against a backend that hasn't been updated.
+    """
+    import json
     deadline = time.time() + timeout
+    last_nudge = 0.0
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(BACKEND_URL + "/health", timeout=2):
+            with urllib.request.urlopen(BACKEND_URL + "/health", timeout=2) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            if "warmed" not in body:
+                return True   # older backend without the field — don't hang on it
+            if body.get("warmed"):
                 return True
+            now = time.time()
+            if now - last_nudge > 10:
+                say("RUN", "Backend is up but TTS is still warming up "
+                          "(pre-caching fixed phrases) — waiting before opening the kiosk...")
+                last_nudge = now
         except Exception:
-            time.sleep(1.5)
+            pass
+        time.sleep(1.5)
     return False
 
 
