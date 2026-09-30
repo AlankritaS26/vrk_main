@@ -51,10 +51,10 @@ export async function createKioskMic({ onSpeechStart, onSpeechEnd, onMisfire, on
     onnxWASMBasePath: '/',
 
     // Conversational VAD tuning — natural voice pickup with quick ~600ms end-of-speech
-    positiveSpeechThreshold: 0.65,   // rejects background noise and speaker playback
-    negativeSpeechThreshold: 0.40,
-    minSpeechFrames: 3,         // ~96 ms to confirm speech onset
-    redemptionFrames: 6,        // ~600 ms pause = end of utterance
+    positiveSpeechThreshold: 0.50,   // natural voice pickup threshold
+    negativeSpeechThreshold: 0.35,
+    minSpeechFrames: 2,         // ~64 ms to confirm speech onset
+    redemptionFrames: 8,        // ~800 ms pause = end of utterance
 
     onSpeechStart,
     onSpeechEnd,                // receives Float32Array @ 16 kHz

@@ -23,6 +23,7 @@ from pydantic import BaseModel, Field
 import config
 from file_parser import parse_file, extract_full_text, SUPPORTED_EXTENSIONS
 from rag_store import RAGStore, RAGCollection
+from embeddings import get_embedding_provider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("ragservice")
@@ -51,6 +52,40 @@ def get_store() -> RAGStore:
     if _store is None:
         _store = RAGStore()
     return _store
+
+
+@app.on_event("startup")
+def _warm_embedding_model():
+    """
+    Loads the embedding model (SentenceTransformer/BGE, see embeddings.py's
+    LocalBGEEmbedding._load) once, here, at process startup — instead of
+    lazily on whatever request happens to call embed_query()/embed_documents()
+    first. Previously that was always the first real user query, which paid
+    the full model load (HF Hub metadata fetch + downloading/reading model
+    weights, several seconds — visible as a burst of huggingface.co HTTP
+    calls in the logs at query time) as part of that visitor's response
+    latency. LocalBGEEmbedding._model is a class-level attribute, so this
+    warms the exact same cached instance every real embed call reuses —
+    nothing else changes about how embeddings are produced.
+
+    Runs as a FastAPI startup event, so uvicorn won't start accepting
+    connections (including /health) until this finishes — run.py's
+    wait_for_rag() already budgets up to 120s for RAGService's first boot,
+    so this fits inside the existing contract rather than needing a new one.
+    Wrapped in try/except so a warmup failure (e.g. no network access to
+    Hugging Face on a machine's very first-ever boot) can't crash the whole
+    service — embeddings.py's lazy-load still covers that case as a
+    fallback, just with the original cold-start cost paid by that first
+    query instead.
+    """
+    try:
+        provider = get_embedding_provider()
+        provider.embed_query("warmup")
+        log.info("[RAGService] Embedding model (%s) warmed up at startup.",
+                 provider.provider_name)
+    except Exception as e:
+        log.warning("[RAGService] Embedding model warmup failed — will lazy-load "
+                    "on the first real query instead: %s", e)
 
 
 # ── Request / Response schemas ─────────────────────────────────────────
@@ -208,6 +243,54 @@ def index_text(collection: str, body: IndexTextRequest):
         added=added,
         message=f"Text indexed: {added} new chunks.",
     )
+
+
+class UpsertEntryRequest(BaseModel):
+    entry_id: str                 = Field(..., description="Stable id owned by the caller (e.g. MongoDB knowledge_entries.entry_id)")
+    text: str                     = Field(..., description="Text to embed for this entry")
+    metadata: dict[str, Any]      = Field(default_factory=dict, description="Extra metadata (entity_type, entity_name, category, ...)")
+
+
+@app.post("/v1/collections/{collection}/entries",
+          response_model=IndexResponse, tags=["Knowledge Entries"])
+def upsert_entry(collection: str, body: UpsertEntryRequest):
+    """
+    Admin-managed knowledge-entry upsert (self-updating RAG / knowledge-
+    update loop). Any chunks previously indexed under this `entry_id` are
+    deleted FIRST, then the new text is embedded and added — so editing a
+    verified answer always REPLACES its vector chunk(s) instead of leaving
+    the old wording behind to conflict with the new one at query time.
+    This is the stale-data-prevention step in the admin verification flow.
+    """
+    coll  = _get_collection(collection)
+    added = coll.upsert_entry(body.entry_id, body.text, body.metadata)
+    return IndexResponse(
+        collection=collection,
+        added=added,
+        message=f"Entry '{body.entry_id}' upserted: {added} chunk(s).",
+    )
+
+
+@app.delete("/v1/collections/{collection}/entries/{entry_id}", tags=["Knowledge Entries"])
+def delete_entry(collection: str, entry_id: str):
+    """Remove all chunks for one admin-managed knowledge entry (e.g. when
+    an admin deletes/retracts a verified answer)."""
+    _get_collection(collection).delete_entry(entry_id)
+    return {"message": f"Entry '{entry_id}' removed from '{collection}'."}
+
+
+@app.delete("/v1/collections/{collection}/source/{source}", tags=["Indexing"])
+def delete_by_source(collection: str, source: str):
+    """
+    Delete every chunk tagged with a given `source` metadata value (e.g.
+    "college_info.json") — leaves everything else in the collection
+    (admin-verified knowledge_entries chunks, tagged `entry_id` instead)
+    untouched. This is the safe way to force a full re-seed of the static
+    JSON data after changing how it's chunked or tagged, without wiping
+    anything an admin has verified through the dashboard.
+    """
+    _get_collection(collection).delete_by_source(source)
+    return {"message": f"All chunks with source='{source}' removed from '{collection}'."}
 
 
 # ══════════════════════════════════════════════════════════════════════

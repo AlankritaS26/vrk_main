@@ -1,0 +1,6 @@
+decision_id,timestamp,session_id,question,top_score,second_score,score_gap,top_entity,second_entity,confidence_band,ambiguous,route,event_type,user_reply,resolution,answer_source
+2c0a15dc32dc,2026-09-29T16:16:37,e07add84-e3c8-4a48-a68d-a5fe32c08dd4,can you give me the facilities of higher anxiety please,1.0000,,,Campus Facilities Overview,,HIGH,False,HIGH_ENTITY_CAMPUS_FACILITIES,decision,,answered,entity_kb
+03163a0c54a3,2026-09-29T16:18:04,e07add84-e3c8-4a48-a68d-a5fe32c08dd4,can you tell me then who is the director of rns i d,1.0000,,,Director,,HIGH,False,HIGH_ENTITY_DIRECTOR,decision,,answered,entity_kb
+ac0229eb374a,2026-09-29T16:24:58,480e223f-b38e-4a19-ab1d-6d5f76c63e08,who is the principal of rnsit mr otaala hello,1.0000,,,Principal,,HIGH,False,HIGH_ENTITY_PRINCIPAL,decision,,answered,entity_kb
+ce5a232014f0,2026-09-29T16:25:42,480e223f-b38e-4a19-ab1d-6d5f76c63e08,connect me to the staff please,0.6909,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,
+9b390fac2a07,2026-09-29T16:26:04,480e223f-b38e-4a19-ab1d-6d5f76c63e08,connect me to humans and i will be able to connect you to the human,0.6406,,,,,LOW,False,LOW_RNSIT_UNKNOWN,decision,,unknown_logged,

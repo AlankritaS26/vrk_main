@@ -335,6 +335,14 @@
       "answer": "The highest CTC offered was 56 LPA in 2023. In 2025, it was 50 LPA."
     },
     {
+      "question": "What is the highest package in 2025?",
+      "answer": "In 2025, the highest placement package offered at RNSIT was 50 LPA, with 1060 total placements and 426 internships."
+    },
+    {
+      "question": "What is the highest placement package in 2025?",
+      "answer": "The highest placement package offered at RNSIT in 2025 was 50 LPA."
+    },
+    {
       "question": "How can I contact the Admissions department?",
       "answer": "Call +91 81472 86667 or email admissions@rnsit.ac.in. The admissions office is open on all Saturdays and Sundays too."
     },
@@ -349,6 +357,14 @@
     {
       "question": "What are the college working hours?",
       "answer": "The college working hours are 9:20 AM to 5:00 PM on all working days."
+    },
+    {
+      "question": "What is the college timings of RNSIT?",
+      "answer": "The college working hours at RNSIT are 9:20 AM to 5:00 PM on all working days. The RNSIT Central Library is open from 9:00 AM to 8:00 PM."
+    },
+    {
+      "question": "What are the college timings?",
+      "answer": "The college working hours at RNSIT are 9:20 AM to 5:00 PM on working days."
     },
     {
       "question": "Does RNSIT have Wi-Fi?",
@@ -449,6 +465,18 @@
     {
       "question": "Where is admin block?",
       "answer": "The Administrative Block is located opposite the Central Library and houses the Director and Principal offices, Accounts, Admissions, Placement Cell, and the Dr. Shivaram Karanth Auditorium."
+    },
+    {
+      "question": "What is the management fee of RNSIT?",
+      "answer": "Management quota annual fees for B.E. programs at RNSIT typically range from 2.5 to 7.5 lakh rupees per year depending on the branch. For exact current year fee details, please contact the Admissions Office at +91 81472 86667 or admissions@rnsit.ac.in."
+    },
+    {
+      "question": "What is the management quota fee structure?",
+      "answer": "The management quota fee structure at RNSIT varies by branch, with indicative annual fees between 2.5 and 7.5 lakh rupees. Contact the Admissions Office at +91 81472 86667 for branch-specific details."
+    },
+    {
+      "question": "What is the management phase or seat allocation at RNSIT?",
+      "answer": "RNSIT offers admissions through KCET, COMEDK, and Management Quota seats. Management quota candidates apply directly to RNSIT. For current seat allocation and management fee details, call +91 81472 86667."
     }
   ]
 }
