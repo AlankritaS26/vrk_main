@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (from repository root):
@@ -60,10 +60,9 @@ from backend.llm import (
     initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
     generate_rag_kiosk_response_stream,
     extract_topic_label,
-    _clean_repetitive_greeting,
 )
 from backend.stt import transcribe_audio, transcribe_pcm
-from backend.tts import text_to_speech, text_to_speech_on_worker
+from backend.tts import text_to_speech, text_to_speech_on_worker, TTS_EXECUTOR
 import backend.tts as tts_module   # for PREWARM_DONE in /health, below
 
 try:
@@ -119,12 +118,7 @@ from backend.query_correction import normalize_query
 from backend.confidence_rag import (
     handle_query as confidence_rag_handle_query,
     handle_query_stream as confidence_rag_handle_query_stream,
-    is_broad_department_query,
-    is_emotional_reengagement_response,
-    is_college_evaluation_query,
 )
-from backend.llm import get_weather_greeting_phrase, chat_completion_with_fallback
-from backend.entity_mapping import detect_entity
 from backend.admin_knowledge import router as admin_knowledge_router
 from backend.database import update_session_context
 from backend.database import (
@@ -339,46 +333,6 @@ EASTER_EGGS = {
     ],
 }
 
-# _matches_short_phrase() (see its docstring above) caps matches at <=4
-# words — a deliberate fix for a DIFFERENT bug (a real question containing
-# "bye"/"thanks" as a substring wrongly triggering a farewell). EASTER_EGGS
-# reuses that same helper, but a polite wrapper around a personality
-# question pushes it over that cap: "Can you tell me a joke?" is 6 words,
-# so it silently fell through EASTER_EGGS entirely and landed in the
-# RNSIT-only guardrail refusal ("I'm here to answer RNSIT-related
-# questions..."), even though "tell me a joke" is a listed easter egg.
-# Fixed by stripping a small set of common request wrappers ONLY for the
-# EASTER_EGGS check below — not from the shared q_normalized used by
-# greeting/farewell/topic-decline matching, which must keep their original
-# strictness. The match itself still has to be exact/word-boundary against
-# a short, curated, fixed phrase list, so this doesn't create new
-# false-positive risk against real campus questions.
-_EASTER_EGG_PREFIXES = (
-    "can you ", "could you ", "would you ", "will you ", "do you ",
-    "can u ", "could u ", "would u ", "will u ", "do u ", "please ",
-)
-_EASTER_EGG_SUFFIXES = (" please",)
-
-
-def _strip_easter_egg_wrapper(q: str) -> str:
-    """Peel off leading/trailing politeness wrappers so the core phrase
-    underneath ("tell me a joke") can still match EASTER_EGGS' <=4-word
-    cap. Loops since visitors can stack more than one ("Could you please
-    tell me a joke?")."""
-    stripped = q
-    changed = True
-    while changed:
-        changed = False
-        for p in _EASTER_EGG_PREFIXES:
-            if stripped.startswith(p):
-                stripped = stripped[len(p):]
-                changed = True
-        for s in _EASTER_EGG_SUFFIXES:
-            if stripped.endswith(s):
-                stripped = stripped[: -len(s)]
-                changed = True
-    return stripped.strip()
-
 
 # ── Replies to the "continue with X, or something else?" re-engagement ──
 # These only carry meaning right after that specific greeting question,
@@ -452,222 +406,6 @@ def _is_farewell(q_normalized: str) -> bool:
         if re.search(rf"(?:^|\s){re.escape(marker)}(?:$|\s)", q):
             return True
     return False
-
-
-# ── Rule-based backstop for session re-engagement topic derivation ───────
-# extract_topic_label() (backend/llm.py) is an LLM call and can legitimately
-# come back None — a provider outage, a genuinely vague history, or (seen in
-# practice) a closing remark glued onto the real question in the SAME stored
-# string, e.g. "Is RNS IT a good college? No." confusing the summarizer into
-# replying NONE. When that happens, callers used to fall straight through to
-# the generic "Let's continue from where we left off." greeting even though
-# a perfectly good topic was sitting right there in the last meaningful
-# question. This derives one deterministically instead of giving up — it is
-# only ever consulted when the LLM label came back empty (see both call
-# sites in resume_or_create_session() and the MEMORY_RECALL route below), so
-# it never overrides a real topic. Reuses the closing/filler phrase sets
-# already defined above for routing, plus a couple of bare closers ("ok",
-# "okay") that aren't in either of those but were called out explicitly for
-# this fallback.
-_TOPIC_FALLBACK_CLOSING_PHRASES = (
-    TOPIC_DECLINE_PHRASES | THANK_YOU_PHRASES | FAREWELL_MARKERS
-    | {"ok", "okay", "alright", "fine", "nothing"}
-)
-_PUNCT_STRIP_TABLE = str.maketrans("", "", string.punctuation)
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.?!])\s+")
-
-# Small, intentionally tiny keyword -> label map used ONLY to name a
-# fallback topic for the re-engagement greeting — deliberately separate
-# from entity_mapping.py's answer dictionary, which this does not touch.
-# "rnsit" alone covers both "RNS IT" and "RNSIT" once normalize_query()
-# (backend/query_correction.py) has folded the spoken/typed variants
-# together, so both normalize to the same fallback label.
-_TOPIC_FALLBACK_KEYWORDS = {
-    "placement":    "placements",
-    "placements":   "placements",
-    "package":      "placements",
-    "packages":     "placements",
-    "recruiter":    "placements",
-    "recruiters":   "placements",
-    "admission":    "admissions",
-    "admissions":   "admissions",
-    "fee":          "fees",
-    "fees":         "fees",
-    "hostel":       "hostel facilities",
-    "hostels":      "hostel facilities",
-    "canteen":      "the canteen",
-    "library":      "the library",
-    "gym":          "the gym",
-    "sports":       "sports facilities",
-    "scholarship":  "scholarships",
-    "scholarships": "scholarships",
-    "cse":          "the Computer Science department",
-    "ise":          "the Information Science department",
-    "ece":          "the ECE department",
-    "eee":          "the EEE department",
-    "aiml":         "the AI and ML department",
-    "aids":         "the AI and Data Science department",
-    "mech":         "the Mechanical Engineering department",
-    "mechanical":   "the Mechanical Engineering department",
-    "civil":        "the Civil Engineering department",
-    "mca":          "the MCA program",
-    "mba":          "the MBA program",
-    "department":   "departments",
-    "departments":  "departments",
-    "branch":       "academic branches",
-    "branches":     "academic branches",
-    "course":       "courses",
-    "courses":      "courses",
-    "club":         "student clubs",
-    "clubs":        "student clubs",
-    "fest":         "college fests",
-    "principal":    "the Principal",
-    "director":     "the Director",
-    "timing":       "college timings",
-    "hours":        "college working hours",
-    "location":     "campus location",
-    "address":      "campus address",
-    "weather":      "the weather",
-    "traffic":      "traffic conditions",
-}
-
-
-def _is_closing_only(fragment: str) -> bool:
-    """True if `fragment`, stripped of punctuation, is ENTIRELY a short
-    closing/filler remark ("No", "No thanks", "Okay", "Thanks", "That's
-    it"...) and carries no topic information of its own."""
-    f = fragment.strip().translate(_PUNCT_STRIP_TABLE).strip().lower()
-    return bool(f) and f in _TOPIC_FALLBACK_CLOSING_PHRASES
-
-
-def _strip_trailing_closing_phrase(question: str) -> str:
-    """Split a stored question into sentence-ish fragments and drop any
-    trailing ones that are pure closing remarks, e.g.
-    "Is RNS IT a good college? No." -> "Is RNS IT a good college?"
-    so the real question underneath a glued-on closer is still usable."""
-    parts = [p for p in _SENTENCE_SPLIT_RE.split((question or "").strip()) if p.strip()]
-    while parts and _is_closing_only(parts[-1]):
-        parts.pop()
-    return " ".join(parts).strip()
-
-
-def _derive_topic_fallback(questions: list[str]) -> str | None:
-    """Rule-based backstop for when extract_topic_label() returns None.
-    Uses meaningful questions to find recognized campus topics/entities.
-    Never invents a topic and never returns generic useless phrases."""
-    candidates = []
-    for q in reversed(questions or []):
-        if not q or not q.strip():
-            continue
-        candidate = _strip_trailing_closing_phrase(q)
-        if not candidate or _is_closing_only(candidate):
-            continue
-        normalized = normalize_query(candidate)
-        if normalized:
-            candidates.append((candidate, normalized))
-
-    if not candidates:
-        return None
-
-    # Pass 1 — Keyword match against known topics
-    for candidate, normalized in candidates:
-        for w in normalized.split():
-            if w in _TOPIC_FALLBACK_KEYWORDS:
-                label = _TOPIC_FALLBACK_KEYWORDS[w]
-                logger.info("[SESSION] Topic fallback derived from keyword '%s': %s", w, label)
-                return label
-
-    # Pass 2 — Entity mapping check on meaningful candidates
-    for candidate, normalized in candidates:
-        detected = detect_entity(normalized) or detect_entity(candidate)
-        if detected and detected.canonical_name:
-            label = detected.canonical_name.lower()
-            logger.info("[SESSION] Topic fallback derived from entity: %s", label)
-            return label
-
-    return None
-
-
-def classify_emotion(text: str) -> str:
-    """Classifies the emotional tone of the visitor's greeting reply."""
-    t = (text or "").lower()
-    if any(w in t for w in ("stress", "stressed", "anxious", "worried", "nervous", "overwhelmed", "exhausted", "tired", "hectic")):
-        return "stressed"
-    if any(w in t for w in ("sad", "low", "depressed", "unhappy", "terrible", "bad", "not good", "down", "not great", "awful", "rough")):
-        return "sad"
-    if any(w in t for w in ("frustrated", "annoyed", "irritated", "angry", "upset", "mad")):
-        return "frustrated"
-    if any(w in t for w in ("excited", "pumped", "thrilled", "can't wait", "amazing")):
-        return "excited"
-    if any(w in t for w in ("happy", "good", "great", "fine", "awesome", "fantastic", "well", "all good", "doing well", "pretty good", "wonderful")):
-        return "happy"
-    if any(w in t for w in ("okay", "alright", "so so", "normal", "same old")):
-        return "neutral"
-    return "unknown"
-
-
-_DETERMINISTIC_EMOTION_RESPONSES = {
-    "happy": "Glad to hear that!",
-    "excited": "Wonderful to hear that!",
-    "sad": "I'm sorry you're feeling down. I hope things look up soon.",
-    "stressed": "I'm sorry to hear that. Take it easy — I'm here if you need any help.",
-    "frustrated": "I understand — take a deep breath, and let's see how I can help.",
-    "neutral": "Good to know!",
-    "unknown": "Thanks for sharing.",
-}
-
-
-async def handle_personalized_reengagement(user_reply: str, session: dict) -> tuple[str, str | None]:
-    """
-    Handles returning visitor's response to 'How are you doing today?':
-    1. Understands emotional tone and provides empathetic, natural response.
-    2. Reconnects to previous session using the last up to 5 meaningful questions.
-    Uses LLM when available; uses deterministic fallback when LLM is unavailable.
-    """
-    previous_questions = session.get("previous_questions", []) if session else []
-    derived_topic = _derive_topic_fallback(previous_questions)
-
-    questions_block = "\n".join(f"- {q}" for q in previous_questions) if previous_questions else "(none)"
-    prompt = (
-        "You are Nova, the warm, empathetic AI digital receptionist at RNS Institute of Technology (RNSIT).\n"
-        "A returning visitor just replied to your greeting 'How are you doing today?'.\n\n"
-        f"Visitor reply: \"{user_reply}\"\n\n"
-        f"Their questions from their previous session (oldest first):\n{questions_block}\n\n"
-        "INSTRUCTIONS:\n"
-        "1. Respond to how the visitor is feeling with genuine warmth in 1 short sentence. "
-        "Be empathetic if they feel stressed, tired, or down; be enthusiastic if they feel good or happy; be pleasant if neutral. "
-        "CRITICAL: Never mention emotion detection, classification, or labels (do NOT say 'I detected that you are sad', 'Your emotional state is', etc.).\n"
-        "2. If the previous questions show a clear meaningful topic (such as placements, hostel facilities, admissions, fees, or a department), reconnect to it in 1 short sentence: "
-        "'Last time we were talking about [topic]. Would you like to continue with that?'\n"
-        "If there are no previous questions or no clear topic, simply say: 'How may I assist you today?'\n"
-        "Never say generic useless phrases like 'Previous topic was RNSIT' or 'Let's continue where we left off'. Never invent a topic not present in their questions.\n"
-        "3. Keep the entire response under 3 sentences total."
-    )
-
-    try:
-        raw_text, _tier, _model = await chat_completion_with_fallback(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=100,
-        )
-        cleaned = _clean_repetitive_greeting((raw_text or "").strip())
-        if cleaned and len(cleaned.split()) >= 4 and not any(bad in cleaned.lower() for bad in ("detected", "classification", "emotional state")):
-            topic = derived_topic
-            if "continue with" in cleaned.lower() and not topic:
-                topic = await extract_topic_label(previous_questions)
-            return cleaned, topic
-    except Exception as e:
-        logger.warning("[RE-ENGAGEMENT] LLM call failed, falling back to deterministic: %s", e)
-
-    # Deterministic fallback
-    tone = classify_emotion(user_reply)
-    emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Good to know!")
-    if derived_topic:
-        reconnect_sentence = f"Last time we were talking about {derived_topic}. Would you like to continue with that?"
-    else:
-        reconnect_sentence = "How may I assist you today?"
-
-    return f"{emotion_sentence} {reconnect_sentence}", derived_topic
 
 
 # ── Q/A label stripper ────────────────────────────────────────────────────
@@ -1754,14 +1492,18 @@ async def view_admin_dashboard(username: str = Depends(authenticate_admin)):
 INSTITUTE_NAME = os.getenv("INSTITUTE_NAME", "R N S Institute of Technology")
 
 def build_greeting(name: str, is_returning: bool, resumed: bool,
-                    weather_phrase: str | None = None) -> str:
+                    previous_topic: str | None = None) -> str:
     """The exact spoken lines for first-time vs returning/named visitors."""
     who = name if name and name not in ("Guest", "Unknown", "", "Friend") else ""
-    if is_returning or resumed:
-        weather_part = f" {weather_phrase}" if weather_phrase else " It's a pleasant day at RNSIT."
-        if who:
-            return f"Welcome back, {who}!{weather_part} How are you doing today?"
-        return f"Welcome back!{weather_part} How are you doing today?"
+    if who:
+        if resumed and previous_topic:
+            return (f"Welcome back, {who}! Good to see you again. Last time you were asking about "
+                    f"{previous_topic} — would you like to continue with that, "
+                    f"or help with something else today?")
+        if resumed:
+            return (f"Welcome back, {who}! Good to see you again. "
+                    f"We can continue where we left off. How may I assist you today?")
+        return f"Welcome back, {who}! How may I assist you today?"
 
     return (f"Welcome! I am Nova, the digital receptionist of {INSTITUTE_NAME}. "
             f"I can help you with admissions, departments, placements, fees, "
@@ -1803,72 +1545,60 @@ async def resume_or_create_session(face_id: str, user_name: str,
     resumed = False
     continued_from = None
     session_id = None
+    previous_topic = None
 
     if face_id:
-        # Single Source of Truth: look up authoritative persistent face profile
-        doc = await faces_collection.find_one({"face_id": face_id}, {"name": 1})
-        if doc and doc.get("name") and doc["name"] not in ("Guest", "Unknown", ""):
-            user_name = doc["name"]
-
         prev = await find_recent_session_by_face(face_id, days=30)
         if prev and prev.get("session_id"):
             session_id = prev["session_id"]          # SAME thread continues
             continued_from = prev.get("continued_from") or prev["session_id"]
             resumed = True
             visit_count = max(visit_count, int(prev.get("visit_count") or 1) + 1)
-            if not doc or not doc.get("name") or doc["name"] in ("Guest", "Unknown", ""):
-                if prev.get("user_name") and prev["user_name"] not in ("Guest", "Unknown", ""):
-                    user_name = prev["user_name"]
 
     if not session_id:
         session_id = str(uuid.uuid4())               # never face_id
 
-    is_user_returning = bool(resumed or is_returning or visit_count > 1)
-    weather_phrase = None
-    if is_user_returning:
+    # ── Memory-aware re-engagement: look up what they last asked about ──
+    # Pulls the last few (not just one) stored questions from their
+    # previous session so the topic summary covers everything they were
+    # asking about (e.g. "hostel facilities and fees"), not only their
+    # final message. Only attempted for resumed sessions; failures here
+    # are non-fatal and simply fall back to the generic greeting (see
+    # build_greeting).
+    if resumed:
         try:
-            weather_phrase = await get_weather_greeting_phrase()
-        except Exception as wex:
-            logger.warning("[SESSION] Weather fetch for greeting failed: %s", wex)
-            weather_phrase = "It's a pleasant day at RNSIT."
-
-    # Look up last up to 5 meaningful questions from previous session
-    previous_questions = []
-    if is_user_returning:
-        try:
-            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=10)
-            for r in recent:
-                txt = (r.get("input_text") or "").strip()
-                if txt and not _is_closing_only(txt) and len(txt.split()) > 1:
-                    clean_q = _strip_trailing_closing_phrase(txt)
-                    if clean_q and not _is_closing_only(clean_q):
-                        previous_questions.append(clean_q)
-            previous_questions = previous_questions[-5:]
-            logger.info(
-                "[SESSION] Re-engagement lookup: face=%s session=%s last_5_qs=%r",
-                face_id[:8] if face_id else "-", session_id[:8], previous_questions,
-            )
+            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=3)
+            recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
+            if recent_questions:
+                previous_topic = await extract_topic_label(recent_questions)
+                logger.info(
+                    "[SESSION] Re-engagement lookup: last_qs=%r -> topic=%r",
+                    recent_questions, previous_topic,
+                )
+            else:
+                logger.info("[SESSION] Re-engagement lookup: no prior interaction on file for face=%s session=%s", face_id, session_id)
         except Exception as e:
-            logger.warning(f"[SESSION] Skipping re-engagement questions lookup: {e}")
-            previous_questions = []
-
-    greeting_text = build_greeting(user_name, is_returning=is_user_returning, resumed=resumed, weather_phrase=weather_phrase)
+            logger.warning(f"[SESSION] Skipping re-engagement topic lookup: {e}")
+            previous_topic = None
 
     sess = {
         "session_id":   session_id,
         "user_name":    user_name,
-        "is_returning": is_user_returning,
+        "is_returning": is_returning,
         "visit_count":  visit_count,
         "face_id":      face_id or "",
         "trigger":      trigger,
         "asking_name":  False,
         "resumed":      resumed,
         "resumed_at":   datetime.now().isoformat(),
-        "previous_questions": previous_questions,
-        "previous_topic": None,
-        "awaiting_reengagement_reply": is_user_returning,
-        "awaiting_topic_choice": False,
-        "greeting":     greeting_text,
+        "previous_topic": previous_topic,
+        # True only when the greeting actually named a topic and asked a
+        # "continue with that, or something else?" question — the NEXT
+        # visitor reply, if it's a short accept/decline like "something
+        # else" or "yes", is about THAT offer, not a new RAG-worthy
+        # question, and must be intercepted before RAG (see /ask).
+        "awaiting_topic_choice": bool(previous_topic),
+        "greeting":     build_greeting(user_name, is_returning, resumed, previous_topic),
     }
 
     await save_session(session_id, face_id or None, user_name,
@@ -1906,9 +1636,6 @@ async def start_session(
         _last_activity_ts = datetime.now().timestamp()
         active_session["resumed_at"] = new_sess["resumed_at"]
         active_session["greeting"]   = new_sess["greeting"]
-        active_session["previous_questions"] = new_sess.get("previous_questions", [])
-        active_session["awaiting_reengagement_reply"] = new_sess.get("awaiting_reengagement_reply", False)
-        active_session["awaiting_topic_choice"] = False
         await touch_session(final_session_id)
         return {
             "status":     "already_active",
@@ -1974,13 +1701,8 @@ async def are_you_there_endpoint():
 
 @app.get("/session/current")
 async def get_current_session():
-    global _last_activity_ts, active_session
+    global _last_activity_ts
     if active_session:
-        fid = active_session.get("face_id")
-        if fid:
-            f_doc = await faces_collection.find_one({"face_id": fid}, {"name": 1})
-            if f_doc and f_doc.get("name") and f_doc["name"] not in ("Guest", "Unknown", ""):
-                active_session["user_name"] = f_doc["name"]
         _last_activity_ts = datetime.now().timestamp()
         return {"active": True, **active_session}
     return {"active": False}
@@ -2041,89 +1763,6 @@ def _is_cacheable(ans: str) -> bool:
     return not any(p in a for p in _UNCACHEABLE_PATTERNS)
 
 
-# Routes whose answer text is generated FROM conversation history / a
-# session-specific "pending" candidate rather than purely from the literal
-# question text. Caching these under a Redis key derived only from
-# `q_normalized` is wrong in two ways:
-#   1) HIGH_BROAD_DEPT_* — the broad "which department is good?" answer is
-#      synthesized with the visitor's own recent history baked in, so once
-#      cached it gets replayed verbatim to every later visitor (or the same
-#      visitor's next unrelated turn) who happens to phrase a question
-#      similarly, ignoring their actual conversation context.
-#   2) HIGH_DISAMBIGUATED_*, HIGH_NEITHER, HIGH_CLARIFY_LIMIT — these are
-#      the ANSWER to a short reply ("yes", "the CSE one") that only makes
-#      sense against THAT session's pending candidate. Caching under the
-#      literal reply text ("yes") would serve a random unrelated visitor's
-#      disambiguation answer to the next person who happens to say "yes".
-# Only genuinely question-grounded, context-independent answers — a direct
-# verified-entity fact (HIGH_ENTITY_*) or a single top-hit RAG synthesis
-# with no pending/ambiguity involved (bare HIGH_<tier>) — are safe to cache.
-_UNCACHEABLE_ROUTE_MARKERS = ("broad_dept", "disambiguated", "neither", "clarify_limit")
-
-
-def _is_cacheable_route(route: str) -> bool:
-    r = (route or "").lower()
-    if not r.startswith("high_") or "ambiguous" in r:
-        return False
-    return not any(m in r for m in _UNCACHEABLE_ROUTE_MARKERS)
-
-
-# ==========================================
-# NAME_CHANGE detection — EXPLICIT intent only
-# ==========================================
-# NAME_CHANGE must fire ONLY when the user explicitly asks to
-# change/set/update/rename their name, or explicitly instructs Nova to
-# address them by a new name ("call me X"). It must NEVER fire on a plain
-# self-introduction ("I'm Sneha", "My name is Sneha", bare "Sneha") or on
-# an unrelated "I'm <word>" statement ("I'm sorry", "I'm sad", "I'm good",
-# "I'm stressed") — those are not requests to change anything and are
-# handled by other routing (greeting/emotion), not this one.
-#
-# This is intentionally a small, closed set of IMPERATIVE patterns rather
-# than a growing blacklist of words/names to exclude. The captured name is
-# bounded to 1-3 word-shaped tokens directly by the regex structure (not
-# by scanning for "stop words" after the fact), so trailing conversation
-# ("...and I also wanted to ask about hostel fees") can never be swallowed
-# into the name in the first place.
-_NAME_TOKEN = r"[a-zA-Z][a-zA-Z'-]*"
-_NAME_CAPTURE_GREEDY = rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,2}})"
-_NAME_CAPTURE_LAZY = rf"({_NAME_TOKEN}(?:\s+{_NAME_TOKEN}){{0,2}}?)"
-
-# "change/set/update/rename my name to|as X"
-_NAME_CHANGE_VERB_RE = re.compile(
-    rf"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+(?:to|as)\s+{_NAME_CAPTURE_GREEDY}\b"
-)
-# "call me X from now on" — tried first, with a LAZY capture so "from now
-# on" is never swallowed into the name (e.g. "call me Sneha from now on"
-# captures "Sneha", not "Sneha from now").
-_CALL_ME_SUFFIXED_RE = re.compile(
-    rf"\bcall\s+me\s+{_NAME_CAPTURE_LAZY}\s+from\s+now\s+on\b"
-)
-# bare "call me X" (no "from now on" suffix) — still an explicit instruction
-# to be addressed by a new name.
-_CALL_ME_BARE_RE = re.compile(rf"\bcall\s+me\s+{_NAME_CAPTURE_GREEDY}\b")
-
-
-def _detect_name_change(q_normalized: str) -> str | None:
-    """
-    Returns the requested new name (Title Case) if `q_normalized` is an
-    EXPLICIT name-change request, else None.
-
-    Deliberately does NOT infer intent from capitalization, a detected
-    person-name entity, "I'm <word>" phrasing, or conversation context —
-    only the imperative patterns above count. See module comment above.
-    """
-    match = (
-        _NAME_CHANGE_VERB_RE.search(q_normalized)
-        or _CALL_ME_SUFFIXED_RE.search(q_normalized)
-        or _CALL_ME_BARE_RE.search(q_normalized)
-    )
-    if not match:
-        return None
-    name = " ".join(w.capitalize() for w in match.group(1).split())
-    return name or None
-
-
 async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
     """
     All the fast, deterministic pre-RAG routes — greeting, farewell,
@@ -2173,47 +1812,19 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
 
     # ─── Easter eggs → instant, deterministic, zero RAG/LLM round-trip ──────
     # Same short-utterance safety net as GREETING_PHRASES: only fires for a
-    # standalone match (<=4 words after stripping a polite wrapper like
-    # "can you ... ?" — see _strip_easter_egg_wrapper() above), never for a
-    # real question that happens to contain one of these phrases as a
-    # fragment.
-    q_easter_egg = _strip_easter_egg_wrapper(q_normalized)
+    # standalone match (<=4 words), never for a real question that happens
+    # to contain one of these phrases as a fragment.
     for phrase, responses in EASTER_EGGS.items():
-        if _matches_short_phrase(q_normalized, {phrase}) or _matches_short_phrase(q_easter_egg, {phrase}):
+        if _matches_short_phrase(q_normalized, {phrase}):
             answer = responses[hash(sid + phrase) % len(responses)]
             logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
             return answer, "easter_egg", "CONTINUE"
 
-    # ─── Returning visitor reply to "How are you doing today?" greeting ──────────
-    #
-    # INTENT GATE — runs BEFORE NAME_CHANGE, RAG, and entity detection.
-    # awaiting_reengagement_reply does NOT mean 'treat every message as emotional'.
-    # It means: CHECK if the message is actually an emotional response;
-    # otherwise clear the flag and continue normal routing.
-    #
-    # Uses POSITIVE detection (is_emotional_reengagement_response) so that
-    # genuine questions like 'Who is the principal?' or garbled inputs like
-    # 'Did I ask you about the journey...' are never consumed as wellbeing replies.
-    if active_session and active_session.get("awaiting_reengagement_reply"):
-        if is_emotional_reengagement_response(q_normalized):
-            # This IS an emotional response — handle it and consume the flag.
-            active_session["awaiting_reengagement_reply"] = False
-            answer, topic = await handle_personalized_reengagement(q_normalized, active_session)
-            if topic:
-                active_session["previous_topic"] = topic
-                active_session["awaiting_topic_choice"] = True
-            else:
-                active_session["awaiting_topic_choice"] = False
-            logger.info("[ROUTE] PERSONALIZED_REENGAGEMENT — reply=%r topic=%r", q_normalized, topic)
-            return answer, "personalized_reengagement", "CONTINUE"
-        else:
-            # NOT an emotional response — clear the pending flag and fall through
-            # to normal routing so this query is handled on its own merits.
-            active_session["awaiting_reengagement_reply"] = False
-            logger.info(
-                "[ROUTE] RE-ENGAGEMENT bypassed (not emotional response) — '%s'",
-                q_normalized,
-            )
+    # ─── Change Name Request ────────────────────────────────────────────────
+    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul"
+    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
+                        re.search(r"\b(?:change|update|set|rename)\s+my\s+name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized)
 
     # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
     INVALID_NAME_STARTS = (
@@ -2357,8 +1968,6 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
                 recent_questions = [r["input_text"] for r in recent if r.get("input_text")]
                 if recent_questions:
                     prev_topic = await extract_topic_label(recent_questions)
-                    if not prev_topic:
-                        prev_topic = _derive_topic_fallback(recent_questions)
             except Exception as e:
                 logger.warning(f"[MEMORY RECALL] Lookup failed: {e}")
 
@@ -2479,7 +2088,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         # caching a "Did you mean A or B?" or "Are you asking about X?"
         # under the ORIGINAL question's key would serve that clarification
         # question to every future visitor who asks the same thing.
-        if redis_client and answer and _is_cacheable_route(route):
+        if redis_client and answer and route.startswith("high_") and "ambiguous" not in route:
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
@@ -2655,7 +2264,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             answer = "I'm having trouble processing that right now. Please visit the Admin Block for assistance."
             yield f"data: {json.dumps({'sentence': answer})}\n\n"
 
-        if redis_client and answer and _is_cacheable_route(route):
+        if redis_client and answer and route.startswith("high_") and "ambiguous" not in route:
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
@@ -2859,22 +2468,19 @@ async def tts_endpoint(request: Request):
         text = (body.get("text") or "").strip()
         if not text:
             return {"audio": None}
-        # Route through TTS_EXECUTOR's single dedicated thread (not the
-        # default asyncio.to_thread pool) so this lands on the exact same
-        # thread tts.py's warmup already warmed. See tts.py's TTS_EXECUTOR
-        # comment — that thread mismatch, not lack of a lock, was the root
-        # cause of "still slow after warmup". _kokoro_lock in tts.py stays
-        # in place as a safety net if TTS_EXECUTOR's worker count ever
-        # changes, but on a single worker it's never actually contended.
-        wav = await asyncio.get_event_loop().run_in_executor(
-            None, text_to_speech_on_worker, text
+        loop = asyncio.get_running_loop()
+        wav = await loop.run_in_executor(
+            TTS_EXECUTOR, text_to_speech, text
         )
         elapsed_ms = (time.monotonic() - t_recv) * 1000
         logger.info(f"[TTS-TIMING] /tts request handled in {elapsed_ms:.0f}ms "
                     f"({len(text)} chars): '{text[:40]}'")
-        return {"audio": base64.b64encode(wav).decode("utf-8") if wav else None}
+        if not wav:
+            logger.error(f"[TTS] text_to_speech returned empty audio for text: '{text[:50]}'")
+            return {"audio": None}
+        return {"audio": base64.b64encode(wav).decode("utf-8")}
     except Exception as e:
-        logger.error(f"[TTS] Endpoint error: {e}")
+        logger.error(f"[TTS] Endpoint error for text '{text if 'text' in locals() else 'unknown'}': {e}", exc_info=True)
         return {"audio": None}
 
 
@@ -3029,29 +2635,34 @@ async def submit_name(name: str = "Guest", save: bool = True):
         )
 
     if save and name not in ("Guest", "Unknown", ""):
-        from backend.detection import register_or_resume_face, ST, _load_known_faces
-        if fid:
-            await update_face_name_with_alias(fid, name)
-            logger.info(f"[VISITOR] submit_name: renamed existing face_id={fid[:8]} to '{name}'")
-        else:
-            result = register_or_resume_face(name, save=True)
-            new_fid = result.get("face_id") or ""
-            if not new_fid:
-                new_fid = str(uuid.uuid4())
-            snap_anchor = ST.snapshot().get("anchor") or []
-            await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
-            ST.set(face_id=new_fid, identity=name)
-            _load_known_faces(force=True)
-            active_session["face_id"] = new_fid
-            fid = new_fid
-            if sid:
-                await sessions_collection.update_many(
-                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
-                await interactions_collection.update_many(
-                    {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
-            logger.info(
-                f"[VISITOR] submit_name: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
-            )
+        try:
+            from backend.detection import register_or_resume_face, ST, _load_known_faces
+            if fid:
+                await update_face_name_with_alias(fid, name)
+                logger.info(f"[VISITOR] submit_name: renamed existing face_id={fid[:8]} to '{name}'")
+            else:
+                result = register_or_resume_face(name, save=True)
+                new_fid = result.get("face_id") or ""
+                if not new_fid:
+                    new_fid = str(uuid.uuid4())
+                snap_anchor = ST.snapshot().get("anchor") or []
+                await save_face_encoding(new_fid, name, snap_anchor, [snap_anchor] if snap_anchor else [])
+                ST.set(face_id=new_fid, identity=name)
+                _load_known_faces(force=True)
+                active_session["face_id"] = new_fid
+                fid = new_fid
+                if sid:
+                    await sessions_collection.update_many(
+                        {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+                    await interactions_collection.update_many(
+                        {"session_id": sid}, {"$set": {"face_id": new_fid, "user_name": name}})
+                logger.info(
+                    f"[VISITOR] submit_name: registered face_id={new_fid[:8]} for '{name}' in MongoDB (has_encoding={bool(snap_anchor)})"
+                )
+        except Exception as _face_err:
+            # The NAME is already persisted on the session/interactions above. A face-registration
+            # failure (no anchor embedding yet, DB hiccup) must not abort the request or skip the broadcast.
+            logger.error(f"[VISITOR] submit_name: face registration failed for '{name}': {_face_err}", exc_info=True)
 
     # Broadcast the updated name to all connected frontends immediately so the
     # admin dashboard, GoodbyeScreen, etc. all see the real name right away.

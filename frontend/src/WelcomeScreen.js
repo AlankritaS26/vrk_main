@@ -104,16 +104,30 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const pendingSpeechRef = useRef(null);         // speech blocked by autoplay policy
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
+  const activeOnDoneRef = useRef(null);          // holds onDone callback so interrupts/errors resolve immediately without 15s freeze
+  const [isAudioBlocked, setIsAudioBlocked] = useState(false);
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
   const lastAnswerRef = useRef('');              // stores the most recent full answer text for resume-on-interrupt
   const wasInterruptedRef = useRef(false);       // true if TTS was barged-in before it finished — triggers "want to continue?" offer
   const ttsAnalyserRef = useRef(null);           // live TTS level for the 3D avatar mouth
 
   // Browsers create AudioContext 'suspended' until a user gesture.
-  // Unlock on the first pointer/key event and replay anything pending.
+  // Unlock on the first pointer/key/touch event and replay anything pending.
   useEffect(() => {
     const unlock = async () => {
-      try { await playCtxRef.current?.resume(); } catch (e) { }
+      try {
+        if (!playCtxRef.current) {
+          playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (playCtxRef.current.state === 'suspended') {
+          await playCtxRef.current.resume();
+        }
+        if (playCtxRef.current.state === 'running') {
+          setIsAudioBlocked(false);
+        }
+      } catch (e) {
+        console.warn('[AUDIO] Error unlocking AudioContext:', e);
+      }
       if (pendingSpeechRef.current) {
         const { text, onStart } = pendingSpeechRef.current;
         pendingSpeechRef.current = null;
@@ -121,9 +135,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }
     };
     window.addEventListener('pointerdown', unlock);
+    window.addEventListener('touchstart', unlock);
+    window.addEventListener('click', unlock);
     window.addEventListener('keydown', unlock);
     return () => {
       window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('touchstart', unlock);
+      window.removeEventListener('click', unlock);
       window.removeEventListener('keydown', unlock);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -495,6 +513,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ttsGainRef.current.gain.setValueAtTime(1, now);   // reset for the next speak() call
     }
     isSpeaking.current = false;
+    // CRITICAL: Call pending onDone so speakAndWait does NOT hang for 15 seconds!
+    if (activeOnDoneRef.current) {
+      const cb = activeOnDoneRef.current;
+      activeOnDoneRef.current = null;
+      try { cb(); } catch (e) { }
+    }
   }, []);
   useEffect(() => { interruptSpeakingRef.current = interruptSpeaking; }, [interruptSpeaking]);
 
@@ -608,6 +632,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     window.speechSynthesis.cancel();
     const myId = Symbol('speak');
     activeSpeakIdRef.current = myId;
+    activeOnDoneRef.current = onDone;
     isSpeaking.current = true;
 
     let hasStartedAvatar = false;
@@ -622,6 +647,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     };
 
     const finish = () => {
+      activeOnDoneRef.current = null;
       if (activeSpeakIdRef.current !== myId) return;
       window.__novaTtsActive = false;  // lipsync off — mouth returns to rest
       isSpeaking.current = false;
@@ -635,7 +661,18 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
     }
     const pctx = playCtxRef.current;
-    if (pctx.state === 'suspended') { try { await pctx.resume(); } catch (e) { } }
+    if (pctx.state === 'suspended') {
+      try { await pctx.resume(); } catch (e) { }
+    }
+    if (pctx.state === 'suspended') {
+      console.warn('[TTS] AudioContext is suspended — showing unblock indicator and falling back to browser voice.');
+      setIsAudioBlocked(true);
+      pendingSpeechRef.current = { text, onStart };
+      await browserSpeak();
+      return;
+    } else {
+      setIsAudioBlocked(false);
+    }
 
     if (!ttsGainRef.current) {
       ttsGainRef.current = pctx.createGain();
@@ -653,33 +690,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
 
-    // Sentence splitting with natural chunking
-    const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
-      .map(s => s.trim()).filter(Boolean);
-
-    const sentences = [];
-    if (raw.length) {
-      let first = raw[0];
-      if (first.length > 55) {
-        const cut = first.indexOf(',');
-        if (cut > 15) {
-          sentences.push(first.slice(0, cut + 1));
-          first = first.slice(cut + 1).trim();
-        }
-      }
-      if (first) sentences.push(first);
-      let buf = '';
-      for (let i = 1; i < raw.length; i++) {
-        buf = buf ? buf + ' ' + raw[i] : raw[i];
-        if (buf.length >= 80) { sentences.push(buf); buf = ''; }
-      }
-      if (buf) sentences.push(buf);
-    }
-
-    if (sentences.length > 1 && sentences[0].length < 20) {
-      sentences[1] = sentences[0] + ' ' + sentences[1];
-      sentences.shift();
-    }
+    // Sentence splitting with unified chunking identical to sendToBackend
+    const sentences = buildTtsSentenceChunks(text);
 
     console.log('TTS QUEUE:', sentences);
 
@@ -721,39 +733,26 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
 
         const tAudioRecv = performance.now();
-        if (!b64) return { buf: null, tReq, tAudioRecv, tDecoded: tAudioRecv };
+        if (!b64) {
+          // Log loudly so silent failures are immediately visible in the console.
+          console.error('[TTS] backend returned audio:null for text:', JSON.stringify(sentenceText),
+            '| pctx.state:', pctx.state,
+            '| elapsed:', (tAudioRecv - tReq).toFixed(0) + 'ms',
+            '| This means Kokoro synthesis failed or returned empty bytes on the backend.');
+          return { buf: null, tReq, tAudioRecv, tDecoded: tAudioRecv };
+        }
 
         const bin = atob(b64);
         const bytes = new Uint8Array(bin.length);
         for (let b = 0; b < bin.length; b++) bytes[b] = bin.charCodeAt(b);
-        const buf = await pctx.decodeAudioData(bytes.buffer);
+        let buf = null;
+        try {
+          buf = await pctx.decodeAudioData(bytes.buffer);
+        } catch (decodeErr) {
+          console.error('[TTS] decodeAudioData failed for:', JSON.stringify(sentenceText), decodeErr);
+        }
         const tDecoded = performance.now();
         return { buf, tReq, tAudioRecv, tDecoded };
-        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
-        const node = pctx.createBufferSource();
-        node.buffer = buf;
-        node.connect(ttsAnalyserRef.current || ttsGainRef.current);
-        activeNodesRef.current.push(node);
-        node.onended = () => {
-          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-        };
-
-        const at = Math.max(pctx.currentTime, playCursorRef.current);
-        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
-        node.start(at);
-        playCursorRef.current = at + buf.duration;
-
-        // Fire onStart/onSentence exactly when THIS clip's audio begins —
-        // if it's scheduled to start later than "now" (queued behind an
-        // earlier clip that's still playing), wait for that moment instead
-        // of firing immediately, so text and voice stay in lockstep.
-        const announce = () => {
-          fireStart();                                     // status + first-clip-only hook
-          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
-          resolveStarted();
-        };
-        if (delayMs > 0) setTimeout(announce, delayMs);
-        else announce();
       } catch (e) {
         console.warn('[TTS] Fetch or decode error for sentence:', sentenceText, e);
         return { buf: null, tReq, tAudioRecv: performance.now(), tDecoded: performance.now() };
@@ -787,13 +786,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         ? decodeInitialClipPromise(initialClipPromise)
         : (sentences.length > 0 ? fetchAndDecodeClip(sentences[0]) : null);
 
+      let nextPlayTime = pctx.currentTime + 0.02;
+
       for (let i = 0; i < sentences.length; i++) {
         if (activeSpeakIdRef.current !== myId) break;
 
         const currentSentence = sentences[i];
-        if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
 
-        // Trigger pre-fetch & pre-decode of chunk N+1 WHILE chunk N is prepared/played
+        // Trigger pre-fetch & pre-decode of chunk N+1 WHILE chunk N is prepared/scheduled
         const nextPromise = (i + 1 < sentences.length) ? fetchAndDecodeClip(sentences[i + 1]) : null;
         const clipData = await prefetchNextPromise;
         prefetchNextPromise = nextPromise;
@@ -812,30 +812,40 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               node.connect(ttsAnalyserRef.current || ttsGainRef.current);
               activeNodesRef.current.push(node);
 
-              await new Promise((resolveEnd) => {
-                node.onended = () => {
-                  activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-                  resolveEnd();
-                };
+              const now = pctx.currentTime;
+              const startAt = Math.max(now + 0.02, nextPlayTime);
+              node.start(startAt);
+              nextPlayTime = startAt + clipData.buf.duration;
+              playCursorRef.current = nextPlayTime;
 
-                const tPlayStart = performance.now();
-                if (i === 0) {
-                  firstAudioPlayStart = tPlayStart;
-                  fireStart(); // Avatar flips to speaking EXACTLY when buffer starts playing!
+              node.onended = () => {
+                activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
+              };
 
-                  const tAns = timingBase != null ? timingBase : clipData.tReq;
-                  const ttsSynthNet = clipData.tAudioRecv - clipData.tReq;
-                  const decodeMs = clipData.tDecoded - clipData.tAudioRecv;
-                  const timeToFirstAudio = tPlayStart - tAns;
+              const delayToStartMs = Math.max(0, (startAt - now) * 1000);
+              setTimeout(() => {
+                if (activeSpeakIdRef.current === myId) {
+                  const tPlayStart = performance.now();
+                  if (i === 0) {
+                    firstAudioPlayStart = tPlayStart;
+                    fireStart(); // Avatar flips to speaking EXACTLY when buffer starts playing!
 
-                  console.log(`[LATENCY-FLOW] ANSWER_RECEIVED: t=${tAns.toFixed(1)}ms`);
-                  console.log(`[LATENCY-FLOW] TTS_REQUEST_START: t=${clipData.tReq.toFixed(1)}ms (+${(clipData.tReq - tAns).toFixed(1)}ms)`);
-                  console.log(`[LATENCY-FLOW] TTS_AUDIO_RECEIVED: t=${clipData.tAudioRecv.toFixed(1)}ms (TTS synth+net: ${ttsSynthNet.toFixed(0)}ms)`);
-                  console.log(`[LATENCY-FLOW] AUDIO_DECODED: t=${clipData.tDecoded.toFixed(1)}ms (decode: ${decodeMs.toFixed(0)}ms)`);
-                  console.log(`[LATENCY-FLOW] AUDIO_PLAY_START: t=${tPlayStart.toFixed(1)}ms (time-to-first-audio: ${timeToFirstAudio.toFixed(0)}ms)`);
+                    const tAns = timingBase != null ? timingBase : clipData.tReq;
+                    const ttsSynthNet = clipData.tAudioRecv - clipData.tReq;
+                    const decodeMs = clipData.tDecoded - clipData.tAudioRecv;
+                    const timeToFirstAudio = tPlayStart - tAns;
+
+                    console.log(`[LATENCY-FLOW] ANSWER_RECEIVED: t=${tAns.toFixed(1)}ms`);
+                    console.log(`[LATENCY-FLOW] TTS_REQUEST_START: t=${clipData.tReq.toFixed(1)}ms (+${(clipData.tReq - tAns).toFixed(1)}ms)`);
+                    console.log(`[LATENCY-FLOW] TTS_AUDIO_RECEIVED: t=${clipData.tAudioRecv.toFixed(1)}ms (TTS synth+net: ${ttsSynthNet.toFixed(0)}ms)`);
+                    console.log(`[LATENCY-FLOW] AUDIO_DECODED: t=${clipData.tDecoded.toFixed(1)}ms (decode: ${decodeMs.toFixed(0)}ms)`);
+                    console.log(`[LATENCY-FLOW] AUDIO_PLAY_START: t=${tPlayStart.toFixed(1)}ms (time-to-first-audio: ${timeToFirstAudio.toFixed(0)}ms)`);
+                  }
+                  // Fire onSentence synchronized with audio start of this chunk
+                  if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
                 }
-                node.start(0);
-              });
+              }, delayToStartMs);
+
               playedSuccessfully = true;
             }
           } catch (playbackErr) {
@@ -856,7 +866,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             utter.onerror = () => resolveEnd();
             window.speechSynthesis.speak(utter);
           });
+          nextPlayTime = pctx.currentTime + 0.02;
         }
+      }
+
+      if (activeSpeakIdRef.current !== myId) return;
+
+      // Wait for the scheduled audio pipeline to drain completely before finishing
+      const waitRemainingMs = Math.max(0, (nextPlayTime - pctx.currentTime) * 1000);
+      if (waitRemainingMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, waitRemainingMs + 40));
       }
 
       if (activeSpeakIdRef.current !== myId) return;
@@ -1166,10 +1185,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       // Extracts just the first chunk — this is all the first TTS request
       // needs to send; the rest is chunked+prefetched inside speakStream.
-      // Uses the SAME buildTtsSentenceChunks() speakStream uses for its
-      // own sentences[0], so this prefetch can never diverge from (or be
-      // a too-short throwaway fragment ahead of) what actually gets played.
-      const firstChunkText = (ans) => buildTtsSentenceChunks(ans)[0] || ans;
+      const firstChunk = buildTtsSentenceChunks(answer)[0] || answer;
+      const initialClipPromise = fetch(BACKEND + '/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: firstChunk })
+      }).then(r => r.json()).then(d => d.audio || null).catch(() => null);
 
       // Store full answer so resume intent can replay it on interruption
       lastAnswerRef.current = answer;
@@ -1185,6 +1206,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       let appendSentence = null;
       speakStream(answer, {
+        initialClipPromise,
+        timingBase: tAnswerReceived,
         onStart: () => {
           awaitingAnswerRef.current = false;   // real answer is speaking now — resting state is 'ready' again
           setProcessingHint('');
@@ -2470,6 +2493,46 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               </>
             )}
           </div>
+        </div>
+      )}
+
+      {/* ── AUDIO BLOCKED BY BROWSER AUTOPLAY INDICATOR ── */}
+      {isAudioBlocked && (
+        <div
+          onClick={async () => {
+            if (!playCtxRef.current) {
+              playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+            }
+            try {
+              await playCtxRef.current.resume();
+              setIsAudioBlocked(false);
+            } catch (e) {
+              console.warn('[AUDIO] Resume error on user tap:', e);
+            }
+          }}
+          style={{
+            position: 'fixed',
+            top: '18px',
+            left: '50%',
+            transform: 'translateX(-50%)',
+            zIndex: 9999,
+            background: 'linear-gradient(135deg, #ef4444, #dc2626)',
+            color: '#ffffff',
+            padding: '10px 22px',
+            borderRadius: '30px',
+            boxShadow: '0 8px 24px rgba(220, 38, 38, 0.45)',
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '10px',
+            fontSize: '14px',
+            fontWeight: '700',
+          }}
+        >
+          <span>🔇 Sound Paused by Browser</span>
+          <span style={{ background: '#ffffff', color: '#dc2626', padding: '3px 10px', borderRadius: '12px', fontSize: '12px' }}>
+            Tap anywhere to enable sound
+          </span>
         </div>
       )}
 

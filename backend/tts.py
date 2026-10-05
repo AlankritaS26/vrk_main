@@ -1,19 +1,17 @@
 """
 tts.py — text-to-speech for the VRK kiosk.
 
-ENGINE DEFAULT: Kokoro. This was accidentally defaulted to "melotts" during
-an earlier experiment and silently ran that way for real visitors with no
-.env override — that bug is fixed here. MeloTTS remains available as an
-explicit opt-in (TTS_ENGINE=melotts) if you want to revisit it later, but
-it is NOT the default and never will be unless set explicitly.
+PRIVACY: everything here runs ON THIS MACHINE. No text or audio is sent to any server.
+  kokoro   (default) local neural TTS - GPU if present, voice af_heart, speed 1.0.
+  melotts  optional local engine (TTS_ENGINE=melotts).
+If synthesis fails, the frontend falls back to the browser's built-in (also local) voice.
 """
 import os
 import io
 import time
 import logging
+import re
 import threading
-import cProfile
-import pstats
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -43,52 +41,32 @@ load_dotenv()
 TTS_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts-worker")
 
 
-def _default_tts_threads() -> int:
-    """Torch intra-op thread cap for the TTS worker.
-
-    Set to 12 per explicit direction after reviewing bench_tts.py's thread
-    sweep on the actual kiosk hardware (12 cores): threads=12 measured
-    fastest (3641.5ms mean). The sweep itself was noisy — 2 through 14
-    threads mostly overlapped within stdev — so this is a judgment call on
-    top of that data, not a clean statistical win; recorded here as a
-    deliberate choice rather than re-derived automatically, so a future
-    edit doesn't quietly change it back. TTS_TORCH_THREADS still overrides
-    this explicitly if you want to test another value.
-    """
-    return 12
-
-
 def _init_torch_threads():
-    """Pin torch's thread count on the TTS worker thread. See
-    _default_tts_threads() above for the thread-count reasoning (12,
-    per explicit direction from the bench_tts.py results) —
-    TTS_TORCH_THREADS still overrides it explicitly if needed."""
+    """Pin torch's thread count on the TTS worker thread.
+
+    NOTE ON THE DEFAULT: with TTS_EXECUTOR having exactly one worker, only
+    ONE synthesis call ever runs at a time now — there's no more "two
+    syntheses fighting each other for cores" scenario within TTS itself to
+    guard against (that's what the original cap of 2 was defending
+    against). The only remaining reason to cap this at all is leaving CPU
+    headroom for STT (faster_whisper) and the RAG embedding model, which
+    run concurrently on their own threads/processes — see the same log
+    window showing faster_whisper and sentence-transformers calls
+    interleaved with TTS synthesis. If profiling shows Kokoro itself is the
+    bottleneck (multi-second synthesis for short text, well after warmup —
+    i.e. NOT a cold-start effect), try raising TTS_TORCH_THREADS toward
+    your actual core count and re-measure; there's no longer an internal
+    reason to keep it this low.
+    """
     try:
         import torch
-        threads = int(os.getenv("TTS_TORCH_THREADS", str(_default_tts_threads())))
-        torch.set_num_threads(threads)
+        torch.set_num_threads(int(os.getenv("TTS_TORCH_THREADS", str(max(2, (os.cpu_count() or 4) // 2)))))
         try:
             torch.set_num_interop_threads(1)
         except RuntimeError:
             # Can only be called once per process and only before any
             # interop op has run — ignore if it's too late.
             pass
-        # flush_denormal(True) was tried here and REVERTED. Hypothesis was
-        # that Kokoro's conv-heavy vocoder hits the classic CPU denormal
-        # slowdown (near-zero float values falling back to slow microcode
-        # paths) — a real, well-documented effect on SOME hardware/model
-        # combos. bench_tts.py's direct A/B on THIS machine (Ryzen-class
-        # AVX2, no AVX512) showed the opposite: off=3421ms vs on=3673ms,
-        # i.e. no improvement (if anything slightly worse, within noise).
-        # Per "don't keep an optimization that isn't measurably better":
-        # left at PyTorch's own default (off) rather than kept on a
-        # plausible-sounding guess that didn't hold up when measured.
-        # Visible confirmation of what's actually engaged — needed to tell
-        # "thread cap is still the bottleneck" apart from "thread cap was
-        # already raised, the remaining cost is genuinely inference" when
-        # reading [TTS-PROFILE] timings below.
-        logger.info("[TTS-PROFILE] torch threads pinned: %d (cpu_count=%s)",
-                    threads, os.cpu_count())
     except ImportError:
         pass
 
@@ -97,8 +75,12 @@ def _init_torch_threads():
 # before Kokoro (and its underlying torch ops) ever run on it.
 TTS_EXECUTOR.submit(_init_torch_threads)
 
-TTS_VOICE = os.getenv("TTS_VOICE", "af_bella")
-TTS_SPEED = float(os.getenv("TTS_SPEED", "1.12"))
+# af_heart is Kokoro's highest-graded voice; a blend such as "af_heart,af_bella" is also valid
+# and often sounds less synthetic than a single voice. 1.12x speed was a big part of the
+# "robotic / hurried" feel; 1.0 is the model's natural pace.
+TTS_VOICE = os.getenv("TTS_VOICE", "af_heart")
+TTS_SPEED = float(os.getenv("TTS_SPEED", "1.0"))
+TTS_DEVICE = os.getenv("TTS_DEVICE", "auto")   # auto | cuda | cpu
 
 # ── Response cache: (text, engine, voice, speed) -> WAV bytes ────────────
 _TTS_CACHE: dict = {}
@@ -124,7 +106,15 @@ def _get_pipe():
     global _pipe
     if _pipe is None:
         print("[TTS] Loading Kokoro pipeline...")
-        _pipe = KPipeline(lang_code="a")   # 'a' = American English
+        dev = TTS_DEVICE
+        if dev == "auto":
+            try:
+                import torch
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                dev = "cpu"
+        print(f"[TTS] Kokoro device = {dev}")
+        _pipe = KPipeline(lang_code="a", device=dev)   # 'a' = American English
         print("[TTS] Kokoro ready.")
     return _pipe
 
@@ -171,7 +161,7 @@ def _trim_silence(audio: np.ndarray, sr: int) -> np.ndarray:
     raw model output tends to have."""
     nz = np.where(np.abs(audio) > 0.004)[0]
     if len(nz):
-        pad = int(sr * 0.06)
+        pad = int(sr * 0.09)
         audio = audio[max(0, nz[0] - pad): min(len(audio), nz[-1] + pad)]
     return audio
 
@@ -189,131 +179,15 @@ _kokoro_lock = threading.Lock()
 
 
 def _synthesize_kokoro(text: str) -> bytes:
-    # Stage-level timing — kept cheap (a handful of time.monotonic() calls)
-    # so it can stay on in production and actually show, per call, whether
-    # a slow /tts is lock contention, phonemization+inference (the model
-    # itself), or post-processing/encoding, instead of only ever seeing one
-    # opaque total. pipe(text, ...) is a generator that does phonemization
-    # and vocoder inference together per chunk — Kokoro doesn't expose
-    # those as separate steps — so "phonemize+infer" below is that combined
-    # cost, which is normally the dominant one.
-    t0 = time.monotonic()
-    with _kokoro_lock:
-        t_lock = time.monotonic()
-        pipe = _get_pipe()
-        t_pipe = time.monotonic()
-        chunks = [audio for _, _, audio in pipe(text, voice=TTS_VOICE, speed=TTS_SPEED)]
-        t_infer = time.monotonic()
-    if not chunks:
-        return b""
-    audio = _trim_silence(np.concatenate(chunks), 24000)
-    t_trim = time.monotonic()
-    buf = io.BytesIO()
-    sf.write(buf, audio, 24000, format="WAV")
-    t_encode = time.monotonic()
-    # INFO, not DEBUG: main.py's logging.basicConfig(level=logging.INFO)
-    # meant this line was silently dropped before it ever reached a handler
-    # — the "profiling isn't showing up" symptom. It's cheap (a handful of
-    # time.monotonic() calls, no extra work), so it's fine to leave at INFO
-    # rather than require a log-level change to see it.
-    logger.info(
-        "[TTS-PROFILE] lock_wait=%.0fms pipe_init=%.0fms phonemize+infer=%.0fms "
-        "trim=%.0fms encode=%.0fms total=%.0fms (%d chars): '%s'",
-        (t_lock - t0) * 1000, (t_pipe - t_lock) * 1000,
-        (t_infer - t_pipe) * 1000, (t_trim - t_infer) * 1000,
-        (t_encode - t_trim) * 1000, (t_encode - t0) * 1000, len(text),
-        text[:40],
-    )
-    return buf.getvalue()
-
-
-def _log_runtime_diagnostics(pipe):
-    """One-time dump of exactly what's actually running: torch device,
-    dtype, thread counts, CPU backend config, and the Kokoro model/voice
-    config — requested so we can rule out "silently running fp64" or "not
-    actually seeing the thread cap we set" etc. before reasoning about
-    where the per-call time goes. Best-effort: KPipeline's internals
-    aren't officially documented across versions, so every introspection
-    attempt is guarded and falls back to an honest "unknown" rather than
-    guessing. This is pure introspection — it changes nothing about how
-    inference runs, so unlike the thread-count/compile/dtype experiments
-    it doesn't need A/B benchmarking to justify being here."""
-    try:
-        import torch
-        threads, interop = torch.get_num_threads(), torch.get_num_interop_threads()
-        try:
-            mkldnn_ok = torch.backends.mkldnn.is_available()
-        except Exception:
-            mkldnn_ok = "n/a"
-        try:
-            mkl_ok = torch.backends.mkl.is_available()
-        except Exception:
-            mkl_ok = "n/a"
-        try:
-            cpu_cap = torch.backends.cpu.get_cpu_capability()
-        except Exception:
-            cpu_cap = "n/a (older torch build)"
-        logger.info(
-            "[TTS-PROFILE] cpu backend: torch=%s mkldnn=%s mkl=%s cpu_capability=%s "
-            "OMP_NUM_THREADS=%s MKL_NUM_THREADS=%s",
-            torch.__version__, mkldnn_ok, mkl_ok, cpu_cap,
-            os.getenv("OMP_NUM_THREADS", "<unset>"), os.getenv("MKL_NUM_THREADS", "<unset>"),
-        )
-    except ImportError:
-        threads = interop = "torch unavailable"
-
-    device = dtype = "unknown"
-    model_obj = getattr(pipe, "model", None)
-    if model_obj is not None:
-        try:
-            p = next(model_obj.parameters())
-            device, dtype = str(p.device), str(p.dtype)
-        except Exception as e:
-            device = dtype = f"introspection failed: {e}"
-
-    logger.info(
-        "[TTS-PROFILE] runtime: torch_threads=%s torch_interop_threads=%s "
-        "model_device=%s model_dtype=%s voice=%s speed=%s lang_code=a engine=%s",
-        threads, interop, device, dtype, TTS_VOICE, TTS_SPEED, TTS_ENGINE,
-    )
-
-
-def _synthesize_kokoro_profiled(text: str) -> bytes:
-    """Same work as _synthesize_kokoro(), but with the phonemize+infer span
-    wrapped in cProfile instead of one opaque timer, so we can see WHICH
-    function inside it actually costs the time — G2P/phonemization,
-    tokenization, KModel.forward, the decoder/vocoder, or something
-    unexpected like the voice pack being reloaded from disk every call —
-    without having to guess at kokoro's internal method names in advance
-    (they aren't part of its public API and vary across versions).
-    TEMPORARY diagnostic per request: used by the startup repeat-call test
-    below, and per-request when TTS_DEEP_PROFILE=1. cProfile adds real
-    per-Python-call-boundary overhead, so it's opt-in for live traffic
-    (see _TTS_DEEP_PROFILE) rather than always-on like the cheap timing in
-    _synthesize_kokoro()."""
-    profiler = cProfile.Profile()
     with _kokoro_lock:
         pipe = _get_pipe()
-        profiler.enable()
         chunks = [audio for _, _, audio in pipe(text, voice=TTS_VOICE, speed=TTS_SPEED)]
-        profiler.disable()
-    stream = io.StringIO()
-    pstats.Stats(profiler, stream=stream).sort_stats("cumulative").print_stats(15)
-    logger.info("[TTS-PROFILE] deep breakdown (%d chars) '%s':\n%s",
-                len(text), text[:40], stream.getvalue())
     if not chunks:
         return b""
     audio = _trim_silence(np.concatenate(chunks), 24000)
     buf = io.BytesIO()
     sf.write(buf, audio, 24000, format="WAV")
     return buf.getvalue()
-
-
-# Opt-in per-request deep profiling (see _synthesize_kokoro_profiled above).
-# Off by default — this is for turning on temporarily against live traffic
-# if the startup repeat-call test below isn't enough to reproduce the
-# pattern seen in production.
-_TTS_DEEP_PROFILE = os.getenv("TTS_DEEP_PROFILE", "0") == "1"
 
 
 def _synthesize_melo(text: str) -> bytes:
@@ -342,6 +216,48 @@ def _synthesize_melo(text: str) -> bytes:
                 pass
 
 
+# ── Text normalisation for speech ────────────────────────────────────────
+# Most of the "robotic" feel on campus answers is the engine mis-reading things like
+# "RNSIT", "CSE", "Rs. 1,20,000", "B.E." or markdown bullets. Fix them before synthesis.
+_ACRONYMS = {
+    "RNSIT": "R N S I T", "RNS": "R N S", "CSE": "C S E", "ISE": "I S E", "ECE": "E C E",
+    "EEE": "E E E", "AIML": "A I M L", "AI": "A I", "ML": "M L", "MBA": "M B A", "USN": "U S N",
+    "SGPA": "S G P A", "CGPA": "C G P A", "CIE": "C I E", "HOD": "H O D", "VTU": "V T U",
+    "AICTE": "A I C T E", "NAAC": "N A A C", "NBA": "N B A", "KCET": "K C E T",
+    "COMEDK": "COMED K", "JEE": "J E E", "PGCET": "P G C E T", "CTC": "C T C",
+    "UG": "U G", "PG": "P G", "FAQ": "F A Q", "ID": "I D",
+}
+_ACR_RE = re.compile(r"\b(" + "|".join(sorted(map(re.escape, _ACRONYMS), key=len, reverse=True)) + r")\b")
+_EMOJI_RE = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200d]")
+
+
+def speech_prep(text: str) -> str:
+    t = text
+    t = re.sub(r"https?://\S+|www\.\S+", "the website", t)
+    t = _EMOJI_RE.sub("", t)
+    t = re.sub(r"[*_`#>]+", "", t)                       # markdown
+    t = re.sub(r"^\s*[-•·]\s+", "", t, flags=re.M)       # bullets
+    t = t.replace("\n", ". ")
+    t = re.sub(r"(?<=\d),(?=\d)", "", t)                 # 1,20,000 -> 120000
+    t = re.sub(r"(?:₹|Rs\.?|INR)\s?([\d.]+)\s*(lakhs?|crores?|L|Cr)?\b",
+               lambda m: f"{m.group(1)} {({'l':'lakh','cr':'crore'}.get((m.group(2) or '').lower(), (m.group(2) or '')))} rupees".replace("  ", " "), t)
+    t = t.replace("%", " percent").replace("&", " and ")
+    t = re.sub(r"\b(\d+)\s*[-–]\s*(\d+)\b", r"\1 to \2", t)   # 4-5 -> 4 to 5
+    for a, b in (("Dr.", "Doctor"), ("Prof.", "Professor"), ("Mr.", "Mister"),
+                 ("e.g.", "for example"), ("i.e.", "that is"), ("etc.", "et cetera"),
+                 ("B.E.", "B E"), ("B.Tech", "B Tech"), ("M.Tech", "M Tech"), ("Ph.D", "P H D")):
+        t = t.replace(a, b)
+    t = re.sub(r"\b(lakhs?|crores?)\s+LPA\b", r"\1 per annum", t, flags=re.I)
+    t = re.sub(r"\b(\d+(?:\.\d+)?)\s*LPA\b", r"\1 lakhs per annum", t)
+    t = _ACR_RE.sub(lambda m: _ACRONYMS[m.group(1)], t)
+    t = re.sub(r"\s*\(([^)]*)\)", r", \1,", t)            # parentheses -> natural aside
+    t = re.sub(r"(?<=[A-Za-z])/(?=[A-Za-z])", ", ", t)
+    t = re.sub(r"\s{2,}", " ", t)
+    t = re.sub(r"\s+([,.!?])", r"\1", t)
+    t = re.sub(r",\s*([.!?])", r"\1", t)
+    return t.strip(" ,")
+
+
 def text_to_speech(text: str, language: str = "en") -> bytes:
     """Text -> WAV bytes. Empty bytes = frontend fallback (browser TTS)."""
     if not text or not text.strip():
@@ -351,6 +267,9 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
                 .replace("\u2019", "'").replace("\u2018", "'")
                 .replace("\u201c", '"').replace("\u201d", '"')
                 .replace("\u2026", ", "))
+    text = speech_prep(text)
+    if not text:
+        return b""
 
     voice_tag = MELO_SPEAKER if TTS_ENGINE == "melotts" else TTS_VOICE
     key = (text.strip(), TTS_ENGINE, voice_tag, TTS_SPEED)
@@ -367,7 +286,10 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
     def _run(eng):
         if eng == "melotts":
             return _synthesize_melo(text)
-        return _synthesize_kokoro_profiled(text) if _TTS_DEEP_PROFILE else _synthesize_kokoro(text)
+        # Kokoro must always run on the warmed dedicated thread (see TTS_EXECUTOR).
+        if threading.current_thread().name.startswith("tts-worker"):
+            return _synthesize_kokoro(text)
+        return TTS_EXECUTOR.submit(_synthesize_kokoro, text).result()
 
     t0 = time.monotonic()
     try:
@@ -377,7 +299,7 @@ def text_to_speech(text: str, language: str = "en") -> bytes:
                     f"({engine}, {len(text)} chars): '{text[:40]}'")
     except Exception as e:
         print(f"[TTS] {engine} failed: {e} — trying the other engine")
-        other = "kokoro" if engine == "melotts" else "melotts"
+        other = "melotts" if engine == "kokoro" and MELO_AVAILABLE else "kokoro"
         other_ok = MELO_AVAILABLE if other == "melotts" else KOKORO_AVAILABLE
         wav = b""
         if other_ok:
@@ -419,6 +341,8 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
                  f"directions around campus. How may I assist you today?"),
                 "Sure, let me check that for you.",
                 "Good question - one moment.",
+                "Good question — one moment.",
+                "Good question, one moment.",
                 "Let me look that up for you.",
                 "Of course, just a second.",
                 "Right, let me find that.",
@@ -436,6 +360,16 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
                 "I want to make sure I get your name right. Could you say it once more?",
                 "Sorry, I missed that letter. Could you repeat it?",
                 "How can I help you?",
+                # Exact static strings the kiosk frontend speaks (single chunk each = instant)
+                "Could you please spell your name?",
+                "Please spell your name, like A L A N K R I T A. Or say Guest to continue.",
+                "That's okay. We can continue as Guest. How can I help you?",
+                "No problem. Let's try that again. Please spell your name for me.",
+                "Sorry, I missed that. Could you please spell your name, like A L A N K R I T A?",
+                "Continuing as Guest! How may I assist you today?",
+                "Are you there?",
+                "Great! Glad you're still here.",
+                "Sure! What should I change your name to?",
             ]
             for p in _PREWARM:
                 try:
@@ -443,42 +377,6 @@ if KOKORO_AVAILABLE or MELO_AVAILABLE:
                 except Exception:
                     pass
             print(f"[TTS] {TTS_ENGINE} warmed up and pre-cached {len(_PREWARM)} phrases.")
-
-            # ── Repeat-call diagnostic ────────────────────────────────────
-            # Same text synthesized twice back to back, BOTH after the
-            # warmup above (so neither run pays cold-start cost) — this is
-            # what tells apart "the multi-second cost is a one-time
-            # per-process expense" (run2 much faster than run1) from
-            # "it's genuinely paid on every call" (run1 ≈ run2, meaning the
-            # cost is real inference work, not warmup). Also dumps a
-            # cProfile breakdown of each run and the runtime config
-            # (device/dtype/threads) once, so the exact expensive function
-            # is visible rather than inferred. Uses a fixed sentence in the
-            # same length range (~70 chars) as the slow calls actually
-            # observed in production logs.
-            if KOKORO_AVAILABLE and TTS_ENGINE == "kokoro":
-                try:
-                    _log_runtime_diagnostics(_get_pipe())
-                    _repeat_text = ("The college working hours are 9:20 AM "
-                                     "to 5:00 PM on all working days.")
-                    t_r1 = time.monotonic()
-                    _synthesize_kokoro_profiled(_repeat_text)
-                    d_r1 = (time.monotonic() - t_r1) * 1000
-                    t_r2 = time.monotonic()
-                    _synthesize_kokoro_profiled(_repeat_text)
-                    d_r2 = (time.monotonic() - t_r2) * 1000
-                    verdict = ("run1 much slower than run2 -> looks like residual "
-                               "cold-start/warmup cost, not steady-state inference"
-                               if d_r1 > d_r2 * 1.5 else
-                               "run1 ~= run2 -> cost is paid on every call; this is "
-                               "genuine per-call inference cost, not a warmup gap")
-                    logger.info(
-                        "[TTS-PROFILE] repeat-call test (%d chars): run1=%.0fms "
-                        "run2=%.0fms delta=%.0fms -> %s",
-                        len(_repeat_text), d_r1, d_r2, d_r1 - d_r2, verdict,
-                    )
-                except Exception as e:
-                    logger.warning("[TTS-PROFILE] repeat-call test failed: %s", e)
         except Exception as e:
             print(f"[TTS] Warmup failed: {e}")
         finally:
