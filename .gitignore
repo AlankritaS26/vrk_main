@@ -20,6 +20,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/rag_calibration.csv
 
 # Data and generated assets
 faces/

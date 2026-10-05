@@ -1,4 +1,4 @@
-﻿# VRK — Voice Receptionist Kiosk (Nova)
+# VRK — Voice Receptionist Kiosk (Nova)
 
 An AI-powered digital receptionist kiosk for **RNS Institute of Technology**. Visitors walk up, are recognized (or greeted and registered) by camera, and engage in natural, synchronized voice conversations — built on a self-hosted, high-performance, cost-effective stack.
 
@@ -519,6 +519,65 @@ The following targeted fixes were applied without redesigning the UI or removing
 6. **Timeout Auto-Revert Test**:
    - Trigger an escalation and do not accept it on the staff dashboard.
    - After 60 seconds, the kiosk displays: *"⏳ Staff Currently Occupied — Nova will continue helping you"* and automatically reverts to bot mode.
+
+---
+
+## 📦 QR Companion — Required Dependencies & Setup
+
+### Backend Python Packages (in `backend/requirements.txt`)
+
+The QR Companion feature requires these packages installed in the Python virtual environment:
+
+| Package | Version | Purpose |
+|---|---|---|
+| `qrcode[pil]` | `==8.0` | Server-side QR code image generation (PNG) |
+| `Pillow` | `>=10.0.0` | Image processing library required by `qrcode[pil]` |
+| `reportlab` | `==4.4.1` | Dynamic PDF brochure generation |
+
+> **These are already listed in [`backend/requirements.txt`](file:///c:/Users/Akshatha%20A/vrk_main/backend/requirements.txt).** No separate install is needed — just run:
+> ```powershell
+> venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+> ```
+
+### Frontend (React) — No Extra npm Package Needed
+
+The kiosk frontend does **NOT** use a client-side QR library (like `qrcode.react`). Instead, it loads the QR code as a **PNG image from the backend API**:
+```
+GET /companion/qr/{token}  →  returns PNG image
+```
+The React `WelcomeScreen.js` simply renders an `<img>` tag pointing to this backend endpoint. No npm install required for QR.
+
+### ⚠️ QR Code Not Generating? — Common Causes & Fixes
+
+If the QR code is **not appearing on another laptop**, check these causes:
+
+| # | Cause | Symptom | Fix |
+|---|---|---|---|
+| 1 | **`qrcode` package not installed** | Backend logs: `ModuleNotFoundError: No module named 'qrcode'` | Run: `venv\Scripts\python.exe -m pip install -r backend\requirements.txt` |
+| 2 | **`Pillow` not installed** | Backend logs: `ModuleNotFoundError: No module named 'PIL'` | Run: `venv\Scripts\python.exe -m pip install Pillow>=10.0.0` |
+| 3 | **venv copied instead of rebuilt** | Import errors or wrong Python version | **Delete** the `venv/` folder and rebuild: `py -3.12 -m venv venv` then reinstall requirements |
+| 4 | **Backend not running on port 8001** | QR image shows broken icon (404) | Start backend: `venv\Scripts\python.exe run.py` and verify `http://127.0.0.1:8001/health` returns OK |
+| 5 | **Session not started (no token)** | QR card not visible on kiosk screen | QR only appears after a session starts (face detected). Stand in front of camera to trigger session |
+| 6 | **`COMPANION_BASE_URL` points to wrong IP** | QR generates but scanned link doesn't open on phone | Set `COMPANION_BASE_URL=http://<your-LAN-IP>:8001` in `.env`, or let the backend auto-detect LAN IP |
+| 7 | **Firewall blocking port 8001** | Phone can't reach the companion page after scanning | Open port 8001 in Windows Firewall for inbound TCP connections |
+| 8 | **Phone and laptop not on same Wi-Fi** | Phone shows "site can't be reached" after scanning QR | Ensure both devices are on the same local network (LAN/Wi-Fi) |
+| 9 | **Redis / Memurai not running** | Token creation fails silently | Start Redis/Memurai, or check backend logs for Redis connection errors |
+
+### Quick Diagnostic Steps (on the new laptop)
+
+```powershell
+# 1. Verify qrcode is installed in the venv
+venv\Scripts\python.exe -c "import qrcode; print('qrcode OK, version:', qrcode.__version__)"
+
+# 2. Verify Pillow is installed
+venv\Scripts\python.exe -c "from PIL import Image; print('Pillow OK')"
+
+# 3. Test QR generation directly
+venv\Scripts\python.exe -c "import qrcode; img = qrcode.make('https://test.com'); img.save('test_qr.png'); print('QR saved to test_qr.png')"
+
+# 4. Check backend health
+curl http://127.0.0.1:8001/health
+```
 
 ---
 
