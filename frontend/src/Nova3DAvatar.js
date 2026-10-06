@@ -536,9 +536,9 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
       )}
 
       {loading && !loadError && (
-        <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', zIndex: 3, background: 'radial-gradient(circle, rgba(255,255,255,0.7) 0%, rgba(240,244,255,0.3) 100%)', backdropFilter: 'blur(4px)', borderRadius: '24px' }}>
-          <div style={{ width: '42px', height: '42px', border: '3.5px solid rgba(26,35,126,0.15)', borderTopColor: '#1a237e', borderRadius: '50%', animation: 'spin3d 0.8s linear infinite' }} />
-          <span style={{ fontSize: '13px', fontWeight: '700', color: '#1a237e', letterSpacing: '0.4px' }}>Loading Nova…</span>
+        <div style={{ position: 'absolute', inset: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', zIndex: 3, background: 'radial-gradient(circle, rgba(22,75,114,0.78) 0%, rgba(7,19,50,0.72) 100%)', backdropFilter: 'blur(4px)', borderRadius: '24px' }}>
+          <div style={{ width: '42px', height: '42px', border: '3.5px solid rgba(125,211,252,0.22)', borderTopColor: '#38bdf8', borderRadius: '50%', animation: 'spin3d 0.8s linear infinite' }} />
+          <span style={{ fontSize: '13px', fontWeight: '700', color: '#e0f2fe', letterSpacing: '0.4px' }}>Loading Nova…</span>
           <style>{`@keyframes spin3d { to { transform: rotate(360deg); } }`}</style>
         </div>
       )}

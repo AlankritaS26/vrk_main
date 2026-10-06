@@ -2000,11 +2000,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   /* background tint per state */
   const charBg = {
-    ready: 'linear-gradient(175deg, #dde4ff 0%, #c8d4fc 100%)',
-    listening: 'linear-gradient(175deg, #d8f5dc 0%, #b8eec0 100%)',
-    processing: 'linear-gradient(175deg, #ede4ff 0%, #d8caff 100%)',
-    speaking: 'linear-gradient(175deg, #fff0dd 0%, #ffd8a8 100%)',
-  }[status] || 'linear-gradient(175deg, #dde4ff 0%, #c8d4fc 100%)';
+    ready: 'linear-gradient(155deg, #071332 0%, #10245b 52%, #164b72 100%)',
+    listening: 'linear-gradient(155deg, #071f38 0%, #0d4d55 52%, #176d69 100%)',
+    processing: 'linear-gradient(155deg, #120d3a 0%, #28216d 52%, #214b86 100%)',
+    speaking: 'linear-gradient(155deg, #1a123b 0%, #38216b 52%, #185a79 100%)',
+  }[status] || 'linear-gradient(155deg, #071332 0%, #10245b 52%, #164b72 100%)';
 
   const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
@@ -2121,7 +2121,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           <div style={{
             position: 'absolute', bottom: '60px', left: '50%', transform: 'translateX(-50%)',
             width: '320px', height: '320px', borderRadius: '50%',
-            background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
+            background: 'rgba(56,189,248,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
           }} />
 
           {/* ── happy-moment sparkle burst: first-time-visitor greeting only ── */}
@@ -2177,8 +2177,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
             zIndex: 1, marginTop: '8px'
           }}>
-            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Nova</div>
-            <div style={{ fontSize: '12px', color: '#5c6bc0', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+            <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Hi, I&apos;m Nova</div>
+            <div style={{ fontSize: '12px', color: 'rgba(219,234,254,0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
             <div style={{
               padding: '5px 18px', borderRadius: '20px', background: statusBg,
               color: statusColor, fontSize: '13px', fontWeight: '700',
@@ -2192,9 +2192,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           {status === 'ready' && messages.length === 0 && (
             <div style={{
               marginTop: '14px', padding: '8px 20px', borderRadius: '20px',
-              background: 'rgba(255,255,255,0.65)', backdropFilter: 'blur(8px)',
-              border: '1px solid rgba(255,255,255,0.8)', fontSize: '12px',
-              color: '#5c6bc0', fontStyle: 'italic', textAlign: 'center',
+              background: 'rgba(6,18,54,0.52)', backdropFilter: 'blur(8px)',
+              border: '1px solid rgba(125,211,252,0.32)', fontSize: '12px',
+              color: 'rgba(224,242,254,0.88)', fontStyle: 'italic', textAlign: 'center',
               maxWidth: '280px', zIndex: 1
             }}>
               {hints[hintIndex]}

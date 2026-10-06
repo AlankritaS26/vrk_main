@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
+import IdlePhotoBackground from './BackgroundVideo';
 
 /**
  * IdleScreen — two stacked layers:
@@ -219,7 +220,7 @@ export default function IdleScreen({ detState, identity, bbox, videoDims, camErr
           ══════════════════════════════════════════════════════════ */}
       <div style={{
         position: 'absolute', inset: 0, zIndex: 20,
-        background: '#ffffff',
+        background: 'transparent',
         opacity: faceDetected ? 0 : 1,
         pointerEvents: faceDetected ? 'none' : 'auto',
         transition: 'opacity 0.65s cubic-bezier(0.4, 0, 0.2, 1)',
@@ -227,15 +228,17 @@ export default function IdleScreen({ detState, identity, bbox, videoDims, camErr
         overflow: 'hidden', userSelect: 'none',
       }}>
 
+        {/* ── College campus video — idle only ── */}
+        <IdlePhotoBackground />
+
         {/* CSS keyframes (scoped names to avoid clashing with base) */}
         <style>{`
-          @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
           @keyframes ovShimmer   { 0%{background-position:-200% center} 100%{background-position:200% center} }
           @keyframes ovSlideUp   { from{opacity:0;transform:translateY(22px)} to{opacity:1;transform:translateY(0)} }
           @keyframes ovFadeSlide { from{opacity:0;transform:translateX(16px)} to{opacity:1;transform:translateX(0)} }
           @keyframes ovRingPulse { 0%{transform:scale(0.9);opacity:0.5} 50%{transform:scale(1.12);opacity:0.15} 100%{transform:scale(0.9);opacity:0.5} }
           @keyframes ovTicker    { 0%{transform:translateX(0%)} 100%{transform:translateX(-50%)} }
-          @keyframes ovBreathe   { 0%,100%{opacity:0.7} 50%{opacity:1} }
+          @keyframes ovBreathe   { 0%,100%{opacity:0.8} 50%{opacity:1} }
           @keyframes ovFloat     { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-8px)} }
           @keyframes drift       { 0%,100%{transform:translate(0,0)} 50%{transform:translate(46px,30px)} }
           @keyframes gentleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-9px)} }
@@ -249,67 +252,60 @@ export default function IdleScreen({ detState, identity, bbox, videoDims, camErr
           .ov-ticker  { display:inline-flex; gap:80px; animation:ovTicker 32s linear infinite; white-space:nowrap; }
         `}</style>
 
-        {/* Light glow blobs */}
-        <div style={{ position:'absolute', inset:0, overflow:'hidden', pointerEvents:'none' }}>
-          <div style={{ position:'absolute', top:'-90px', left:'-90px', width:'440px', height:'440px', borderRadius:'50%', background:'radial-gradient(circle, rgba(26,35,126,0.06) 0%, transparent 65%)', filter:'blur(28px)' }} />
-          <div style={{ position:'absolute', bottom:'-70px', right:'-70px', width:'380px', height:'380px', borderRadius:'50%', background:'radial-gradient(circle, rgba(27,94,32,0.05) 0%, transparent 65%)', filter:'blur(28px)' }} />
-          {/* Grid */}
-          <div style={{ position:'absolute', inset:0, backgroundImage:'linear-gradient(rgba(26,35,126,0.025) 1px, transparent 1px), linear-gradient(90deg, rgba(26,35,126,0.025) 1px, transparent 1px)', backgroundSize:'60px 60px' }} />
-          {/* Orbs */}
-          {orbs.map((o,i) => (
-            <div key={i} style={{ position:'absolute', left:`${o.x}%`, top:`${o.y}%`, width:`${o.size}px`, height:`${o.size}px`, borderRadius:'50%', background:o.color, opacity:0.06, filter:'blur(3px)', transform:'translate(-50%,-50%)' }} />
-          ))}
+        {/* Subtle grid overlay on top of video */}
+        <div style={{ position:'absolute', inset:0, overflow:'hidden', pointerEvents:'none', zIndex:1 }}>
+          <div style={{ position:'absolute', inset:0, backgroundImage:'linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px)', backgroundSize:'60px 60px' }} />
         </div>
 
         {/* Top bar */}
-        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'14px 32px 12px', borderBottom:'1px solid #e8eaf6', position:'relative', zIndex:10 }}>
-          <div style={{ display:'inline-flex', alignItems:'center', gap:'8px', background:'#eff3ff', border:'1px solid #c5cae9', borderRadius:'999px', padding:'5px 14px' }}>
-            <div className="ov-ring1" style={{ width:'7px', height:'7px', borderRadius:'50%', background:'#43a047', boxShadow:'0 0 0 3px rgba(67,160,71,0.2)' }} />
-            <span style={{ fontSize:'11.5px', fontWeight:600, color:'#1a237e', letterSpacing:'0.5px' }}>RNSIT Digital Receptionist</span>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'16px 36px 14px', borderBottom:'1px solid rgba(255,255,255,0.22)', position:'relative', zIndex:10, background:'transparent' }}>
+          <div style={{ display:'inline-flex', alignItems:'center', gap:'8px', background:'rgba(255,255,255,0.16)', border:'1px solid rgba(255,255,255,0.32)', borderRadius:'999px', padding:'6px 16px', boxShadow:'0 8px 24px rgba(2,8,30,0.12)' }}>
+            <div className="ov-ring1" style={{ width:'8px', height:'8px', borderRadius:'50%', background:'#86efac', boxShadow:'0 0 0 3px rgba(134,239,172,0.25)' }} />
+            <span style={{ fontSize:'12px', fontWeight:700, color:'#ffffff', letterSpacing:'0.6px', textShadow:'0 1px 8px rgba(0,0,0,0.3)' }}>RNSIT Digital Receptionist</span>
           </div>
           <div style={{ textAlign:'right' }}>
-            <div style={{ fontSize:'26px', fontWeight:800, color:'#1a237e', letterSpacing:'-0.5px', lineHeight:1 }}>{timeStr}</div>
-            <div style={{ fontSize:'11px', color:'#9e9e9e', marginTop:'2px' }}>{dateStr}</div>
+            <div style={{ fontSize:'28px', fontWeight:800, color:'#ffffff', letterSpacing:'-0.5px', lineHeight:1, textShadow:'0 2px 12px rgba(0,0,0,0.38)' }}>{timeStr}</div>
+            <div style={{ fontSize:'11px', color:'rgba(255,255,255,0.78)', marginTop:'3px', letterSpacing:'0.3px', textShadow:'0 1px 6px rgba(0,0,0,0.3)' }}>{dateStr}</div>
           </div>
         </div>
 
         {/* Main content */}
         <div style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', padding:'24px 40px 16px', position:'relative', zIndex:5, gap:'26px' }}>
 
-          {/* Hero card */}
-          <div className="ov-card" style={{ background:'#ffffff', border:'1.5px solid #e8eaf6', borderRadius:'24px', padding:'30px 44px', minWidth:'540px', maxWidth:'680px', boxShadow:'0 8px 40px rgba(26,35,126,0.09), 0 2px 8px rgba(0,0,0,0.04)', display:'flex', flexDirection:'column', alignItems:'center', gap:'20px', opacity:mounted?1:0, transition:'opacity 0.5s ease' }}>
+          {/* Hero card — glassmorphism on video */}
+          <div className="ov-card" style={{ background:'transparent', backdropFilter:'blur(3px)', WebkitBackdropFilter:'blur(3px)', border:'1px solid rgba(255,255,255,0.18)', borderRadius:'24px', padding:'30px 44px', minWidth:'540px', maxWidth:'680px', boxShadow:'0 16px 36px rgba(2,8,30,0.08)', display:'flex', flexDirection:'column', alignItems:'center', gap:'20px', opacity:mounted?1:0, transition:'opacity 0.5s ease' }}>
 
-            {/* Logo + shimmer title */}
+            {/* Logo + title */}
             <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'10px' }}>
               <div className="ov-logo">
                 <img src="/rnslogo.png" alt="RNSIT"
                   onError={e => { e.currentTarget.style.display='none'; }}
-                  style={{ height:'76px', objectFit:'contain', display:'block', filter:'drop-shadow(0 6px 16px rgba(26,35,126,0.14))' }} />
+                  style={{ height:'80px', objectFit:'contain', display:'block', filter:'drop-shadow(0 4px 18px rgba(0,0,0,0.5)) brightness(1.08)' }} />
               </div>
               <div style={{ textAlign:'center' }}>
-                <div style={{ fontSize:'26px', fontWeight:900, lineHeight:1.2, background:'linear-gradient(90deg,#1a237e,#1565c0,#283593,#1a237e)', backgroundSize:'300% 100%', WebkitBackgroundClip:'text', WebkitTextFillColor:'transparent', animation:'ovShimmer 4s linear infinite' }}>
+                <div style={{ fontSize:'26px', fontWeight:900, lineHeight:1.2, color:'#ffffff', textShadow:'0 2px 10px rgba(0,0,0,0.48)' }}>
                   RNS Institute of Technology
                 </div>
-                <div style={{ fontSize:'11px', color:'#9e9e9e', letterSpacing:'3px', textTransform:'uppercase', marginTop:'4px' }}>
+                <div style={{ fontSize:'11px', color:'rgba(255,255,255,0.78)', letterSpacing:'3px', textTransform:'uppercase', marginTop:'5px', textShadow:'0 1px 7px rgba(0,0,0,0.35)' }}>
                   Autonomous Institution · Bengaluru
                 </div>
               </div>
             </div>
 
             {/* Rotating highlight */}
-            <div className="ov-slide" key={ovSlide} style={{ width:'100%', background:h.bg, border:`1.5px solid ${h.accent}22`, borderRadius:'14px', padding:'16px 20px', display:'flex', alignItems:'center', gap:'14px' }}>
+            <div className="ov-slide" key={ovSlide} style={{ width:'100%', background:'transparent', border:'1px solid rgba(255,255,255,0.34)', borderRadius:'14px', padding:'16px 20px', display:'flex', alignItems:'center', gap:'14px', boxShadow:'0 8px 20px rgba(2,8,30,0.10)' }}>
               <div style={{ fontSize:'32px', lineHeight:1 }}>{h.icon}</div>
               <div>
-                <div style={{ fontSize:'16px', fontWeight:800, color:h.accent, marginBottom:'2px' }}>{h.headline}</div>
-                <div style={{ fontSize:'12.5px', color:'#616161', fontWeight:500 }}>{h.sub}</div>
+                <div style={{ fontSize:'16px', fontWeight:800, color:'#ffffff', marginBottom:'2px', textShadow:'0 2px 8px rgba(0,0,0,0.32)' }}>{h.headline}</div>
+                <div style={{ fontSize:'12.5px', color:'rgba(255,255,255,0.78)', fontWeight:500, textShadow:'0 1px 6px rgba(0,0,0,0.3)' }}>{h.sub}</div>
               </div>
-              <div style={{ marginLeft:'auto', width:'8px', height:'8px', borderRadius:'50%', background:h.accent, boxShadow:`0 0 10px ${h.accent}66`, flexShrink:0 }} />
+              <div style={{ marginLeft:'auto', width:'9px', height:'9px', borderRadius:'50%', background:'#0284c7', boxShadow:'0 0 12px #38bdf8aa', flexShrink:0 }} />
             </div>
 
             {/* Dots */}
             <div style={{ display:'flex', gap:'6px', alignItems:'center' }}>
-              {highlights.map((hl,i) => (
-                <div key={i} style={{ width:i===ovDot?'20px':'6px', height:'6px', borderRadius:'3px', background:i===ovDot?hl.accent:'#e0e0e0', transition:'all 0.4s ease' }} />
+              {highlights.map((_,i) => (
+                <div key={i} style={{ width:i===ovDot?'20px':'6px', height:'6px', borderRadius:'3px', background:i===ovDot?'#38bdf8':'rgba(255,255,255,0.3)', transition:'all 0.4s ease' }} />
               ))}
             </div>
           </div>
@@ -317,17 +313,17 @@ export default function IdleScreen({ detState, identity, bbox, videoDims, camErr
           {/* Approach CTA */}
           <div style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'12px', opacity:mounted?1:0, transition:'opacity 0.8s ease 0.3s' }}>
             <div style={{ position:'relative', display:'flex', alignItems:'center', justifyContent:'center' }}>
-              <div className="ov-ring1" style={{ position:'absolute', width:'76px', height:'76px', borderRadius:'50%', border:'2px solid rgba(26,35,126,0.18)' }} />
-              <div className="ov-ring2" style={{ position:'absolute', width:'56px', height:'56px', borderRadius:'50%', border:'2px solid rgba(26,35,126,0.1)' }} />
-              <div style={{ width:'42px', height:'42px', borderRadius:'50%', background:'linear-gradient(135deg, #1a237e, #1565c0)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:'19px', boxShadow:'0 4px 16px rgba(26,35,126,0.28)' }}>
+              <div className="ov-ring1" style={{ position:'absolute', width:'76px', height:'76px', borderRadius:'50%', border:'2px solid rgba(56,189,248,0.35)' }} />
+              <div className="ov-ring2" style={{ position:'absolute', width:'56px', height:'56px', borderRadius:'50%', border:'2px solid rgba(56,189,248,0.2)' }} />
+              <div style={{ width:'42px', height:'42px', borderRadius:'50%', background:'linear-gradient(135deg, #1d4ed8, #38bdf8)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:'19px', boxShadow:'0 4px 20px rgba(56,189,248,0.5)' }}>
                 🧑
               </div>
             </div>
             <div style={{ textAlign:'center' }}>
-              <div style={{ fontSize:'19px', fontWeight:800, color:'#1a237e', letterSpacing:'0.2px', animation:'ovBreathe 3s ease-in-out infinite' }}>
+              <div style={{ fontSize:'20px', fontWeight:800, color:'#ffffff', letterSpacing:'0.2px', textShadow:'0 2px 12px rgba(0,0,0,0.45)', animation:'ovBreathe 3s ease-in-out infinite' }}>
                 Walk up to begin
               </div>
-              <div style={{ fontSize:'12.5px', color:'#9e9e9e', marginTop:'3px', fontWeight:500 }}>
+              <div style={{ fontSize:'13px', color:'rgba(255,255,255,0.78)', marginTop:'4px', fontWeight:500, textShadow:'0 1px 7px rgba(0,0,0,0.35)' }}>
                 Your AI campus guide is ready
               </div>
             </div>
@@ -335,18 +331,18 @@ export default function IdleScreen({ detState, identity, bbox, videoDims, camErr
         </div>
 
         {/* Scrolling ticker */}
-        <div style={{ background:'#f5f5f5', borderTop:'1px solid #e0e0e0', padding:'9px 0', overflow:'hidden', position:'relative', zIndex:10 }}>
+        <div style={{ background:'transparent', backdropFilter:'blur(8px)', borderTop:'1px solid rgba(255,255,255,0.20)', padding:'9px 0', overflow:'hidden', position:'relative', zIndex:10 }}>
           <div className="ov-ticker">
             {[...tickers, ...tickers].map((t,i) => (
-              <span key={i} style={{ fontSize:'12px', fontWeight:600, color:'#757575', letterSpacing:'0.3px' }}>{t}</span>
+              <span key={i} style={{ fontSize:'12px', fontWeight:600, color:'rgba(255,255,255,0.82)', letterSpacing:'0.4px', textShadow:'0 1px 6px rgba(0,0,0,0.32)' }}>{t}</span>
             ))}
           </div>
         </div>
 
         {/* Footer */}
-        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'9px 32px', background:'#1a237e', position:'relative', zIndex:10 }}>
-          <span style={{ fontSize:'11px', color:'rgba(255,255,255,0.75)', fontWeight:500 }}>Nova · AI Campus Receptionist</span>
-          <span style={{ fontSize:'11px', color:'rgba(255,255,255,0.75)', fontWeight:500 }}>Dr. Vishnuvardhan Road, Channasandra · Bengaluru 560 098</span>
+        <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'9px 32px', background:'transparent', backdropFilter:'blur(8px)', position:'relative', zIndex:10, borderTop:'1px solid rgba(255,255,255,0.20)' }}>
+          <span style={{ fontSize:'11px', color:'rgba(255,255,255,0.80)', fontWeight:500 }}>Nova · AI Campus Receptionist</span>
+          <span style={{ fontSize:'11px', color:'rgba(255,255,255,0.80)', fontWeight:500 }}>Dr. Vishnuvardhan Road, Channasandra · Bengaluru 560 098</span>
         </div>
       </div>
     </div>
