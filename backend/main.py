@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (from repository root):
@@ -551,12 +551,36 @@ def _strip_trailing_closing_phrase(question: str) -> str:
     return " ".join(parts).strip()
 
 
+def _is_meaningful_conversation(txt: str) -> bool:
+    """True if `txt` is a substantive user query rather than a greeting,
+    filler, farewell, name command, or emotional re-engagement reply."""
+    if not txt or not txt.strip():
+        return False
+    clean = txt.strip()
+    if len(clean.split()) < 2:
+        return False
+    q_norm = normalize_query(clean)
+    if _is_closing_only(clean) or _is_closing_only(q_norm):
+        return False
+    if _matches_short_phrase(q_norm, GREETING_PHRASES):
+        return False
+    if _is_farewell(q_norm):
+        return False
+    if _detect_name_change(q_norm):
+        return False
+    if is_emotional_reengagement_response(q_norm):
+        return False
+    if any(p in q_norm for p in ("spelling", "spell my name", "spell your name", "what is your name")):
+        return False
+    return True
+
+
 def _derive_topic_fallback(questions: list[str]) -> str | None:
     """Rule-based backstop for when extract_topic_label() returns None.
     Uses meaningful questions to find recognized campus topics/entities.
     Never invents a topic and never returns generic useless phrases."""
     candidates = []
-    for q in reversed(questions or []):
+    for q in (questions or []):
         if not q or not q.strip():
             continue
         candidate = _strip_trailing_closing_phrase(q)
@@ -569,21 +593,45 @@ def _derive_topic_fallback(questions: list[str]) -> str | None:
     if not candidates:
         return None
 
+    found_topics = []
     # Pass 1 — Keyword match against known topics
     for candidate, normalized in candidates:
         for w in normalized.split():
             if w in _TOPIC_FALLBACK_KEYWORDS:
                 label = _TOPIC_FALLBACK_KEYWORDS[w]
-                logger.info("[SESSION] Topic fallback derived from keyword '%s': %s", w, label)
-                return label
+                if label not in found_topics:
+                    found_topics.append(label)
 
     # Pass 2 — Entity mapping check on meaningful candidates
     for candidate, normalized in candidates:
         detected = detect_entity(normalized) or detect_entity(candidate)
         if detected and detected.canonical_name:
             label = detected.canonical_name.lower()
-            logger.info("[SESSION] Topic fallback derived from entity: %s", label)
-            return label
+            if label not in found_topics:
+                found_topics.append(label)
+
+    if found_topics:
+        if len(found_topics) == 1:
+            return found_topics[0]
+        elif len(found_topics) == 2:
+            return f"{found_topics[0]} and {found_topics[1]}"
+        else:
+            return f"{', '.join(found_topics[:-1])}, and {found_topics[-1]}"
+
+    # Pass 3 — Extract key noun words across candidates
+    keywords = []
+    for candidate, normalized in candidates:
+        words = [w for w in normalized.split() if len(w) > 3 and w not in ("what", "where", "how", "why", "tell", "about", "your", "this", "that", "with", "from", "some", "more", "question", "questions")]
+        for w in words:
+            if w not in keywords:
+                keywords.append(w)
+    if keywords:
+        if len(keywords) == 1:
+            return keywords[0]
+        elif len(keywords) == 2:
+            return f"{keywords[0]} and {keywords[1]}"
+        else:
+            return f"{', '.join(keywords[:2])}, and {keywords[2]}"
 
     return None
 
@@ -599,7 +647,7 @@ def classify_emotion(text: str) -> str:
         return "frustrated"
     if any(w in t for w in ("excited", "pumped", "thrilled", "can't wait", "amazing")):
         return "excited"
-    if any(w in t for w in ("happy", "good", "great", "fine", "awesome", "fantastic", "well", "all good", "doing well", "pretty good", "wonderful")):
+    if any(w in t for w in ("happy", "good", "great", "fine", "awesome", "fantastic", "well", "all good", "doing well", "doing good", "pretty good", "wonderful")):
         return "happy"
     if any(w in t for w in ("okay", "alright", "so so", "normal", "same old")):
         return "neutral"
@@ -621,27 +669,35 @@ async def handle_personalized_reengagement(user_reply: str, session: dict) -> tu
     """
     Handles returning visitor's response to 'How are you doing today?':
     1. Understands emotional tone and provides empathetic, natural response.
-    2. Reconnects to previous session using the last up to 5 meaningful questions.
+    2. Reconnects to previous session using topic summary of last up to 5 meaningful questions.
     Uses LLM when available; uses deterministic fallback when LLM is unavailable.
     """
     previous_questions = session.get("previous_questions", []) if session else []
-    derived_topic = _derive_topic_fallback(previous_questions)
+
+    topic_summary = None
+    if previous_questions:
+        try:
+            topic_summary = await extract_topic_label(previous_questions)
+        except Exception as te:
+            logger.warning("[RE-ENGAGEMENT] Topic extraction failed: %s", te)
+    if not topic_summary:
+        topic_summary = _derive_topic_fallback(previous_questions)
 
     questions_block = "\n".join(f"- {q}" for q in previous_questions) if previous_questions else "(none)"
     prompt = (
         "You are Nova, the warm, empathetic AI digital receptionist at RNS Institute of Technology (RNSIT).\n"
         "A returning visitor just replied to your greeting 'How are you doing today?'.\n\n"
         f"Visitor reply: \"{user_reply}\"\n\n"
-        f"Their questions from their previous session (oldest first):\n{questions_block}\n\n"
+        f"Topics discussed in their previous session: \"{topic_summary or 'None'}\"\n"
+        f"Their previous questions (oldest first):\n{questions_block}\n\n"
         "INSTRUCTIONS:\n"
-        "1. Respond to how the visitor is feeling with genuine warmth in 1 short sentence. "
-        "Be empathetic if they feel stressed, tired, or down; be enthusiastic if they feel good or happy; be pleasant if neutral. "
+        "1. Give ONE short natural emotional response (1 sentence) acknowledging how the visitor is feeling with genuine warmth. "
+        "Be empathetic if they feel stressed or tired; enthusiastic if happy or good; pleasant if neutral. "
         "CRITICAL: Never mention emotion detection, classification, or labels (do NOT say 'I detected that you are sad', 'Your emotional state is', etc.).\n"
-        "2. If the previous questions show a clear meaningful topic (such as placements, hostel facilities, admissions, fees, or a department), reconnect to it in 1 short sentence: "
-        "'Last time we were talking about [topic]. Would you like to continue with that?'\n"
-        "If there are no previous questions or no clear topic, simply say: 'How may I assist you today?'\n"
-        "Never say generic useless phrases like 'Previous topic was RNSIT' or 'Let's continue where we left off'. Never invent a topic not present in their questions.\n"
-        "3. Keep the entire response under 3 sentences total."
+        "2. If there are previous topics, add a second sentence reconnecting to them: "
+        "'Last time, we were discussing [topic summary]. Would you like to continue?'\n"
+        "If there are no previous questions or topic, ask: 'How may I assist you today?'\n"
+        "Never invent or hallucinate topics not present in their previous questions. Keep the response to 2 short sentences total."
     )
 
     try:
@@ -652,22 +708,19 @@ async def handle_personalized_reengagement(user_reply: str, session: dict) -> tu
         )
         cleaned = _clean_repetitive_greeting((raw_text or "").strip())
         if cleaned and len(cleaned.split()) >= 4 and not any(bad in cleaned.lower() for bad in ("detected", "classification", "emotional state")):
-            topic = derived_topic
-            if "continue with" in cleaned.lower() and not topic:
-                topic = await extract_topic_label(previous_questions)
-            return cleaned, topic
+            return cleaned, topic_summary
     except Exception as e:
         logger.warning("[RE-ENGAGEMENT] LLM call failed, falling back to deterministic: %s", e)
 
     # Deterministic fallback
     tone = classify_emotion(user_reply)
-    emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Good to know!")
-    if derived_topic:
-        reconnect_sentence = f"Last time we were talking about {derived_topic}. Would you like to continue with that?"
+    emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Glad to hear that!")
+    if topic_summary:
+        reconnect_sentence = f"Last time, we were discussing {topic_summary}. Would you like to continue?"
     else:
         reconnect_sentence = "How may I assist you today?"
 
-    return f"{emotion_sentence} {reconnect_sentence}", derived_topic
+    return f"{emotion_sentence} {reconnect_sentence}", topic_summary
 
 
 # ── Q/A label stripper ────────────────────────────────────────────────────
@@ -1836,12 +1889,12 @@ async def resume_or_create_session(face_id: str, user_name: str,
     previous_questions = []
     if is_user_returning:
         try:
-            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=10)
+            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=25)
             for r in recent:
                 txt = (r.get("input_text") or "").strip()
-                if txt and not _is_closing_only(txt) and len(txt.split()) > 1:
+                if txt and _is_meaningful_conversation(txt):
                     clean_q = _strip_trailing_closing_phrase(txt)
-                    if clean_q and not _is_closing_only(clean_q):
+                    if clean_q and _is_meaningful_conversation(clean_q):
                         previous_questions.append(clean_q)
             previous_questions = previous_questions[-5:]
             logger.info(
@@ -2215,47 +2268,14 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
                 q_normalized,
             )
 
-    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
-    INVALID_NAME_STARTS = (
-        "a student", "student", "a visitor", "visitor", "a parent", "parent",
-        "looking for", "interested in", "here for", "going to", "from",
-        "trying to", "asking", "calling", "an engineering", "ordering",
-    )
-    INVALID_NAME_WORDS = {
-        "all", "right", "alright", "sure", "fine", "cool", "done", "wait", "stop",
-        "cancel", "yeah", "yep", "nope", "got", "good", "morning", "evening",
-        "afternoon", "night", "understood", "talk", "speak", "staff", "human",
-        "person", "student", "university", "bengaluru", "bangalore", "task", "nature",
-    }
-
-    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"^(?:i am|iam|myself)\s+([a-zA-Z\s,.-]+)", q_normalized)
-
-    if name_change_match:
-        test_raw = name_change_match.group(1).strip().lower()
-        if any(test_raw.startswith(prefix) for prefix in INVALID_NAME_STARTS):
-            name_change_match = None
-    if name_change_match:
-        new_name_raw = name_change_match.group(1).strip()
-        if "," in new_name_raw:
-            new_name_raw = new_name_raw.split(",")[0].strip()
-        new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
-        if (
-            new_name_words
-            and len(new_name_words) <= 3
-            and all(w.isalpha() for w in new_name_words)
-            and not any(w.lower() in INVALID_NAME_WORDS for w in new_name_words)
-            and not any(x in new_name_raw.lower() for x in ["blink", "twice", "yes", "no", "eye", "emoji"])
-        ):
-            new_name = " ".join(new_name_words)
-            # Candidate name only — NEVER save or update DB until confirmed with spelling
-            if active_session:
-                active_session["candidate_name"] = new_name
-            answer = f"Thanks, {new_name}. Could you spell your name for me, one letter at a time?"
-            logger.info("[ROUTE] NAME_CHANGE_CANDIDATE (unconfirmed) — candidate='%s', prompting spelling", new_name)
-            return answer, "name_change_ask_spelling", "CONTINUE"
+    # ─── Explicit NAME_CHANGE intent — uses _detect_name_change ────────────────
+    new_name = _detect_name_change(q_normalized)
+    if new_name:
+        if active_session:
+            active_session["candidate_name"] = new_name
+        answer = f"Thanks, {new_name}. Could you spell your name for me, one letter at a time?"
+        logger.info("[ROUTE] NAME_CHANGE_CANDIDATE (unconfirmed) — candidate='%s', prompting spelling", new_name)
+        return answer, "name_change_ask_spelling", "CONTINUE"
 
     if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
        re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
