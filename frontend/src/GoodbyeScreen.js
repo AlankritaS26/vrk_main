@@ -1,4 +1,5 @@
 import React, { useEffect, useRef } from 'react';
+import IdlePhotoBackground from './BackgroundVideo';
 
 const BACKEND = process.env.REACT_APP_BACKEND_URL || 'http://127.0.0.1:8001';
 
@@ -54,65 +55,69 @@ export default function GoodbyeScreen({ session, farewell }) {
 
   return (
     <div style={{
-      minHeight: '100vh', background: '#f5f6fa',
+      minHeight: '100vh', background: 'transparent', position: 'relative',
       fontFamily: "'Segoe UI', Arial, sans-serif",
       display: 'flex', flexDirection: 'column',
       alignItems: 'center', justifyContent: 'center', gap: '28px'
     }}>
+      <IdlePhotoBackground />
+
       <img
         src="/rnslogo.png" alt="RNSIT"
         onError={(e) => { e.currentTarget.style.display = 'none'; }}
-        style={{ height: '110px', objectFit: 'contain', animation: 'gentleFloat 3.5s ease-in-out infinite' }}
+        style={{ height: '110px', objectFit: 'contain', animation: 'gentleFloat 3.5s ease-in-out infinite', position: 'relative', zIndex: 1 }}
       />
 
       <div style={{
-        background: '#ffffff', borderRadius: '20px',
+        background: 'transparent', backdropFilter: 'blur(3px)',
+        WebkitBackdropFilter: 'blur(3px)',
+        borderRadius: '20px',
         padding: '52px 72px', textAlign: 'center',
-        boxShadow: '0 8px 40px rgba(26,35,126,0.10)',
-        border: '1.5px solid #e8eaf6', maxWidth: '620px',
-        animation: 'riseIn 0.5s ease'
+        boxShadow: '0 16px 36px rgba(2,8,30,0.08)',
+        border: '1.5px solid rgba(255,255,255,0.18)', maxWidth: '620px',
+        animation: 'riseIn 0.5s ease', position: 'relative', zIndex: 1
       }}>
         {/* Check mark in a soft ring — closure, not celebration */}
         <div style={{
           width: '76px', height: '76px', borderRadius: '50%',
-          background: 'linear-gradient(135deg, #e8eaf6, #f5f6ff)',
+          background: 'rgba(255,255,255,0.16)',
           display: 'flex', alignItems: 'center', justifyContent: 'center',
-          margin: '0 auto 26px', border: '2px solid #c5cae9'
+          margin: '0 auto 26px', border: '2px solid rgba(186,230,253,0.7)'
         }}>
           <svg width="36" height="36" viewBox="0 0 24 24" fill="none"
-               stroke="#1a237e" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+               stroke="#bae6fd" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
             <polyline points="20 6 9 17 4 12" />
           </svg>
         </div>
 
-        <div style={{ fontSize: '34px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.2px' }}>
+        <div style={{ fontSize: '34px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.2px', textShadow: '0 2px 10px rgba(0,0,0,0.3)' }}>
           Thank you for visiting
         </div>
 
-        <div style={{ fontSize: '19px', color: '#444', marginTop: '14px', lineHeight: '1.6' }}>
-          Goodbye{displayName ? <>, <strong style={{ color: '#1a237e' }}>{displayName}</strong></> : ''}.
+        <div style={{ fontSize: '19px', color: 'rgba(255,255,255,0.88)', marginTop: '14px', lineHeight: '1.6' }}>
+          Goodbye{displayName ? <>, <strong style={{ color: '#bae6fd' }}>{displayName}</strong></> : ''}.
           Wishing you a wonderful day ahead.
         </div>
 
-        <div style={{ fontSize: '14px', color: '#9aa0b4', marginTop: '22px' }}>
+        <div style={{ fontSize: '14px', color: 'rgba(255,255,255,0.65)', marginTop: '22px' }}>
           Returning to the welcome screen shortly
         </div>
 
         {/* animated progress line */}
         <div style={{
           height: '4px', width: '160px', margin: '18px auto 0',
-          borderRadius: '2px', background: '#e8eaf6',
+          borderRadius: '2px', background: 'rgba(255,255,255,0.22)',
           overflow: 'hidden', position: 'relative'
         }}>
           <div style={{
             position: 'absolute', inset: 0, borderRadius: '2px',
-            background: 'linear-gradient(90deg, #1a237e, #5c6bc0)',
+            background: 'linear-gradient(90deg, #38bdf8, #bae6fd)',
             transformOrigin: 'left', animation: 'drain 5s linear forwards'
           }} />
         </div>
       </div>
 
-      <div style={{ fontSize: '13px', color: '#b0b4c8', letterSpacing: '0.4px' }}>
+      <div style={{ fontSize: '13px', color: 'rgba(255,255,255,0.68)', letterSpacing: '0.4px', position: 'relative', zIndex: 1 }}>
         RNS Institute of Technology &middot; Digital Receptionist
       </div>
 

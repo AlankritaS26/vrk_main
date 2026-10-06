@@ -1998,14 +1998,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   /* ── 3D NOVA AVATAR ACTIVE (replaces legacy SVG) ── */
 
 
-  /* background tint per state */
-  const charBg = {
-    ready: 'linear-gradient(155deg, #071332 0%, #10245b 52%, #164b72 100%)',
-    listening: 'linear-gradient(155deg, #071f38 0%, #0d4d55 52%, #176d69 100%)',
-    processing: 'linear-gradient(155deg, #120d3a 0%, #28216d 52%, #214b86 100%)',
-    speaking: 'linear-gradient(155deg, #1a123b 0%, #38216b 52%, #185a79 100%)',
-  }[status] || 'linear-gradient(155deg, #071332 0%, #10245b 52%, #164b72 100%)';
-
   const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
@@ -2013,7 +2005,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
-      fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#f0f4ff'
+      fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#dbeafe'
     }}>
 
       {/* ── MODALS ── */}
@@ -2113,7 +2105,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         <div style={{
           width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
-          background: charBg, transition: 'background 0.8s ease', position: 'relative',
+          background: {
+            ready: '#dbeafe',
+            listening: '#dbeafe',
+            processing: '#dbeafe',
+            speaking: '#dbeafe',
+          }[status] || '#dbeafe', transition: 'background 0.8s ease', position: 'relative',
           overflow: 'hidden'
         }}>
 
@@ -2204,14 +2201,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
         {/* ══════════ RIGHT: COMPACT CHAT ══════════ */}
         <div style={{
-          flex: 1, display: 'flex', flexDirection: 'column', background: '#f8f9ff',
-          borderLeft: '1.5px solid #e0e4ff', overflow: 'hidden'
+          flex: 1, display: 'flex', flexDirection: 'column', background: 'rgba(219,234,254,0.72)',
+          border: '1px solid rgba(255,255,255,0.62)', borderRadius: '28px', margin: '14px',
+          boxShadow: '0 16px 36px rgba(30,64,175,0.14)', backdropFilter: 'blur(8px)',
+          overflow: 'hidden'
         }}>
 
           {/* chat header */}
           <div style={{
-            padding: '10px 16px', background: '#fff',
-            borderBottom: '1px solid #e8eaf6', flexShrink: 0,
+            padding: '12px 18px', background: 'rgba(255,255,255,0.22)',
+            borderBottom: '1px solid rgba(255,255,255,0.45)', flexShrink: 0,
             display: 'flex', alignItems: 'center', gap: '8px'
           }}>
             <div style={{
@@ -2219,14 +2218,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               background: { ready: '#43a047', listening: '#43a047', processing: '#7e57c2', speaking: '#e53935' }[status] || '#43a047',
               transition: 'background 0.3s', boxShadow: '0 0 0 3px rgba(67,160,71,0.15)'
             }} />
-            <span style={{ fontSize: '13px', fontWeight: '700', color: '#444' }}>Conversation</span>
-            <span style={{ fontSize: '11px', color: '#bbb', marginLeft: 'auto' }}>
+            <span style={{ fontSize: '13px', fontWeight: '800', color: '#1e3a8a' }}>Conversation</span>
+            <span style={{ fontSize: '11px', color: '#64748b', marginLeft: 'auto' }}>
               {messages.length > 0 ? `${messages.length} message${messages.length > 1 ? 's' : ''}` : 'Just started'}
             </span>
           </div>
 
           {/* messages */}
-          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '14px 18px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
 
             {messages.length === 0 && !liveText && status !== 'processing' && (
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '30px 12px', textAlign: 'center' }}>
@@ -2248,21 +2247,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 }}>
                   {!prevSame && (
                     <span style={{
-                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
+                      fontSize: '10px', color: '#64748b', marginBottom: '4px',
                       paddingLeft: isNova ? '6px' : 0, paddingRight: !isNova ? '6px' : 0, fontWeight: '600'
                     }}>
                       {isNova ? 'Nova' : visitorName}
                     </span>
                   )}
                   <div className="msg-in" style={{
-                    maxWidth: '88%', padding: '8px 12px',
+                    maxWidth: '86%', padding: '10px 14px',
                     borderRadius: isNova
                       ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
                       : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-                    background: isNova ? '#ffffff' : '#1a237e',
-                    color: isNova ? '#1a1a1a' : '#ffffff',
-                    fontSize: '13.5px', lineHeight: '1.5',
-                    boxShadow: isNova ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+                    background: isNova ? 'rgba(255,255,255,0.72)' : 'rgba(30,64,175,0.88)',
+                    color: isNova ? '#1e293b' : '#ffffff',
+                    fontSize: '13.5px', lineHeight: '1.55',
+                    border: isNova ? '1px solid rgba(255,255,255,0.8)' : '1px solid rgba(147,197,253,0.35)',
+                    boxShadow: isNova ? '0 5px 14px rgba(30,64,175,0.08)' : '0 5px 14px rgba(30,64,175,0.18)',
+                    backdropFilter: 'blur(8px)',
                     wordBreak: 'break-word'
                   }}>
                     {msg.text}
@@ -2325,7 +2326,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
           {/* voice footer */}
           <div style={{
-            padding: '8px 12px', background: '#fff', borderTop: '1px solid #e8eaf6',
+            padding: '10px 14px', background: 'rgba(255,255,255,0.22)', borderTop: '1px solid rgba(255,255,255,0.45)',
             flexShrink: 0, display: 'flex', alignItems: 'center', gap: '10px'
           }}>
             <div style={{
