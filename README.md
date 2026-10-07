@@ -182,9 +182,67 @@ ANSWER SOURCE: weather_api | traffic_api | entity_kb | general_rag | guardrail_r
     - **Admin**: Username `admin` / Password `111111`
   - Real-time WebSocket alerts, live pending queue, conversation transcripts, and **Accept** / **Resolve** controls.
   - Staff open this URL on a separate laptop/tablet at the front desk and log in once.
+  - Multiple staff members can open the same dashboard at the same time. Everyone sees the same live escalation queue and conversation updates; the first staff member to select **Accept** becomes the connected responder.
+  - To test from another computer or phone on the same Wi-Fi, find the backend computer's IPv4 address with `ipconfig`, then open `http://<IPv4-address>:8001/staff` on that device (for example, `http://192.168.1.25:8001/staff`). Allow Python/Uvicorn through Windows Firewall if the page cannot be reached. Use the computer's LAN address, not `127.0.0.1`, because `127.0.0.1` points to the device being used.
+  - On a phone, use the same URL in Chrome/Edge and allow microphone access when using the staff voice control. HTTPS may be required by the browser for microphone access when the dashboard is not opened from localhost.
+  - If the microphone is blocked on another laptop, this is usually because `http://192.168.x.x:8001/staff` is not a secure browser context. Use HTTPS for a permanent setup. For a development-only test in Chrome, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add the exact dashboard origin (for example `http://192.168.0.117:8001`), enable the flag, relaunch Chrome, and then allow microphone access. Do not use this flag on a shared or public computer.
 - **Kiosk Wait UX**: Smooth glassmorphic modal with pulsing indicator, connection countdown, and auto-timeout after 60 seconds.
 
 ---
+
+### 8. 📱 Staff Mobile App (Expo Go)
+
+The repository includes a native staff app in [`staff-mobile/`](./staff-mobile/). It avoids browser microphone restrictions on plain LAN HTTP.
+
+#### Capabilities
+
+- Native microphone permission through Expo Go.
+- Staff login, active escalation queue, summaries, transcripts, history, Accept, and Resolve.
+- Five-second staff voice clips uploaded to `POST /escalation/audio/{session_id}`.
+- Staff voice is relayed as original audio to the kiosk.
+- Visitor voice is relayed as original audio to the connected staff phone.
+- Existing kiosk STT remains primary: faster-whisper through `/stt/pcm`.
+- Live WebSocket updates and automatic scrolling to the newest active message.
+
+#### Run the staff app
+
+Start the backend first, then run from the repository root:
+
+```powershell
+Set-Location "C:\Users\Akshatha A\vrk_main\staff-mobile"
+npm install
+npx expo start --lan --port 8086
+```
+
+If Metro or Expo Go is using an old bundle:
+
+```powershell
+npx expo start --lan --port 8086 --clear
+```
+
+Then install Expo Go, scan the QR code, enter `http://192.168.0.117:8001`, and log in with `staff` / `rnsit2024`. The phone and backend computer must be on the same Wi-Fi. Accept an escalation and tap **Turn microphone on**.
+
+Do not run `cd staff-mobile` if the terminal is already in that directory. Do not use `CI=1` during normal development because it disables Metro reloads.
+
+#### Audio routing
+
+| Speaker | Audio destination | Transcription |
+|---|---|---|
+| Visitor at kiosk | Staff browser dashboard and Expo staff phone | Existing kiosk STT |
+| Staff Expo phone | Kiosk as original recorded audio | Existing kiosk STT |
+| Staff text reply | Kiosk through Kokoro `/tts` | Saved in transcript |
+| Visitor audio at kiosk | Not played back on kiosk, preventing echo | Existing kiosk STT |
+
+The browser dashboard may require one click on **Enable visitor audio** before autoplay permits incoming visitor audio. Expo uses native audio playback.
+
+#### Staff troubleshooting
+
+- Use `http://127.0.0.1:8001/staff` only on the backend computer; use `http://<LAN-IP>:8001/staff` from another device.
+- If browser microphone access is blocked over LAN HTTP, use the Expo app or configure HTTPS.
+- For `unsupported FormData implementation`, restart Expo with `--clear`; the app uses native `File.upload`.
+- For a duplicate `setAudioModeAsync` error, close Expo Go and restart Metro with `--clear`.
+- If Connect is slow, the active queue loads first and history loads in the background.
+- If browser visitor audio is silent, click **Enable visitor audio**, check tab mute, and check the output device.
 
 ## System Architecture
 

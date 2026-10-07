@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#050d1a" />
+      <stop offset="40%" stop-color="#0a192f" />
+      <stop offset="70%" stop-color="#0f2b48" />
+      <stop offset="100%" stop-color="#061224" />
+    </linearGradient>
+    <radialGradient id="sunGlow" cx="65%" cy="35%" r="60%">
+      <stop offset="0%" stop-color="#1e4976" stop-opacity="0.6" />
+      <stop offset="40%" stop-color="#0d233e" stop-opacity="0.3" />
+      <stop offset="100%" stop-color="#050d1a" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="glassRoof" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#0284c7" stop-opacity="0.05" />
+    </linearGradient>
+    <linearGradient id="pillarGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#0c2540" />
+      <stop offset="50%" stop-color="#1c456e" />
+      <stop offset="100%" stop-color="#08182b" />
+    </linearGradient>
+    <linearGradient id="groundGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#091b2c" />
+      <stop offset="100%" stop-color="#030810" />
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Sky & Ambient backdrop -->
+  <rect width="1920" height="1080" fill="url(#bgGrad)" />
+  <circle cx="1200" cy="380" r="800" fill="url(#sunGlow)" />
+
+  <!-- Distant trees / landscape silhouettes -->
+  <path d="M0,740 Q240,710 480,735 T960,715 T1440,730 T1920,710 L1920,1080 L0,1080 Z" fill="#040e18" opacity="0.7" />
+  <path d="M0,770 Q300,745 600,760 T1200,745 T1800,765 T1920,755 L1920,1080 L0,1080 Z" fill="#061422" opacity="0.8" />
+
+  <!-- Modern Academic Campus Facade Silhouette -->
+  <!-- Main central auditorium & engineering block -->
+  <rect x="520" y="380" width="880" height="380" rx="12" fill="#0a2035" opacity="0.9" />
+  <!-- Glass Atrium Center -->
+  <path d="M780,340 L1140,340 L1160,760 L760,760 Z" fill="url(#glassRoof)" />
+  <line x1="840" y1="340" x2="830" y2="760" stroke="#38bdf8" stroke-width="2" opacity="0.3" />
+  <line x1="960" y1="340" x2="960" y2="760" stroke="#38bdf8" stroke-width="3" opacity="0.5" />
+  <line x1="1080" y1="340" x2="1090" y2="760" stroke="#38bdf8" stroke-width="2" opacity="0.3" />
+
+  <!-- Architectural Columns -->
+  <rect x="420" y="440" width="36" height="320" rx="4" fill="url(#pillarGrad)" />
+  <rect x="490" y="440" width="36" height="320" rx="4" fill="url(#pillarGrad)" />
+  <rect x="1390" y="440" width="36" height="320" rx="4" fill="url(#pillarGrad)" />
+  <rect x="1460" y="440" width="36" height="320" rx="4" fill="url(#pillarGrad)" />
+
+  <!-- Entrance Portico Canopy -->
+  <polygon points="680,560 1240,560 1280,600 640,600" fill="#0e2a47" />
+  <line x1="640" y1="600" x2="1280" y2="600" stroke="#38bdf8" stroke-width="3" opacity="0.6" filter="url(#glow)" />
+
+  <!-- Architectural windows grid -->
+  <g fill="#38bdf8" opacity="0.15">
+    <rect x="560" y="420" width="35" height="40" rx="2" />
+    <rect x="610" y="420" width="35" height="40" rx="2" />
+    <rect x="660" y="420" width="35" height="40" rx="2" />
+    <rect x="710" y="420" width="35" height="40" rx="2" />
+    <rect x="1200" y="420" width="35" height="40" rx="2" />
+    <rect x="1250" y="420" width="35" height="40" rx="2" />
+    <rect x="1300" y="420" width="35" height="40" rx="2" />
+
+    <rect x="560" y="480" width="35" height="40" rx="2" />
+    <rect x="610" y="480" width="35" height="40" rx="2" />
+    <rect x="660" y="480" width="35" height="40" rx="2" />
+    <rect x="710" y="480" width="35" height="40" rx="2" />
+    <rect x="1200" y="480" width="35" height="40" rx="2" />
+    <rect x="1250" y="480" width="35" height="40" rx="2" />
+    <rect x="1300" y="480" width="35" height="40" rx="2" />
+  </g>
+
+  <!-- Campus Plaza / Ground -->
+  <rect x="0" y="760" width="1920" height="320" fill="url(#groundGrad)" />
+  <line x1="0" y1="760" x2="1920" y2="760" stroke="#1e3a5f" stroke-width="2" />
+
+  <!-- Warm Pathway Lighting Glows -->
+  <circle cx="680" cy="760" r="140" fill="#38bdf8" opacity="0.08" />
+  <circle cx="1240" cy="760" r="140" fill="#38bdf8" opacity="0.08" />
+  <circle cx="960" cy="760" r="220" fill="#60a5fa" opacity="0.1" />
+
+  <!-- Diagonal ambient light beam -->
+  <polygon points="1200,0 1600,0 1920,1080 1350,1080" fill="#38bdf8" opacity="0.03" />
+</svg>
