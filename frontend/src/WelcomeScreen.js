@@ -71,6 +71,7 @@ function buildTtsSentenceChunks(text) {
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
+  const escalationScrollRef = useRef(null);
   const camVideoRef = useRef(null);
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
@@ -104,6 +105,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const pendingSpeechRef = useRef(null);         // speech blocked by autoplay policy
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
+  const speakStreamRef = useRef(null);
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
   const lastAnswerRef = useRef('');              // stores the most recent full answer text for resume-on-interrupt
   const wasInterruptedRef = useRef(false);       // true if TTS was barged-in before it finished — triggers "want to continue?" offer
@@ -174,6 +176,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const [showCompanionModal, setShowCompanionModal] = useState(false);
   const [escalationState, setEscalationState] = useState(null); // null | 'pending' | 'connected' | 'timeout'
   const [escalationMsg, setEscalationMsg] = useState('');
+  const [escalationMessages, setEscalationMessages] = useState([]);
+  const escalationStateRef = useRef(null);
+  useEffect(() => { escalationStateRef.current = escalationState; }, [escalationState]);
 
   useEffect(() => {
     if (!session?.session_id) {
@@ -195,6 +200,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const handleRequestEscalation = async () => {
     try {
       setEscalationState('pending');
+      setEscalationMessages([]);
       setEscalationMsg('Connecting you to front desk staff…');
       await fetch(BACKEND + '/escalation/request', {
         method: 'POST',
@@ -208,7 +214,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const handleCancelEscalation = async () => {
     setEscalationState(null);
-    const sid = session?.session_id;
+    const sid = sessionRef.current?.session_id;
     if (sid) {
       try {
         await fetch(`${BACKEND}/escalation/cancel/${sid}`, { method: 'POST' });
@@ -234,6 +240,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (scrollRef.current)
       scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, liveText, processingHint]);
+
+  useEffect(() => {
+    const panel = escalationScrollRef.current;
+    if (!panel) return undefined;
+    const frame = requestAnimationFrame(() => {
+      panel.scrollTo({ top: panel.scrollHeight, behavior: 'smooth' });
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [escalationMessages]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -267,6 +282,45 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       timestamp: new Date().toLocaleTimeString()
     }]);
   }, [setMessages]);
+
+  const playEscalationAudio = useCallback(async (payload) => {
+    if (!payload?.audio) return;
+    try {
+      interruptSpeakingRef.current?.();
+      if (!playCtxRef.current) {
+        playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      const ctx = playCtxRef.current;
+      if (ctx.state === 'suspended') await ctx.resume();
+      const binary = atob(payload.audio);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      let buffer;
+      if (payload.mime_type?.startsWith('audio/pcm')) {
+        const samples = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+        buffer = ctx.createBuffer(1, samples.length, 16000);
+        const channel = buffer.getChannelData(0);
+        for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+      } else {
+        buffer = await ctx.decodeAudioData(bytes.buffer);
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const startAt = Math.max(ctx.currentTime, playCursorRef.current);
+      source.start(startAt);
+      playCursorRef.current = startAt + buffer.duration;
+      activeNodesRef.current.push(source);
+      source.onended = () => {
+        activeNodesRef.current = activeNodesRef.current.filter(node => node !== source);
+      };
+    } catch (error) {
+      console.warn('[ESC] Audio playback failed:', error);
+      if (payload.speaker === 'staff' && payload.text) {
+        speakStreamRef.current?.(payload.text);
+      }
+    }
+  }, []);
 
   // Creates a new chat bubble for `speaker` and returns a function that
   // appends sentence-by-sentence text into it — keeps the on-screen text
@@ -419,7 +473,36 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         lastProcessedTextRef.current = { text: heard, time: now };
         wasInterruptedRef.current = false;   // visitor spoke something — clear interrupt flag
         if (isMounted.current) setLiveText(heard);
-        sendToBackend(heard);
+        if (escalationStateRef.current === 'connected') {
+          const sid = session?.session_id;
+          if (sid) {
+            fetch(BACKEND + '/escalation/visitor-audio/' + sid, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: i16.buffer
+            }).catch(error => console.warn('[ESC] Visitor audio relay failed:', error));
+            fetch(BACKEND + '/escalation/message', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ session_id: sid, text: heard }),
+            }).then(async response => {
+              if (!response.ok) throw new Error(await response.text());
+              const data = await response.json();
+              if (data.message) {
+                setEscalationMessages(prev => prev.some(m =>
+                  m.timestamp === data.message.timestamp && m.text === data.message.text
+                ) ? prev : [...prev, data.message].slice(-50));
+              }
+            }).catch(err => {
+              console.error('[ESCALATION] Spoken message failed:', err);
+              setEscalationMsg('Your message could not be delivered. Please speak again.');
+            });
+          }
+          setLiveText('');
+          setStatus('ready');
+        } else {
+          sendToBackend(heard);
+        }
       } else {
         // Empty/too-short STT result after a barge-in interruption:
         // offer to resume the answer rather than silently going to 'ready'.
@@ -871,6 +954,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       await browserSpeak();
     }
   }, [startListening, interruptSpeaking]);
+  speakStreamRef.current = speakStream;
 
   // Thin wrapper over speakStream for callers that don't need per-sentence
   // sync (ack bubble, farewell, greeting, error fallback, name flow) — same
@@ -1972,17 +2056,31 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           } else if (msg.type === 'companion_qr') {
             if (msg.token) setCompanionToken(msg.token);
             if (msg.url) setCompanionUrl(msg.url);
-          } else if (msg.type === 'escalation_pending') {
+          } else if (msg.type === 'escalation_pending' &&
+                     msg.session_id === sessionRef.current?.session_id) {
             setEscalationState('pending');
             setEscalationMsg(msg.message || 'Connecting you to front desk staff…');
-          } else if (msg.type === 'escalation_connected') {
+          } else if (msg.type === 'escalation_connected' &&
+                     msg.session_id === sessionRef.current?.session_id) {
             setEscalationState('connected');
             setEscalationMsg(msg.message || 'A staff member has connected!');
-          } else if (msg.type === 'escalation_timeout') {
+          } else if (msg.type === 'escalation_message' &&
+                     msg.session_id === sessionRef.current?.session_id) {
+            setEscalationMessages(prev => [...prev, msg.message].slice(-50));
+            if (msg.message?.speaker === 'staff' && msg.message.text && !msg.message.has_audio) {
+              speakStreamRef.current?.(msg.message.text);
+            }
+          } else if (msg.type === 'escalation_audio' &&
+                     msg.session_id === sessionRef.current?.session_id &&
+                     msg.speaker === 'staff') {
+            playEscalationAudio(msg);
+          } else if (msg.type === 'escalation_timeout' &&
+                     msg.session_id === sessionRef.current?.session_id) {
             setEscalationState('timeout');
             setEscalationMsg(msg.message || 'No staff available right now. Nova will continue helping you.');
             setTimeout(() => setEscalationState(null), 6000);
-          } else if (msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') {
+          } else if ((msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') &&
+                     msg.session_id === sessionRef.current?.session_id) {
             setEscalationState(null);
           }
         } catch (_) { }
@@ -1991,7 +2089,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     connect();
     return () => { dead = true; ws?.close(); };
-  }, [handleDepartureCheck]);
+  }, [handleDepartureCheck, playEscalationAudio]);
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
 
@@ -2174,7 +2272,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
             zIndex: 1, marginTop: '8px'
           }}>
-            <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Hi, I&apos;m Nova</div>
+            <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Nova</div>
             <div style={{ fontSize: '12px', color: 'rgba(219,234,254,0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
             <div style={{
               padding: '5px 18px', borderRadius: '20px', background: statusBg,
@@ -2427,6 +2525,34 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 <p style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', marginBottom: '20px' }}>
                   {escalationMsg || 'A front desk team member is now assisting you.'}
                 </p>
+                <div ref={escalationScrollRef} style={{
+                  maxHeight: '180px', overflowY: 'auto', textAlign: 'left',
+                  background: '#f8fafc', border: '1px solid #e2e8f0',
+                  borderRadius: '14px', padding: '10px', marginBottom: '12px'
+                }}>
+                  {escalationMessages.length === 0 && (
+                    <div style={{ fontSize: '12px', color: '#94a3b8', textAlign: 'center', padding: '12px' }}>
+                      Speak normally. Your voice is sent to the connected staff member.
+                    </div>
+                  )}
+                  {escalationMessages.map((message, index) => (
+                    <div key={`${message.timestamp}-${index}`} style={{
+                      display: 'flex', justifyContent: message.speaker === 'visitor' ? 'flex-end' : 'flex-start',
+                      marginBottom: '6px'
+                    }}>
+                      <div style={{
+                        maxWidth: '82%', padding: '8px 10px', borderRadius: '10px',
+                        background: message.speaker === 'visitor' ? '#dbeafe' : '#dcfce7',
+                        color: '#334155', fontSize: '12px', lineHeight: '1.4'
+                      }}>
+                        <strong style={{ display: 'block', fontSize: '10px', color: '#64748b', marginBottom: '2px' }}>
+                          {message.speaker === 'visitor' ? 'You' : 'Staff'}
+                        </strong>
+                        {message.text}
+                      </div>
+                    </div>
+                  ))}
+                </div>
                 <div style={{
                   background: '#f0fdf4', borderRadius: '12px', padding: '12px 16px',
                   fontSize: '13px', color: '#15803d', border: '1px solid #bbf7d0',

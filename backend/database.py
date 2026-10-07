@@ -654,6 +654,7 @@ async def save_escalation(
     user_name: str,
     reason: str,
     transcript: list | None = None,
+    summary: str | None = None,
 ) -> str:
     """
     Persists a new escalation record to MongoDB.
@@ -667,6 +668,7 @@ async def save_escalation(
             "user_name":   user_name or "Guest",
             "reason":      reason,
             "transcript":  transcript or [],
+            "summary":     summary or "",
             "status":      "STAFF_NOTIFIED",
             "created_at":  now,
             "updated_at":  now,
