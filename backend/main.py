@@ -2237,19 +2237,15 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
             return answer, "easter_egg", "CONTINUE"
 
-    # ─── Returning visitor reply to "How are you doing today?" greeting ──────────
+    # ─── Emotional / wellbeing reply (re-engagement or standalone) ────────────
     #
     # INTENT GATE — runs BEFORE NAME_CHANGE, RAG, and entity detection.
-    # awaiting_reengagement_reply does NOT mean 'treat every message as emotional'.
-    # It means: CHECK if the message is actually an emotional response;
-    # otherwise clear the flag and continue normal routing.
-    #
     # Uses POSITIVE detection (is_emotional_reengagement_response) so that
-    # genuine questions like 'Who is the principal?' or garbled inputs like
-    # 'Did I ask you about the journey...' are never consumed as wellbeing replies.
-    if active_session and active_session.get("awaiting_reengagement_reply"):
-        if is_emotional_reengagement_response(q_normalized):
-            # This IS an emotional response — handle it and consume the flag.
+    # genuine questions like 'Who is the principal?' or statements like
+    # 'See, I am a sportsperson...' are never consumed as wellbeing replies.
+    if is_emotional_reengagement_response(q_normalized):
+        if active_session and active_session.get("awaiting_reengagement_reply"):
+            # Returning visitor reply to 'How are you doing today?' greeting
             active_session["awaiting_reengagement_reply"] = False
             answer, topic = await handle_personalized_reengagement(q_normalized, active_session)
             if topic:
@@ -2260,13 +2256,27 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             logger.info("[ROUTE] PERSONALIZED_REENGAGEMENT — reply=%r topic=%r", q_normalized, topic)
             return answer, "personalized_reengagement", "CONTINUE"
         else:
-            # NOT an emotional response — clear the pending flag and fall through
-            # to normal routing so this query is handled on its own merits.
-            active_session["awaiting_reengagement_reply"] = False
-            logger.info(
-                "[ROUTE] RE-ENGAGEMENT bypassed (not emotional response) — '%s'",
-                q_normalized,
-            )
+            # Standalone emotional / wellbeing reply (subsequent turn or first-time visitor)
+            tone = classify_emotion(q_normalized)
+            emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Glad to hear that!")
+            if tone == "stressed":
+                answer = f"{emotion_sentence} What can I help you with today?"
+            elif tone == "sad":
+                answer = f"{emotion_sentence} How may I assist you today?"
+            elif tone == "frustrated":
+                answer = f"{emotion_sentence} What can I assist you with?"
+            else:
+                answer = f"{emotion_sentence} How can I help you today?"
+            logger.info("[ROUTE] EMOTIONAL_WELLBEING (standalone) — tone=%s reply=%r", tone, q_normalized)
+            return answer, "emotional_wellbeing", "CONTINUE"
+    elif active_session and active_session.get("awaiting_reengagement_reply"):
+        # NOT an emotional response — clear the pending flag and fall through
+        # to normal routing so this query is handled on its own merits.
+        active_session["awaiting_reengagement_reply"] = False
+        logger.info(
+            "[ROUTE] RE-ENGAGEMENT bypassed (not emotional response) — '%s'",
+            q_normalized,
+        )
 
     # ─── Explicit NAME_CHANGE intent — uses _detect_name_change ────────────────
     new_name = _detect_name_change(q_normalized)

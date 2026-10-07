@@ -457,6 +457,8 @@ def is_incomplete_or_garbled_query(query: str, q_normalized: str | None = None) 
         return False
     if is_college_evaluation_query(qn) or is_college_evaluation_query(q):
         return False
+    if is_emotional_reengagement_response(qn) or is_emotional_reengagement_response(q):
+        return False
 
     # Check for valid standalone keyword queries (e.g. 'placements', 'admissions', 'fees', 'hostel', etc.)
     _VALID_STANDALONE = {
@@ -575,7 +577,7 @@ def is_emotional_reengagement_response(text: str) -> bool:
         return True
 
     # Pattern 2: "I'm <state>", "I am <state>", "Im <state>"
-    for prefix in ("i'm ", "im ", "i am ", "i feel ", "feeling "):
+    for prefix in ("i'm ", "im ", "i am ", "i m ", "i feel ", "feeling "):
         if t.startswith(prefix):
             rest = t[len(prefix):].strip()
             if rest and len(rest.split()) <= 4 and any(w in rest for w in _EMOTION_STATE_WORDS):

@@ -1217,18 +1217,43 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     s = s.replace(/^(?:hi|hello|hey|nova|please)[\s,.]+/i, '');
     s = s.replace(/[.!?]+$/, '').trim();
     if (!s) return '';
+
+    // Discourse markers and sentence-starters that appear before a comma but
+    // are never names: "See, I am...", "Well, I want...", "Actually, ..."
+    // The comma-split below would otherwise extract these as name candidates.
+    const _DISCOURSE_MARKERS = /^(see|well|look|actually|so|now|right|okay|ok|listen|hey|hi|hello|yes|no|sorry|please|anyway|alright|basically|honestly|frankly|clearly|obviously)$/i;
+
     if (s.includes(',')) {
       const firstPart = s.split(',')[0].trim();
+      // Only accept the pre-comma fragment as a name candidate if it's a
+      // single short word that is NOT a discourse marker or common filler.
       if (firstPart && /^[a-zA-Z\s]+$/.test(firstPart)) {
-        s = firstPart;
+        const firstWords = firstPart.trim().split(/\s+/);
+        if (firstWords.length === 1 && !_DISCOURSE_MARKERS.test(firstWords[0])) {
+          s = firstPart;
+        }
+        // Multi-word pre-comma fragments (e.g. "my friend Sneha, ...") are
+        // left intact — the word-count filter below will deal with them.
       }
     }
-    const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
+
+    // Expanded stop-word list: common question words, filler words, and
+    // words that are valid English but never a person's name.
+    const words = s.split(/\s+/).filter(w =>
+      !/^(what|who|where|when|why|which|nova|kiosk|please|my|name|is|to|the|a|an|i|am|are|was|were|be|been|being|it|its|this|that|these|those|and|or|but|if|of|in|on|at|for|with|from|by|about|into|through|just|also|too|very|more|most|so|then|than|not|no|nor|yet|both|either|neither|each|every|all|any|few|more|some|such)$/i.test(w)
+    );
     if (words.length === 0 || words.length > 3) return '';
     // Only accept strictly alphabetic words
     if (!words.every(w => /^[a-zA-Z]+$/.test(w))) return '';
     const result = words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
-    if (words.length === 1 && _REJECTION_WORDS.test(words[0])) return '';
+
+    // Single-word results: reject common emotional states, adjectives, and
+    // non-name words that could leak through (fixes "I am good" → "Good",
+    // "See, I am..." → "See", etc.). Replaces the previously undefined
+    // _REJECTION_WORDS reference which would throw a ReferenceError.
+    const _NON_NAME_WORDS = /^(good|fine|well|great|okay|ok|alright|bad|tired|stressed|happy|sad|sorry|busy|free|ready|done|see|look|right|so|now|listen|anyway|basically|honestly|frankly|clearly|obviously|yes|no|guest|skip|continue|bye|thanks|then|and|but|or)$/i;
+    if (words.length === 1 && _NON_NAME_WORDS.test(words[0])) return '';
+
     return result;
   }, []);
 
@@ -1563,12 +1588,22 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
       || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
 
-    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text);
+    // NOTE: 'i am' and "i'm" are intentionally excluded here.
+    // Those are self-description phrases ("I am good", "I'm stressed") and must
+    // NEVER be treated as name introductions. Only use patterns that are
+    // unambiguously explicit name-introduction requests.
+    // 'i am called' is handled separately in hasInlineName above.
+    const isExplicitNameIntro = /\b(my name is|call me|this is)\s+\w/i.test(text);
 
     if ((isExplicitNameIntro || hasInlineName) && !bareNameChange) {
       const candidateName = extractVisitorName(text);
+      // Reject common emotional/status/adjective words that can leak through
+      // extractVisitorName when the user says "I am <state>" — even though
+      // 'i am' is no longer in isExplicitNameIntro, hasInlineName can still
+      // match edge cases like "my name is good" (unlikely but safe to guard).
+      const _EMOTIONAL_WORDS = /^(good|fine|well|great|okay|ok|alright|bad|tired|stressed|happy|sad|sorry|busy|free|ready|done|yes|no|guest|skip|continue|bye|thanks|thank you|then|well|so|and|but|or|the|a|an)$/i;
       if (candidateName && candidateName.length >= 2 && candidateName.split(' ').length <= 3
-          && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you|done|then|well|so|and|but|or|the|a|an)$/i.test(candidateName)) {
+          && !_EMOTIONAL_WORDS.test(candidateName)) {
         // ALWAYS route through spelling capture before saving!
         await runSpellingCaptureAndConfirm(candidateName, () => isMounted.current);
         return;
