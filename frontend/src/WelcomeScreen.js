@@ -71,7 +71,6 @@ function buildTtsSentenceChunks(text) {
 
 export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
-  const escalationScrollRef = useRef(null);
   const camVideoRef = useRef(null);
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
@@ -170,15 +169,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
 
-  // ── QR Companion & Escalation States ──
+  // ── QR Companion ──
   const [companionToken, setCompanionToken] = useState(null);
   const [companionUrl, setCompanionUrl] = useState('');
   const [showCompanionModal, setShowCompanionModal] = useState(false);
-  const [escalationState, setEscalationState] = useState(null); // null | 'pending' | 'connected' | 'timeout'
-  const [escalationMsg, setEscalationMsg] = useState('');
-  const [escalationMessages, setEscalationMessages] = useState([]);
-  const escalationStateRef = useRef(null);
-  useEffect(() => { escalationStateRef.current = escalationState; }, [escalationState]);
 
   useEffect(() => {
     if (!session?.session_id) {
@@ -196,31 +190,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       })
       .catch(() => {});
   }, [session?.session_id]);
-
-  const handleRequestEscalation = async () => {
-    try {
-      setEscalationState('pending');
-      setEscalationMessages([]);
-      setEscalationMsg('Connecting you to front desk staff…');
-      await fetch(BACKEND + '/escalation/request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: 'user_request' }),
-      });
-    } catch (err) {
-      console.error('[ESCALATION] Request failed:', err);
-    }
-  };
-
-  const handleCancelEscalation = async () => {
-    setEscalationState(null);
-    const sid = sessionRef.current?.session_id;
-    if (sid) {
-      try {
-        await fetch(`${BACKEND}/escalation/cancel/${sid}`, { method: 'POST' });
-      } catch (e) { /* silent */ }
-    }
-  };
 
   // The backend composes the greeting (it knows resume-vs-new and the
   // institute intro line); these local strings are only a fallback.
@@ -240,15 +209,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     if (scrollRef.current)
       scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [messages, liveText, processingHint]);
-
-  useEffect(() => {
-    const panel = escalationScrollRef.current;
-    if (!panel) return undefined;
-    const frame = requestAnimationFrame(() => {
-      panel.scrollTo({ top: panel.scrollHeight, behavior: 'smooth' });
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [escalationMessages]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -283,44 +243,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }]);
   }, [setMessages]);
 
-  const playEscalationAudio = useCallback(async (payload) => {
-    if (!payload?.audio) return;
-    try {
-      interruptSpeakingRef.current?.();
-      if (!playCtxRef.current) {
-        playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      const ctx = playCtxRef.current;
-      if (ctx.state === 'suspended') await ctx.resume();
-      const binary = atob(payload.audio);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      let buffer;
-      if (payload.mime_type?.startsWith('audio/pcm')) {
-        const samples = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
-        buffer = ctx.createBuffer(1, samples.length, 16000);
-        const channel = buffer.getChannelData(0);
-        for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
-      } else {
-        buffer = await ctx.decodeAudioData(bytes.buffer);
-      }
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      const startAt = Math.max(ctx.currentTime, playCursorRef.current);
-      source.start(startAt);
-      playCursorRef.current = startAt + buffer.duration;
-      activeNodesRef.current.push(source);
-      source.onended = () => {
-        activeNodesRef.current = activeNodesRef.current.filter(node => node !== source);
-      };
-    } catch (error) {
-      console.warn('[ESC] Audio playback failed:', error);
-      if (payload.speaker === 'staff' && payload.text) {
-        speakStreamRef.current?.(payload.text);
-      }
-    }
-  }, []);
 
   // Creates a new chat bubble for `speaker` and returns a function that
   // appends sentence-by-sentence text into it — keeps the on-screen text
@@ -473,36 +395,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         lastProcessedTextRef.current = { text: heard, time: now };
         wasInterruptedRef.current = false;   // visitor spoke something — clear interrupt flag
         if (isMounted.current) setLiveText(heard);
-        if (escalationStateRef.current === 'connected') {
-          const sid = session?.session_id;
-          if (sid) {
-            fetch(BACKEND + '/escalation/visitor-audio/' + sid, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream' },
-              body: i16.buffer
-            }).catch(error => console.warn('[ESC] Visitor audio relay failed:', error));
-            fetch(BACKEND + '/escalation/message', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ session_id: sid, text: heard }),
-            }).then(async response => {
-              if (!response.ok) throw new Error(await response.text());
-              const data = await response.json();
-              if (data.message) {
-                setEscalationMessages(prev => prev.some(m =>
-                  m.timestamp === data.message.timestamp && m.text === data.message.text
-                ) ? prev : [...prev, data.message].slice(-50));
-              }
-            }).catch(err => {
-              console.error('[ESCALATION] Spoken message failed:', err);
-              setEscalationMsg('Your message could not be delivered. Please speak again.');
-            });
-          }
-          setLiveText('');
-          setStatus('ready');
-        } else {
-          sendToBackend(heard);
-        }
+        sendToBackend(heard);
       } else {
         // Empty/too-short STT result after a barge-in interruption:
         // offer to resume the answer rather than silently going to 'ready'.
@@ -997,10 +890,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
-
-    if (escalationState && /\b(?:stop|cancel|never mind|nevermind|back|continue|dont connect|no staff)\b/i.test(text)) {
-      setEscalationState(null);
-    }
 
     // ── Check if visitor is affirming a pending name confirmation ──────
     const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
@@ -2091,32 +1980,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           } else if (msg.type === 'companion_qr') {
             if (msg.token) setCompanionToken(msg.token);
             if (msg.url) setCompanionUrl(msg.url);
-          } else if (msg.type === 'escalation_pending' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState('pending');
-            setEscalationMsg(msg.message || 'Connecting you to front desk staff…');
-          } else if (msg.type === 'escalation_connected' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState('connected');
-            setEscalationMsg(msg.message || 'A staff member has connected!');
-          } else if (msg.type === 'escalation_message' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationMessages(prev => [...prev, msg.message].slice(-50));
-            if (msg.message?.speaker === 'staff' && msg.message.text && !msg.message.has_audio) {
-              speakStreamRef.current?.(msg.message.text);
-            }
-          } else if (msg.type === 'escalation_audio' &&
-                     msg.session_id === sessionRef.current?.session_id &&
-                     msg.speaker === 'staff') {
-            playEscalationAudio(msg);
-          } else if (msg.type === 'escalation_timeout' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState('timeout');
-            setEscalationMsg(msg.message || 'No staff available right now. Nova will continue helping you.');
-            setTimeout(() => setEscalationState(null), 6000);
-          } else if ((msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState(null);
           }
         } catch (_) { }
       };
@@ -2124,12 +1987,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     connect();
     return () => { dead = true; ws?.close(); };
-  }, [handleDepartureCheck, playEscalationAudio]);
+  }, [handleDepartureCheck]);
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
-
-  /* ── 3D NOVA AVATAR ACTIVE (replaces legacy SVG) ── */
-
 
   const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
@@ -2193,10 +2053,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 </div>
               ))}
             </div>
-
-            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-              Questions about your data? Speak to a staff member at the Admin Block.
-            </p>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
               <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
@@ -2501,140 +2357,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         </div>
       </div>
 
-      {/* ── ESCALATION MODAL / OVERLAY ── */}
-      {escalationState && (
-        <div style={{
-          position: 'fixed', inset: 0, zIndex: 100,
-          background: 'rgba(15, 23, 42, 0.75)', backdropFilter: 'blur(8px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
-        }}>
-          <div style={{
-            background: '#ffffff', borderRadius: '20px', maxWidth: '440px', width: '100%',
-            padding: '32px 28px', textAlign: 'center', boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
-            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
-          }}>
-            {escalationState === 'pending' && (
-              <>
-                <div style={{
-                  width: '64px', height: '64px', margin: '0 auto 18px', borderRadius: '50%',
-                  border: '4px solid #e0e7ff', borderTopColor: '#4338ca',
-                  animation: 'spin 1s linear infinite',
-                }} />
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#1e1b4b', marginBottom: '8px' }}>
-                  Connecting to Front Desk
-                </h2>
-                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
-                  {escalationMsg || 'A front desk reception team member has been alerted to assist you directly at this kiosk.'}
-                </p>
-                <div style={{
-                  background: 'linear-gradient(135deg, #eef2ff, #f0fdf4)',
-                  borderRadius: '14px', padding: '14px 16px', marginBottom: '16px',
-                  border: '1px solid #c7d2fe', textAlign: 'left',
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#4338ca', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
-                    📞 Front Desk &amp; Campus Helpline
-                  </div>
-                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#1e1b4b', marginBottom: '3px' }}>
-                    +91 80286 11880 / 81 / 82
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#3730a3' }}>
-                    Admissions Helpline: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
-                  </div>
-                </div>
-                <div style={{
-                  background: '#f0f9ff', borderRadius: '12px', padding: '12px 16px',
-                  fontSize: '13px', color: '#0369a1', border: '1px solid #bae6fd',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say <strong>"Stop"</strong> anytime to return to Nova
-                </div>
-              </>
-            )}
-
-            {escalationState === 'connected' && (
-              <>
-                <div style={{ fontSize: '56px', marginBottom: '16px' }}>🤝</div>
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#065f46', marginBottom: '8px' }}>
-                  Staff Member Connected!
-                </h2>
-                <p style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', marginBottom: '20px' }}>
-                  {escalationMsg || 'A front desk team member is now assisting you.'}
-                </p>
-                <div ref={escalationScrollRef} style={{
-                  maxHeight: '180px', overflowY: 'auto', textAlign: 'left',
-                  background: '#f8fafc', border: '1px solid #e2e8f0',
-                  borderRadius: '14px', padding: '10px', marginBottom: '12px'
-                }}>
-                  {escalationMessages.length === 0 && (
-                    <div style={{ fontSize: '12px', color: '#94a3b8', textAlign: 'center', padding: '12px' }}>
-                      Speak normally. Your voice is sent to the connected staff member.
-                    </div>
-                  )}
-                  {escalationMessages.map((message, index) => (
-                    <div key={`${message.timestamp}-${index}`} style={{
-                      display: 'flex', justifyContent: message.speaker === 'visitor' ? 'flex-end' : 'flex-start',
-                      marginBottom: '6px'
-                    }}>
-                      <div style={{
-                        maxWidth: '82%', padding: '8px 10px', borderRadius: '10px',
-                        background: message.speaker === 'visitor' ? '#dbeafe' : '#dcfce7',
-                        color: '#334155', fontSize: '12px', lineHeight: '1.4'
-                      }}>
-                        <strong style={{ display: 'block', fontSize: '10px', color: '#64748b', marginBottom: '2px' }}>
-                          {message.speaker === 'visitor' ? 'You' : 'Staff'}
-                        </strong>
-                        {message.text}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{
-                  background: '#f0fdf4', borderRadius: '12px', padding: '12px 16px',
-                  fontSize: '13px', color: '#15803d', border: '1px solid #bbf7d0',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say <strong>&ldquo;Stop&rdquo;</strong> to return to Nova
-                </div>
-              </>
-            )}
-
-            {escalationState === 'timeout' && (
-              <>
-                <div style={{ fontSize: '56px', marginBottom: '16px' }}>⏳</div>
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#92400e', marginBottom: '8px' }}>
-                  Staff Currently Occupied
-                </h2>
-                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
-                  {escalationMsg || 'Front desk staff members are currently assisting other visitors. Nova will gladly continue answering your questions!'}
-                </p>
-                <div style={{
-                  background: 'linear-gradient(135deg, #fef3c7, #fffbeb)',
-                  borderRadius: '14px', padding: '14px 16px', marginBottom: '18px',
-                  border: '1px solid #fde68a', textAlign: 'left',
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
-                    📞 Direct Contact Numbers
-                  </div>
-                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#78350f', marginBottom: '3px' }}>
-                    +91 80286 11880 / 81 / 82
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#92400e' }}>
-                    Admissions Desk: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
-                  </div>
-                </div>
-                <div style={{
-                  background: '#fffbeb', borderRadius: '12px', padding: '10px 16px',
-                  fontSize: '13px', color: '#92400e', border: '1px solid #fde68a',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say anything to continue with Nova
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* ── QR COMPANION MODAL ── */}
       {showCompanionModal && (
         <div style={{
@@ -2755,85 +2477,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           100% { opacity:0; transform: translateY(-60px) scale(1.15) rotate(25deg); }
         }
 
-        /* ══════════════════════════════
-             Nova CHARACTER ANIMATIONS
-        ══════════════════════════════ */
-
-        /* BODY — gentle breathing (always on) */
-        .nova-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
-        @keyframes charBreathe { 0%,100%{transform:scaleY(1)} 50%{transform:scaleY(1.016)} }
-
-        /* HEAD — base: idle micro-float */
-        .nova-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
-        @keyframes idleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
-
-        /* ── LISTENING ── */
-        .nova-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
-        @keyframes listenLean { to{transform:translateX(10px) rotate(6deg)} }
-
-        /* pulse ring */
-        .listen-r1 { animation:lRing 2s ease-out infinite; }
-        .listen-r2 { animation:lRing 2s 0.7s ease-out infinite; }
-        @keyframes lRing { 0%{r:92;opacity:0.55} 100%{r:140;opacity:0} }
-
-        /* ── PROCESSING ── */
-        .nova-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
-        @keyframes thinkTilt { to{transform:translateX(-12px) rotate(-7deg)} }
-
-        /* thinking arm rise */
-        .nova-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
-        @keyframes armRise { from{transform:translateY(30px);opacity:0} to{transform:none;opacity:1} }
-
-        /* thinking bubble float */
-        .tbub { animation:tBubFloat 1.6s ease-in-out infinite; }
-        @keyframes tBubFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
-
-        /* furrowed brow when thinking */
-        .brow-think { animation: browFurrow 0.5s ease-out forwards; transform-origin:133px 86px; }
-        @keyframes browFurrow { to{transform:translateY(4px)} }
-
-        /* ── SPEAKING ── */
-        .nova-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
-        @keyframes headBob { 0%,100%{transform:translateY(0) rotate(0)} 30%{transform:translateY(-5px) rotate(1.5deg)} 70%{transform:translateY(2px) rotate(-1deg)} }
-
-        /* mouth alternates: a visible ↔ b visible */
-        .nova-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
-        .nova-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
-        @keyframes mA { 0%,49%{opacity:1} 50%,100%{opacity:0} }
-        @keyframes mB { 0%,49%{opacity:0} 50%,100%{opacity:1} }
-
-        /* sound waves stagger */
-        .wave1 { animation: wv 1s 0.0s ease-in-out infinite; }
-        .wave2 { animation: wv 1s 0.2s ease-in-out infinite; }
-        .wave3 { animation: wv 1s 0.4s ease-in-out infinite; }
-        @keyframes wv { 0%,100%{opacity:0.2;stroke-width:2} 50%{opacity:0.9;stroke-width:3} }
       `}</style>
     </div>
   );
 }
-
-
-// ── Nova's avatar: used in message rows and header ───────────────────────
-const NovaAvatar = ({ size = 38, speaking = false }) => (
-  <div style={{ position: 'relative', flexShrink: 0 }}>
-    {speaking && (
-      <>
-        <div className="avatar-ring r1" style={{ width: size + 14, height: size + 14, top: -7, left: -7 }} />
-        <div className="avatar-ring r2" style={{ width: size + 22, height: size + 22, top: -11, left: -11 }} />
-      </>
-    )}
-    <div style={{
-      width: size, height: size, borderRadius: '50%',
-      background: 'linear-gradient(135deg, #1a237e 0%, #5c35c9 60%, #7c4dff 100%)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      boxShadow: speaking ? '0 0 0 3px #7c4dff55' : '0 2px 8px rgba(26,35,126,0.30)',
-      flexShrink: 0, overflow: 'hidden', position: 'relative',
-    }}>
-      {/* stylised person silhouette */}
-      <svg width={size * 0.62} height={size * 0.62} viewBox="0 0 40 40" fill="none">
-        <circle cx="20" cy="14" r="7" fill="rgba(255,255,255,0.92)" />
-        <path d="M4 38 C4 28 36 28 36 38" fill="rgba(255,255,255,0.92)" />
-      </svg>
-    </div>
-  </div>
-);

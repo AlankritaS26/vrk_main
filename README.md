@@ -33,7 +33,6 @@ venv\Scripts\python.exe run.py
 | Portal / Feature | URL / Endpoint | Default Credentials | Supported Device | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | **Interactive Kiosk** | `http://localhost:3000` | *None (Public Voice Terminal)* | **Laptop / Desktop Terminal Only** | Main digital receptionist (Nova). 100% voice-driven, vision recognition, no touch buttons. Blocked on mobile phones. |
-| **Front Desk Staff Dashboard** | `http://127.0.0.1:8001/staff`<br>*(or `http://<LAN-IP>:8001/staff`)* | Username: `staff`<br>Password: `rnsit2024`<br>*(Admin: `admin` / `111111`)* | **Staff Laptop / Tablet** | Real-time human handover queue, incoming visitor alerts with audio chime, live transcripts, Accept & Resolve actions. |
 | **Admin Control Plane** | `http://127.0.0.1:8001/logs-dashboard` | Username: `admin`<br>Password: `111111` | **Admin Laptop / PC** | Live conversation logs, rename history audit, biometric face encodings, and system wipe controls. |
 | **Mobile Session Summary & Brochure Portal** | `http://<LAN-IP>:8001/companion/<token>` | *None (Secured by 20-min session token)* | **Mobile Phone (Scan QR on Kiosk)** | Visitor takes away their session summary, personalized recap, official PDF brochures, and quick links on smartphone. |
 
@@ -47,7 +46,6 @@ venv\Scripts\python.exe run.py
 
 ### 🎙️ Pure Voice-Only Interaction (No Clicking):
 - **Zero Touch Required**: All clickable buttons ("Talk to Staff", "Phone Companion") have been removed from the kiosk header.
-- **Escalation Trigger**: Say *"I want to talk to a person"*, *"Connect me to human staff"*, *"I need a real person"*, or report an emergency (*"There is a medical emergency"*). Nova automatically alerts the staff dashboard.
 
 ---
 
@@ -174,7 +172,6 @@ ANSWER SOURCE: weather_api | traffic_api | entity_kb | general_rag | guardrail_r
 - **State Machine Architecture**: `BOT_HANDLING` $\to$ `ESCALATION_REQUESTED` $\to$ `STAFF_NOTIFIED` $\to$ `STAFF_CONNECTED` $\to$ `RESOLVED` (with a 60-second auto-timeout reverting to bot if staff is unavailable).
 - **Purely Voice-Triggered Escalation — No Buttons**:
   - **Explicit Voice Intent**: Say *"I want to talk to a person"*, *"Speak to human staff"*, *"Connect me to front desk"*, *"I need a real person"*, *"Talk to someone"*, or *"Transfer me"*.
-  - **Low RAG Confidence**: 3 consecutive low-confidence / uncacheable fallback answers automatically trigger escalation.
   - **Sensitive Keywords**: Automatic priority routing on queries containing *"emergency"*, *"medical"*, *"accident"*, *"harassment"*, or *"police"*.
 - **Live Staff Dashboard** — accessed by staff (not visitors) at `http://127.0.0.1:8001/staff`:
   - Protected with HTTP Basic authentication:
@@ -182,47 +179,15 @@ ANSWER SOURCE: weather_api | traffic_api | entity_kb | general_rag | guardrail_r
     - **Admin**: Username `admin` / Password `111111`
   - Real-time WebSocket alerts, live pending queue, conversation transcripts, and **Accept** / **Resolve** controls.
   - Staff open this URL on a separate laptop/tablet at the front desk and log in once.
-  - Multiple staff members can open the same dashboard at the same time. Everyone sees the same live escalation queue and conversation updates; the first staff member to select **Accept** becomes the connected responder.
   - To test from another computer or phone on the same Wi-Fi, find the backend computer's IPv4 address with `ipconfig`, then open `http://<IPv4-address>:8001/staff` on that device (for example, `http://192.168.1.25:8001/staff`). Allow Python/Uvicorn through Windows Firewall if the page cannot be reached. Use the computer's LAN address, not `127.0.0.1`, because `127.0.0.1` points to the device being used.
   - On a phone, use the same URL in Chrome/Edge and allow microphone access when using the staff voice control. HTTPS may be required by the browser for microphone access when the dashboard is not opened from localhost.
-  - If the microphone is blocked on another laptop, this is usually because `http://192.168.x.x:8001/staff` is not a secure browser context. Use HTTPS for a permanent setup. For a development-only test in Chrome, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add the exact dashboard origin (for example `http://192.168.0.117:8001`), enable the flag, relaunch Chrome, and then allow microphone access. Do not use this flag on a shared or public computer.
+  - If the microphone is blocked on another laptop, this is usually because `http://192.168.x.x:8001/staff` is not a secure browser context. Use HTTPS for a permanent setup. For a development-only test in Chrome, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add the exact dashboard origin (for example `http://192.168.0.167:8001`), enable the flag, relaunch Chrome, and then allow microphone access. Do not use this flag on a shared or public computer.
 - **Kiosk Wait UX**: Smooth glassmorphic modal with pulsing indicator, connection countdown, and auto-timeout after 60 seconds.
 
 ---
 
 ### 8. 📱 Staff Mobile App (Expo Go)
 
-The repository includes a native staff app in [`staff-mobile/`](./staff-mobile/). It avoids browser microphone restrictions on plain LAN HTTP.
-
-#### Capabilities
-
-- Native microphone permission through Expo Go.
-- Staff login, active escalation queue, summaries, transcripts, history, Accept, and Resolve.
-- Five-second staff voice clips uploaded to `POST /escalation/audio/{session_id}`.
-- Staff voice is relayed as original audio to the kiosk.
-- Visitor voice is relayed as original audio to the connected staff phone.
-- Existing kiosk STT remains primary: faster-whisper through `/stt/pcm`.
-- Live WebSocket updates and automatic scrolling to the newest active message.
-
-#### Run the staff app
-
-Start the backend first, then run from the repository root:
-
-```powershell
-Set-Location "C:\Users\Akshatha A\vrk_main\staff-mobile"
-npm install
-npx expo start --lan --port 8086
-```
-
-If Metro or Expo Go is using an old bundle:
-
-```powershell
-npx expo start --lan --port 8086 --clear
-```
-
-Then install Expo Go, scan the QR code, enter `http://192.168.0.117:8001`, and log in with `staff` / `rnsit2024`. The phone and backend computer must be on the same Wi-Fi. Accept an escalation and tap **Turn microphone on**.
-
-Do not run `cd staff-mobile` if the terminal is already in that directory. Do not use `CI=1` during normal development because it disables Metro reloads.
 
 #### Audio routing
 
@@ -319,11 +284,6 @@ The browser dashboard may require one click on **Enable visitor audio** before a
 | `/companion/qr/{token}` | `GET` (PNG) | Generates and streams PNG QR code image for mobile scanning. |
 | `/companion/validate/{token}` | `GET` | Validates companion token and returns session transcript summary. |
 | `/companion/brochure/{token}` | `GET` (PDF) | Streams contextual department or topic brochure PDF. |
-| `/escalation/request` | `POST` | Triggers a human handover request and notifies staff. |
-| `/escalation/active` | `GET` | Lists all active escalation requests for staff queue. |
-| `/escalation/accept/{session_id}` | `POST` | Staff member accepts an escalation request. |
-| `/escalation/resolve/{session_id}` | `POST` | Staff marks escalation resolved, returning kiosk to bot. |
-| `/staff` | `GET` (HTML) | Protected real-time staff escalation dashboard. |
 
 ---
 
@@ -366,8 +326,6 @@ vrk_main/
 |       +-- WelcomeScreen.js    Active voice screen, full-answer render, audio sync
 |       +-- IdleScreen.js       Attract mode, vision state indicators, carousel
 |       +-- GoodbyeScreen.js    Farewell transition card with RNSIT branding
-|       +-- AriaAvatar.js       Animated vector avatar character engine (Nova)
-|       +-- avatarReactions.js  Intent recognition & personality prefixes
 |       +-- kioskMic.js         Browser VAD 16kHz audio capture
 |       +-- index.css           Glassmorphic kiosk design system
 |       +-- index.js            React root mount
@@ -385,7 +343,6 @@ vrk_main/
 ├── backend/               # FastAPI Backend Application (Port 8001)
 │   ├── main.py            # API routes, WebSockets, session management
 │   ├── companion.py       # QR companion endpoints, mobile page, brochure matching
-│   ├── escalation.py      # Human handover state machine & staff dashboard
 │   ├── detection.py       # Camera pipeline, MediaPipe mesh, presence states
 │   ├── recognition.py     # ArcFace + SCRFD face embedding extraction
 │   ├── stt.py             # faster-whisper speech-to-text pipeline
@@ -415,8 +372,6 @@ vrk_main/
 │   │   ├── WelcomeScreen.js# Active voice screen, name capture, audio sync
 │   │   ├── IdleScreen.js  # Attract mode, vision state indicators, carousel
 │   │   ├── GoodbyeScreen.js# Farewell transition card with RNSIT branding
-│   │   ├── AriaAvatar.js  # Animated vector avatar character engine (Nova)
-│   │   ├── avatarReactions.js# Intent recognition & personality prefixes
 │   │   ├── kioskMic.js    # Browser VAD 16kHz audio capture
 │   │   ├── index.css      # Glassmorphic kiosk design system
 │   │   └── index.js       # React root mount
@@ -551,36 +506,7 @@ The following targeted fixes were applied without redesigning the UI or removing
    - Say *"Goodbye"* at the kiosk to conclude the session.
    - Refresh the companion page on your phone → the token is immediately invalidated, displaying the clean **"Session Expired"** card.
 
-### 8. 🛎️ Testing Human Handover & Front Desk Escalation
-1. **Open Staff Dashboard** (staff only — separate device from the kiosk):
-   - On a front-desk laptop or tablet, open a browser and navigate to:
-     ```
-     http://127.0.0.1:8001/staff
-     ```
-     (If on a different machine on the same network: `http://<kiosk-LAN-IP>:8001/staff`)
-   - Log in using staff credentials:
-     - Username: `staff` · Password: `rnsit2024`
-     - *or Admin:* Username: `admin` · Password: `111111`
-   - Note the top status bar: *"Live · WebSocket connected"*.
-2. **Trigger Escalation from Kiosk — Voice Only**:
-   - **Voice (primary)**: Say *"I need to speak to a real person"* or *"Connect me to human staff"* or *"Talk to someone"*.
-   - **Emergency**: Say *"There is a medical emergency"* — this auto-escalates immediately.
-3. **Observe Kiosk Feedback**:
-   - The kiosk displays the glassmorphic overlay: *"Connecting to Front Desk — A front desk reception team member has been alerted..."* with an animated connection spinner.
-4. **Accept Request on Staff Dashboard**:
-   - The staff dashboard flashes a red banner with the visitor's name, reason, and recent chat history.
-   - Click the green **"Accept"** button.
-   - The kiosk screen immediately transitions to: *"🤝 Staff Member Connected!"*.
-5. **Resolve the Escalation**:
-   - On the staff dashboard, click **"Resolve"**.
-   - The kiosk overlay dismisses, and Nova resumes: *"Your query has been addressed. Nova is ready to help you further."*
-6. **Timeout Auto-Revert Test**:
-   - Trigger an escalation and do not accept it on the staff dashboard.
-   - After 60 seconds, the kiosk displays: *"⏳ Staff Currently Occupied — Nova will continue helping you"* and automatically reverts to bot mode.
-
----
-
-## 📦 QR Companion — Required Dependencies & Setup
+### 📦 QR Companion — Required Dependencies & Setup
 
 ### Backend Python Packages (in `backend/requirements.txt`)
 

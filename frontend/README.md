@@ -82,18 +82,7 @@ npm start
 - Avoids robotic fallback labels (suppresses impersonal "Guest" strings for anonymous sessions).
 - Automatically resets the kiosk state machine back to `IdleScreen` after speech completion.
 
-### 5. `src/AriaAvatar.js` (Nova Avatar) — SVG / Canvas Character Engine
-- Interactive vector avatar with smooth micro-animations.
-- States: `idle`, `listening`, `thinking`, `speaking`, `happy`, `curious`, `bow`, `confused`.
-- Procedural eye blinking and ambient breathing cycles.
-- Dynamic mouth movement amplitude modulation linked to Web Audio API playback frequencies.
-
-### 6. `src/avatarReactions.js` — Emotion & Personality Utilities
-- Helper algorithms analyzing user utterances for intent classification (`curious`, `happy`, `thanks`, `greeting`, `confused`).
-- Computes time-aware greetings (*"Good morning! ☀️"*, *"Good afternoon! 🌤️"*).
-- Returns personality prefixes and suffixes to provide a warm, conversational demeanor.
-
-### 7. `src/kioskMic.js` — Client-Side Audio Pipeline
+### 5. `src/kioskMic.js` — Client-Side Audio Pipeline
 - Connects to browser `navigator.mediaDevices.getUserMedia` at 16,000 Hz mono PCM.
 - Runs `@ricky0123/vad-web` with Silero VAD ONNX model to capture clean speech segments while eliminating background lobby noise.
 - Transmits raw audio buffers to `/stt/pcm` for near-instant transcription.

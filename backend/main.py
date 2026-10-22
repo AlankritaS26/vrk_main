@@ -36,8 +36,6 @@ load_dotenv()
 
 # Companion token TTL (minutes) — read once here so companion.py can import it
 COMPANION_TOKEN_TTL_MINUTES: int = int(os.getenv("COMPANION_TOKEN_TTL_MINUTES", "20"))
-# Escalation timeout (seconds)
-ESCALATION_TIMEOUT_SECONDS: int = int(os.getenv("ESCALATION_TIMEOUT_SECONDS", "60"))
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,7 +52,6 @@ from backend.database import (
     delete_face_by_name, update_face_name_with_alias, update_session_user_name,
     sessions_collection, faces_collection, interactions_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
-    escalations_collection,
 )
 from backend.llm import (
     initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
@@ -160,8 +157,6 @@ active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 _last_activity_ts: float = 0.0
-# Per-session low-confidence answer counter (for escalation trigger)
-_low_confidence_count: int = 0
 
 
 # ==========================================
@@ -929,10 +924,7 @@ app.add_middleware(
 
 # ── Mount feature routers ────────────────────────────────────────────────────
 from backend.companion import router as companion_router
-from backend.escalation import router as escalation_router, staff_dashboard
 app.include_router(companion_router)
-app.include_router(escalation_router)
-app.add_api_route("/staff", staff_dashboard, response_class=HTMLResponse, methods=["GET"], tags=["escalation"])
 
 
 # ==========================================
@@ -1972,7 +1964,6 @@ async def start_session(
     active_session      = new_sess
     message_log         = []
     _last_activity_ts   = datetime.now().timestamp()
-    _low_confidence_count = 0  # reset escalation counter on new session
 
     # NOTE: resume_or_create_session() already persisted this session.
     await manager.broadcast({
@@ -1989,7 +1980,7 @@ async def start_session(
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
-    global active_session, _last_activity_ts, _low_confidence_count
+    global active_session, _last_activity_ts
     sid = session_id or (active_session["session_id"] if active_session else None)
 
     # Clean up companion tokens for this session
@@ -2002,7 +1993,6 @@ async def end_session_endpoint(session_id: str = None):
 
     active_session      = None
     _last_activity_ts   = 0.0
-    _low_confidence_count = 0
     await manager.broadcast({"type": "session_end", "session_id": sid})
     return {"status": "success"}
 
@@ -2191,33 +2181,6 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
     """
     global active_session, _last_activity_ts
 
-    # ─── Explicit human-handover intent → escalate before RAG ──────────────
-    # Import lazily to avoid circular import at module load time
-    try:
-        from backend.escalation import _detect_human_intent, _trigger_escalation
-        if _detect_human_intent(q_normalized):
-            # Build transcript from current message_log for staff context
-            transcript = [
-                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-                for m in message_log[-10:]
-            ]
-            asyncio.create_task(_trigger_escalation(
-                session_id=sid,
-                face_id=active_session.get("face_id") if active_session else None,
-                user_name=visitor_name,
-                reason="user_request",
-                transcript=transcript,
-            ))
-            logger.info("[ROUTE] ESCALATION (deterministic) — '%s'", q_normalized)
-            return (
-                "I'm connecting you to a staff member at the front desk right now. "
-                "Please wait a moment — someone will be with you shortly.",
-                "escalation",
-                "CONTINUE",
-            )
-    except Exception as _esc_err:
-        logger.warning("[ROUTE] Escalation intent check failed: %s", _esc_err)
-
     # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
     if _matches_short_phrase(q_normalized, GREETING_PHRASES):
         answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
@@ -2292,66 +2255,10 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
         answer = "Sure! You can say \"change my name to [Your Name]\" anytime, and I'll update it for you."
         return answer, "name_change_help", "CONTINUE"
 
-    # ─── Stop / Cancel escalation or cancel staff request ──────────────────
-    STOP_PHRASES = (
-        "stop", "cancel", "cancel staff", "no staff", "stop connecting",
-        "dont connect", "don't connect", "never mind", "nevermind",
-        "go back", "back to nova", "continue with nova", "i don't need staff",
-        "i dont need staff", "no human", "continue with bot", "cancel request",
-        "no thanks", "stop it", "abort",
-    )
-    is_stop = any(q_normalized == sp or q_normalized.startswith(sp + " ") or q_normalized.endswith(" " + sp) for sp in STOP_PHRASES)
-    if is_stop:
-        from backend.escalation import _get_escalation_state, cancel_escalation
-        esc_state = _get_escalation_state(sid) if sid else None
-        if esc_state and esc_state.get("status") in ("STAFF_NOTIFIED", "STAFF_CONNECTED"):
-            await cancel_escalation(sid, reason="visitor_cancelled")
-            answer = "Cancelled! Nova will continue assisting you right here. What would you like to know?"
-            logger.info("[ROUTE] ESCALATION_CANCEL (deterministic) — session=%s", sid[:8])
-            return answer, "escalation_cancel", "CONTINUE"
-        elif q_normalized in ("stop", "cancel", "stop it", "abort"):
+    if q_normalized in ("stop", "cancel", "stop it", "abort"):
             answer = "Sure, I'm here! What would you like to know about RNSIT?"
             logger.info("[ROUTE] STOP_COMMAND (deterministic) — session=%s", sid[:8])
             return answer, "stop_command", "CONTINUE"
-
-    # ─── Voice-only Escalation (Pre-RAG Deterministic Handover) ─────────────
-    # Intercept human staff requests and sensitive emergencies BEFORE RAG/LLM
-    # so we never return "I don't have that detail" when the visitor asks for staff!
-    from backend.escalation import _detect_human_intent, _detect_sensitive, _trigger_escalation
-
-    if _detect_sensitive(q_normalized):
-        esc_transcript = [
-            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-            for m in message_log[-10:]
-        ]
-        fid = active_session.get("face_id") if active_session else None
-        await _trigger_escalation(
-            session_id=sid,
-            face_id=fid,
-            user_name=visitor_name,
-            reason="sensitive_topic",
-            transcript=esc_transcript,
-        )
-        answer = "I am alerting campus security and front desk staff immediately to assist you. Please wait right here."
-        logger.info("[ROUTE] SENSITIVE_ESCALATION (deterministic) — session=%s", sid[:8])
-        return answer, "escalation_sensitive", "CONTINUE"
-
-    if _detect_human_intent(q_normalized):
-        esc_transcript = [
-            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-            for m in message_log[-10:]
-        ]
-        fid = active_session.get("face_id") if active_session else None
-        await _trigger_escalation(
-            session_id=sid,
-            face_id=fid,
-            user_name=visitor_name,
-            reason="user_request",
-            transcript=esc_transcript,
-        )
-        answer = "I am connecting you to our front desk staff right now. Please hold on a moment while I alert them to assist you directly at this kiosk. If you want to continue with me instead, simply say 'stop' at any time."
-        logger.info("[ROUTE] HUMAN_ESCALATION (deterministic) — session=%s", sid[:8])
-        return answer, "escalation_request", "CONTINUE"
 
     # ─── Thank you / bye / natural sign-off → end session immediately ───────
     if _is_farewell(q_normalized):
@@ -2532,36 +2439,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         logger.warning("[SESSION] context write-back failed: %s", exc)
 
     return await _respond(answer, source=route)
-    # ── Escalation check: low-confidence / sensitive topic detection ──────────
-    global _low_confidence_count
-    answer_is_low_confidence = not _is_cacheable(answer)
-    if answer_is_low_confidence:
-        _low_confidence_count += 1
-    else:
-        _low_confidence_count = max(0, _low_confidence_count - 1)  # decay on good answer
-
-    try:
-        from backend.escalation import maybe_escalate, _detect_sensitive
-        # Build transcript for escalation context
-        esc_transcript = [
-            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-            for m in message_log[-10:]
-        ]
-        escalated = await maybe_escalate(
-            question=question,
-            answer=answer,
-            session_id=sid,
-            face_id=fid,
-            user_name=visitor_name,
-            low_confidence_count=_low_confidence_count,
-            transcript=esc_transcript,
-        )
-        if escalated:
-            answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
-    except Exception as _esc_err:
-        logger.warning("[ASK] Escalation check failed: %s", _esc_err)
-
-    return await _respond(answer, source="rag_llm")
 
 
 @app.get("/ask/stream")
@@ -2700,32 +2577,6 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             })
         except Exception as exc:
             logger.warning("[SESSION] context write-back failed: %s", exc)
-        # ── Escalation check for streaming path ───────────────────────────────
-        global _low_confidence_count
-        if not _is_cacheable(answer):
-            _low_confidence_count += 1
-        else:
-            _low_confidence_count = max(0, _low_confidence_count - 1)
-        try:
-            from backend.escalation import maybe_escalate
-            esc_transcript = [
-                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-                for m in message_log[-10:]
-            ]
-            escalated = await maybe_escalate(
-                question=question,
-                answer=answer,
-                session_id=sid,
-                face_id=fid,
-                user_name=visitor_name,
-                low_confidence_count=_low_confidence_count,
-                transcript=esc_transcript,
-            )
-            if escalated:
-                answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
-        except Exception as _esc_err:
-            logger.warning("[STREAM] Escalation check failed: %s", _esc_err)
-
         await _finish(answer, "CONTINUE")
         yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': 'CONTINUE'})}\n\n"
 
@@ -2968,7 +2819,6 @@ async def greet_visitor(payload: GreetVisitorPayload):
     final_session_id = active_session["session_id"]
     message_log = []
     _last_activity_ts   = datetime.now().timestamp()
-    _low_confidence_count = 0  # reset escalation counter
 
     await manager.broadcast({
         "type": "session_start",
