@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "RNSIT Staff",
+    "slug": "rnsit-staff",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "plugins": ["expo-audio"],
+    "android": {
+      "package": "com.rnsit.staff",
+      "permissions": [
+        "RECORD_AUDIO"
+      ]
+    },
+    "ios": {
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "RNSIT Staff uses the microphone to speak with kiosk visitors."
+      }
+    },
+    "plugins": [
+      "expo-status-bar",
+      "expo-audio"
+    ]
+  }
+}

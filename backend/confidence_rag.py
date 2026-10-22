@@ -578,7 +578,7 @@ def is_emotional_reengagement_response(text: str) -> bool:
     for prefix in ("i'm ", "im ", "i am ", "i feel ", "feeling "):
         if t.startswith(prefix):
             rest = t[len(prefix):].strip()
-            if rest and len(rest.split()) <= 4:  # short after prefix = emotional, not a new question
+            if rest and len(rest.split()) <= 4 and any(w in rest for w in _EMOTION_STATE_WORDS):
                 return True
 
     # Pattern 3: explicit emotion word at start of short sentence (<= 5 words, no interrogative start)

@@ -23,15 +23,18 @@ Analytics hook: every escalation writes created_at, reason, resolution, resolve_
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
 import re
 import secrets
+import wave
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
@@ -368,6 +371,8 @@ async def _trigger_escalation(
         "created_at": now,
         "updated_at": now,
         "transcript": transcript[-10:] if transcript else [],  # last 10 messages
+        "summary": f"Human assistance requested ({reason.replace('_', ' ')}). "
+                   f"Showing the latest {min(len(transcript), 10)} conversation messages.",
     }
 
     # Persist to Redis (live state) + MongoDB (permanent record)
@@ -380,6 +385,7 @@ async def _trigger_escalation(
             user_name=user_name,
             reason=reason,
             transcript=transcript[-10:] if transcript else [],
+            summary=state["summary"],
         )
     except Exception as e:
         logger.warning("[ESC] MongoDB save failed: %s", e)
@@ -412,6 +418,10 @@ async def _trigger_escalation(
 class EscalationRequest(BaseModel):
     reason: str = "user_request"
     message: str = ""
+
+class EscalationMessage(BaseModel):
+    session_id: str
+    text: str
 
 
 @router.post("/request")
@@ -457,6 +467,144 @@ async def request_escalation(payload: EscalationRequest):
     return {"status": "escalation_triggered", "session_id": session_id, "reason": state["reason"]}
 
 
+async def _append_escalation_message(
+    session_id: str, speaker: str, text: str, has_audio: bool = False
+) -> dict:
+    state = _get_escalation_state(session_id)
+    if not state or state.get("status") != "STAFF_CONNECTED":
+        raise HTTPException(status_code=409, detail="No connected staff member for this session.")
+    message = {
+        "speaker": speaker,
+        "text": text.strip()[:1000],
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+    }
+    if has_audio:
+        message["has_audio"] = True
+    state.setdefault("transcript", []).append(message)
+    state["transcript"] = state["transcript"][-50:]
+    state["summary"] = (
+        f"Human assistance requested ({state.get('reason', 'unknown').replace('_', ' ')}). "
+        f"{len(state['transcript'])} conversation messages recorded."
+    )
+    state["updated_at"] = datetime.now().isoformat()
+    _store_escalation_state(session_id, state)
+    try:
+        from backend.database import escalations_collection
+        esc_doc = await escalations_collection.find_one(
+            {"session_id": session_id, "status": "STAFF_CONNECTED"},
+            sort=[("created_at", -1)],
+        )
+        if esc_doc:
+            await escalations_collection.update_one(
+                {"_id": esc_doc["_id"]},
+                {"$set": {
+                    "transcript": state["transcript"],
+                    "summary": state["summary"],
+                    "updated_at": state["updated_at"],
+                }},
+            )
+    except Exception as e:
+        logger.warning("[ESC] message: DB update failed: %s", e)
+    manager = _get_manager()
+    if manager:
+        await manager.broadcast({
+            "type": "escalation_message",
+            "session_id": session_id,
+            "message": message,
+        })
+    return message
+
+
+@router.post("/message")
+async def visitor_escalation_message(payload: EscalationMessage):
+    text = payload.text.strip()
+    if not text or len(text) > 1000:
+        raise HTTPException(status_code=400, detail="Message must contain 1-1000 characters.")
+    try:
+        from backend.main import active_session
+    except ImportError:
+        active_session = None
+    if not active_session or active_session.get("session_id") != payload.session_id:
+        raise HTTPException(status_code=403, detail="Session is not active.")
+    return {"message": await _append_escalation_message(payload.session_id, "visitor", text)}
+
+
+@router.post("/message/{session_id}")
+async def staff_escalation_message(session_id: str, payload: EscalationMessage,
+                                   username: str = Depends(_authenticate_staff)):
+    text = payload.text.strip()
+    if payload.session_id != session_id or not text or len(text) > 1000:
+        raise HTTPException(status_code=400, detail="Invalid escalation message.")
+    return {"message": await _append_escalation_message(session_id, "staff", text)}
+
+
+@router.post("/audio/{session_id}")
+async def staff_escalation_audio(
+    session_id: str,
+    audio: UploadFile = File(...),
+    username: str = Depends(_authenticate_staff),
+):
+    """Transcribe a short staff voice clip and add it to the live escalation."""
+    state = _get_escalation_state(session_id)
+    if not state or state.get("status") != "STAFF_CONNECTED":
+        raise HTTPException(status_code=409, detail="No connected staff member for this session.")
+    content = await audio.read()
+    if not content or len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio clip is empty or too large.")
+    try:
+        from backend.stt import transcribe_audio
+        result = await asyncio.to_thread(transcribe_audio, content)
+    except Exception as e:
+        logger.warning("[ESC] staff audio transcription failed: %s", e)
+        raise HTTPException(status_code=502, detail="Staff audio transcription failed.") from e
+    text = (result.get("text") or "").strip()
+    if result.get("error"):
+        logger.warning("[ESC] staff audio STT returned error=%s content_type=%s size=%d",
+                       result["error"], audio.content_type, len(content))
+        raise HTTPException(status_code=422, detail=f"Speech recognition failed: {result['error']}")
+    if not text:
+        return {"message": None, "text": "", "confidence": result.get("confidence", 0)}
+    message = await _append_escalation_message(session_id, "staff", text, has_audio=True)
+    manager = _get_manager()
+    if manager:
+        await manager.broadcast({
+            "type": "escalation_audio",
+            "session_id": session_id,
+            "speaker": "staff",
+            "mime_type": audio.content_type or "audio/mp4",
+            "audio": base64.b64encode(content).decode("ascii"),
+            "text": text,
+        })
+    return {"message": message, "text": text, "confidence": result.get("confidence", 0)}
+
+
+@router.post("/visitor-audio/{session_id}")
+async def visitor_escalation_audio(session_id: str, request: Request):
+    """Relay the visitor's original PCM clip to connected staff dashboards."""
+    state = _get_escalation_state(session_id)
+    if not state or state.get("status") != "STAFF_CONNECTED":
+        raise HTTPException(status_code=409, detail="No connected staff member for this session.")
+    content = await request.body()
+    if not content or len(content) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="Audio clip is empty or too large.")
+    manager = _get_manager()
+    if manager:
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(content)
+        await manager.broadcast({
+            "type": "escalation_audio",
+            "session_id": session_id,
+            "speaker": "visitor",
+            "mime_type": "audio/wav",
+            "audio": base64.b64encode(wav_buffer.getvalue()).decode("ascii"),
+        })
+    return {"status": "relayed"}
+
+
 @router.get("/active")
 async def get_active_escalations(username: str = Depends(_authenticate_staff)):
     """Return all open escalations for the staff dashboard poll."""
@@ -464,6 +612,21 @@ async def get_active_escalations(username: str = Depends(_authenticate_staff)):
     # Filter to only truly open ones
     open_ones = [e for e in escalations if e.get("status") in ("STAFF_NOTIFIED", "STAFF_CONNECTED")]
     return {"escalations": open_ones, "count": len(open_ones)}
+
+
+@router.get("/history")
+async def get_escalation_history(limit: int = 50, username: str = Depends(_authenticate_staff)):
+    """Return recent persisted escalations for the dashboard history menu."""
+    limit = max(1, min(limit, 100))
+    try:
+        from backend.database import escalations_collection
+        records = await escalations_collection.find(
+            {}, {"_id": 0}
+        ).sort("created_at", -1).limit(limit).to_list(length=limit)
+        return {"escalations": records, "count": len(records)}
+    except Exception as e:
+        logger.warning("[ESC] history: DB read failed: %s", e)
+        return {"escalations": [], "count": 0, "error": "history_unavailable"}
 
 
 @router.post("/accept/{session_id}")
@@ -589,7 +752,7 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
 
     ws_url = backend_url.replace("http://", "ws://").replace("https://", "wss://")
 
-    return HTMLResponse(content=f"""<!DOCTYPE html>
+    response = HTMLResponse(content=f"""<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -601,59 +764,87 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
     *, *::before, *::after {{ box-sizing: border-box; margin:0; padding:0; }}
     body {{
       font-family: 'Inter', sans-serif;
-      background: #0f172a; color: #f1f5f9;
+      background: #ffffff !important; color: #172033;
       min-height: 100vh;
     }}
     header {{
-      background: linear-gradient(90deg, #1e3a5f, #1a56db);
+      background: #ffffff; color: #172033;
+      border-bottom: 1px solid #e2e8f0;
       padding: 18px 28px;
       display: flex; align-items: center; justify-content: space-between;
+      box-shadow: 0 2px 10px rgba(15, 23, 42, .06);
     }}
     header h1 {{ font-size: 20px; font-weight: 700; }}
     header .badge {{
-      background: rgba(255,255,255,0.15); padding: 4px 12px; border-radius: 20px;
+      background: #eef2ff; color: #3730a3; padding: 4px 12px; border-radius: 20px;
       font-size: 12px; font-weight: 600;
     }}
     .status-bar {{
-      background: #1e293b; padding: 8px 28px;
-      display: flex; align-items: center; gap: 12px; font-size: 13px; color: #94a3b8;
+      background: #ffffff; border-bottom: 1px solid #e2e8f0; padding: 8px 28px;
+      display: flex; align-items: center; gap: 12px; font-size: 13px; color: #64748b;
     }}
     .dot {{ width:8px; height:8px; border-radius:50%; background:#10b981;
             box-shadow:0 0 0 3px rgba(16,185,129,.2); animation: pulse 2s infinite; }}
     .dot.red {{ background:#ef4444; box-shadow:0 0 0 3px rgba(239,68,68,.2); }}
     @keyframes pulse {{ 0%,100%{{opacity:1}} 50%{{opacity:.5}} }}
 
-    main {{ padding: 28px; max-width: 1000px; margin: 0 auto; }}
-    h2 {{ font-size: 16px; font-weight: 600; color: #94a3b8; margin-bottom: 16px;
+    main {{ background: #ffffff; padding: 32px 28px; max-width: 1080px; margin: 0 auto; }}
+    h2 {{ font-size: 16px; font-weight: 700; color: #475569; margin-bottom: 16px;
            text-transform: uppercase; letter-spacing: 1px; }}
 
     #queue {{ display: flex; flex-direction: column; gap: 14px; }}
 
     .card {{
-      background: #1e293b; border: 1px solid #334155;
-      border-radius: 14px; padding: 20px 24px;
-      transition: border-color 0.2s;
+      background: #ffffff; border: 1px solid #e2e8f0;
+      border-radius: 16px; padding: 20px 24px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, .06);
+      transition: border-color 0.2s, box-shadow 0.2s;
     }}
-    .card.urgent {{ border-color: #ef4444; }}
-    .card.connected {{ border-color: #10b981; }}
+    .card:hover {{ box-shadow: 0 12px 30px rgba(15, 23, 42, .09); }}
+    .card.urgent {{ border-color: #fca5a5; }}
+    .card.connected {{ border-color: #86efac; }}
 
     .card-top {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }}
-    .visitor-name {{ font-size:18px; font-weight:700; color:#f8fafc; }}
+    .visitor-name {{ font-size:18px; font-weight:700; color:#172033; }}
     .reason-badge {{
       padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 600;
-      background: rgba(239,68,68,.15); color: #fca5a5;
+      background: #fef2f2; color: #b91c1c;
     }}
-    .reason-badge.sensitive {{ background: rgba(245,158,11,.15); color: #fcd34d; }}
-    .reason-badge.connected {{ background: rgba(16,185,129,.15); color: #6ee7b7; }}
+    .reason-badge.sensitive {{ background: #fffbeb; color: #b45309; }}
+    .reason-badge.connected {{ background: #ecfdf5; color: #047857; }}
 
     .meta {{ font-size: 13px; color: #64748b; margin-bottom: 14px; line-height: 1.6; }}
     .transcript {{
-      background: #0f172a; border-radius: 8px; padding: 12px 14px;
-      font-size: 12px; color: #94a3b8; max-height: 160px; overflow-y: auto;
+      background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 10px; padding: 12px 14px;
+      font-size: 12px; color: #475569; max-height: 160px; overflow-y: auto;
       margin-bottom: 14px; line-height: 1.7;
     }}
-    .transcript .visitor {{ color: #93c5fd; }}
-    .transcript .nova {{ color: #86efac; }}
+    .transcript .visitor {{ color: #2563eb; }}
+    .transcript .nova {{ color: #15803d; }}
+    .transcript .staff {{ color: #b45309; }}
+    .staff-chat {{ display:flex; gap:8px; margin-top:12px; }}
+    .staff-chat input {{ flex:1; min-width:0; background:#ffffff; color:#172033; border:1px solid #cbd5e1; border-radius:8px; padding:9px 10px; }}
+    .staff-chat button {{ background:#2563eb; color:#fff; border:0; border-radius:8px; padding:0 14px; font-weight:600; cursor:pointer; }}
+    .voice-status {{ color:#047857; font-size:12px; margin-top:8px; }}
+    .menu-btn {{ background:#ffffff; color:#1d4ed8; border:1px solid #bfdbfe; border-radius:8px; padding:8px 12px; cursor:pointer; font-weight:600; }}
+    .menu-btn:hover {{ background:#eff6ff; }}
+    #history-panel {{ display:none; position:fixed; top:0; right:0; width:min(440px, 92vw); height:100vh; overflow:auto; background:#ffffff; border-left:1px solid #e2e8f0; z-index:20; padding:24px; box-shadow:-12px 0 30px rgba(15,23,42,.16); }}
+    #history-panel h2 {{ margin:0 0 16px; }}
+    .history-item {{ border-bottom:1px solid #e2e8f0; padding:12px 0; }}
+    .history-item strong {{ color:#172033; }}
+    .summary-toggle {{ margin-top:8px; background:#eff6ff; color:#1d4ed8; border:1px solid #bfdbfe; border-radius:6px; padding:6px 9px; cursor:pointer; font-size:12px; font-weight:600; }}
+    .history-summary {{ margin-top:8px; padding:10px; background:#f8fafc; border-radius:7px; color:#475569; font-size:12px; line-height:1.5; }}
+    .conversation-toggle {{ margin-top:8px; background:#ecfdf5; color:#047857; border:1px solid #86efac; }}
+    .history-conversation {{ margin-top:8px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:10px; max-height:300px; overflow-y:auto; }}
+    .conversation-section {{ margin-top:8px; }}
+    .conversation-section h3 {{ font-size:12px; margin:0 0 6px; color:#cbd5e1; }}
+    .conversation-section .history-conversation {{ margin-top:0; }}
+    .history-message {{ padding:8px 9px; margin-bottom:7px; border-radius:7px; font-size:12px; line-height:1.45; }}
+    .history-message:last-child {{ margin-bottom:0; }}
+    .history-message.visitor {{ background:#eff6ff; color:#1d4ed8; }}
+    .history-message.staff {{ background:#fffbeb; color:#b45309; }}
+    .history-message.nova {{ background:#ecfdf5; color:#15803d; }}
+    .history-message .speaker {{ display:block; font-weight:700; font-size:11px; margin-bottom:3px; }}
 
     .actions {{ display:flex; gap:10px; flex-wrap:wrap; }}
     .btn {{
@@ -664,8 +855,8 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
     .btn-accept:hover {{ background:#059669; }}
     .btn-resolve {{ background:#6366f1; color:#fff; }}
     .btn-resolve:hover {{ background:#4f46e5; }}
-    .btn-timeout {{ background:#374151; color:#9ca3af; }}
-    .btn-timeout:hover {{ background:#4b5563; }}
+    .btn-timeout {{ background:#f1f5f9; color:#475569; border:1px solid #cbd5e1; }}
+    .btn-timeout:hover {{ background:#e2e8f0; }}
 
     .empty {{
       text-align:center; padding: 60px 20px; color:#475569;
@@ -687,7 +878,11 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
 
   <header>
     <h1>🎯 Staff Escalation Dashboard</h1>
-    <span class="badge">Logged in as: {username}</span>
+    <div style="display:flex;align-items:center;gap:10px">
+      <button class="menu-btn" onclick="toggleHistory()">☰ Escalation history</button>
+      <button class="menu-btn" id="audio-btn" onclick="enableEscalationAudio()">🔊 Enable visitor audio</button>
+      <span class="badge">Logged in as: {username}</span>
+    </div>
   </header>
 
   <div class="status-bar">
@@ -701,6 +896,11 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
     <h2 id="queue-title">Active Escalations</h2>
     <div id="queue"><div class="empty"><div class="icon">✅</div><p>No active escalations. All clear!</p></div></div>
   </main>
+  <aside id="history-panel">
+    <button class="menu-btn" onclick="toggleHistory()">Close</button>
+    <h2>Recent Escalations</h2>
+    <div id="history-list"><div class="empty">Loading history…</div></div>
+  </aside>
 
   <script>
     const BACKEND = window.location.origin || '{backend_url}';
@@ -708,6 +908,66 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
     const TOKEN   = '{dash_token}';
 
     let queue = {{}};
+    const staffVoices = {{}};
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    function startStaffVoice(sessionId) {{
+      if (!SpeechRecognition || staffVoices[sessionId]) return;
+      const insecure = !window.isSecureContext && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1';
+      if (insecure) {{
+        const status = document.getElementById('voice-' + sessionId);
+        if (status) status.textContent = 'Microphone blocked: open this dashboard over HTTPS (LAN HTTP is not allowed by the browser).';
+        return;
+      }}
+      const recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      recognition.lang = 'en-IN';
+      recognition.onresult = (event) => {{
+        const result = event.results[event.results.length - 1];
+        if (result && result.isFinal) {{
+          const text = result[0].transcript.trim();
+          if (text) sendStaffMessageText(sessionId, text);
+        }}
+      }};
+      recognition.onend = () => {{
+        if (staffVoices[sessionId] === recognition && queue[sessionId]?.status === 'STAFF_CONNECTED') {{
+          try {{ recognition.start(); }} catch (_) {{}}
+        }}
+      }};
+      recognition.onerror = (event) => {{
+        const status = document.getElementById('voice-' + sessionId);
+        if (status) status.textContent = event.error === 'not-allowed'
+          ? 'Microphone permission was denied. Open the site permissions and choose Allow.'
+          : 'Hands-free voice reconnecting…';
+      }};
+      staffVoices[sessionId] = recognition;
+      const status = document.getElementById('voice-' + sessionId);
+      if (status) status.textContent = '🎙 Hands-free microphone active — speak normally';
+      try {{ recognition.start(); }} catch (_) {{}}
+    }}
+
+    function stopStaffVoice(sessionId) {{
+      const recognition = staffVoices[sessionId];
+      if (recognition) {{
+        delete staffVoices[sessionId];
+        try {{ recognition.stop(); }} catch (_) {{}}
+      }}
+    }}
+
+    function toggleStaffVoice(sessionId) {{
+      if (staffVoices[sessionId]) {{
+        stopStaffVoice(sessionId);
+        const button = document.getElementById('voice-btn-' + sessionId);
+        if (button) button.textContent = '🎙 Turn microphone on';
+        const status = document.getElementById('voice-' + sessionId);
+        if (status) status.textContent = 'Microphone off';
+      }} else {{
+        startStaffVoice(sessionId);
+        const button = document.getElementById('voice-btn-' + sessionId);
+        if (button) button.textContent = '🔴 Turn microphone off';
+      }}
+    }}
 
     function timeAgo(iso) {{
       const diff = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
@@ -726,6 +986,84 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
       return map[reason] || reason;
     }}
 
+    function escapeHtml(value) {{
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({{
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }})[ch]);
+    }}
+
+    let escalationAudioContext = null;
+    let escalationAudioCursor = 0;
+    function enableEscalationAudio() {{
+      try {{
+        if (!escalationAudioContext) {{
+          escalationAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }}
+        const resume = escalationAudioContext.resume();
+        Promise.resolve(resume).then(() => {{
+          const button = document.getElementById('audio-btn');
+          if (button) button.textContent = '🔊 Visitor audio enabled';
+        }}).catch(() => {{}});
+      }} catch (_) {{}}
+    }}
+    document.addEventListener('click', () => {{
+      if (escalationAudioContext?.state === 'suspended') escalationAudioContext.resume().catch(() => {{}});
+    }}, {{ passive: true }});
+
+    async function playEscalationAudio(msg) {{
+      if (!msg.audio) return;
+      try {{
+        if (!escalationAudioContext) {{
+          escalationAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+        }}
+        const ctx = escalationAudioContext;
+        if (ctx.state === 'suspended') {{
+          await ctx.resume();
+          if (ctx.state === 'suspended') throw new Error('Click Enable visitor audio first.');
+        }}
+        const binary = atob(msg.audio);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        let buffer;
+        if ((msg.mime_type || '').startsWith('audio/pcm')) {{
+          const samples = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+          buffer = ctx.createBuffer(1, samples.length, 16000);
+          const channel = buffer.getChannelData(0);
+          for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+        }} else {{
+          buffer = await ctx.decodeAudioData(bytes.buffer);
+        }}
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        const startAt = Math.max(ctx.currentTime, escalationAudioCursor);
+        source.start(startAt);
+        escalationAudioCursor = startAt + buffer.duration;
+      }} catch (error) {{
+        console.warn('Escalation audio playback failed', error);
+      }}
+    }}
+
+    function renderHistoryConversation(transcript) {{
+      const messages = transcript || [];
+      if (!messages.length) return '<div class="meta">No conversation messages were saved.</div>';
+      return messages.map(m => {{
+        const speaker = m.speaker === 'visitor' ? 'visitor' : m.speaker === 'staff' ? 'staff' : 'nova';
+        const label = speaker === 'visitor' ? '👤 Visitor' : speaker === 'staff' ? '🧑‍💼 Staff' : '🤖 Nova';
+        return `<div class="history-message ${{speaker}}">
+          <span class="speaker">${{label}} ${{m.timestamp ? `· ${{escapeHtml(m.timestamp)}}` : ''}}</span>
+          ${{escapeHtml(m.text || '')}}
+        </div>`;
+      }}).join('');
+    }}
+
+    function renderSpeakerConversation(transcript, speaker, emptyText) {{
+      const messages = (transcript || []).filter(m => m.speaker === speaker);
+      return messages.length
+        ? renderHistoryConversation(messages)
+        : `<div class="meta">${{emptyText}}</div>`;
+    }}
+
     function renderQueue() {{
       const el = document.getElementById('queue');
       const items = Object.values(queue);
@@ -739,7 +1077,7 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
         const isConnected = e.status === 'STAFF_CONNECTED';
         const isSensitive = e.reason === 'sensitive_topic';
         const transcript  = (e.transcript || []).map(m =>
-          `<div class="${{m.speaker === 'visitor' ? 'visitor' : 'nova'}}"><strong>${{m.speaker === 'visitor' ? '👤 Visitor' : '🤖 Nova'}}:</strong> ${{m.text || ''}}</div>`
+          `<div class="${{m.speaker === 'visitor' ? 'visitor' : m.speaker === 'staff' ? 'staff' : 'nova'}}"><strong>${{m.speaker === 'visitor' ? '👤 Visitor' : m.speaker === 'staff' ? '🧑‍💼 Staff' : '🤖 Nova'}}:</strong> ${{m.text || ''}}</div>`
         ).join('');
         return `
         <div class="card ${{isConnected ? 'connected' : isSensitive ? 'urgent' : ''}}" id="card-${{e.session_id}}">
@@ -752,14 +1090,23 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
             &nbsp;·&nbsp; Escalated ${{timeAgo(e.created_at)}}
             &nbsp;·&nbsp; Status: <strong>${{e.status}}</strong>
           </div>
-          ${{transcript ? `<div class="transcript">${{transcript}}</div>` : ''}}
+          ${{e.summary ? `<div class="meta"><strong>Summary:</strong> ${{e.summary}}</div>` : ''}}
+          ${{transcript ? `<div class="transcript" data-autoscroll="${{isConnected ? 'true' : 'false'}}"><strong>Conversation</strong>${{transcript}}</div>` : ''}}
           <div class="actions">
             ${{!isConnected ? `<button class="btn btn-accept" onclick="accept('${{e.session_id}}')">📞 Accept</button>` : ''}}
             <button class="btn btn-resolve" onclick="resolve('${{e.session_id}}', 'resolved')">✅ Mark Resolved</button>
             <button class="btn btn-timeout" onclick="resolve('${{e.session_id}}', 'dismissed')">✖ Dismiss</button>
           </div>
+          ${{isConnected ? `<div class="voice-status" id="voice-${{e.session_id}}">Microphone off — turn it on when ready.</div>` : ''}}
+          ${{isConnected ? `<button class="btn btn-accept" id="voice-btn-${{e.session_id}}" onclick="toggleStaffVoice('${{e.session_id}}')">🎙 Turn microphone on</button>` : ''}}
         </div>`;
       }}).join('');
+      requestAnimationFrame(() => {{
+        el.querySelectorAll('.transcript[data-autoscroll="true"]').forEach(panel => {{
+          panel.scrollTop = panel.scrollHeight;
+        }});
+      }});
+      items.forEach(e => e.status !== 'STAFF_CONNECTED' && stopStaffVoice(e.session_id));
     }}
 
     async function fetchQueue() {{
@@ -792,6 +1139,68 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
       renderQueue();
     }}
 
+    async function sendStaffMessage(event, sessionId) {{
+      event.preventDefault();
+      const input = document.getElementById('staff-msg-' + sessionId);
+      const text = input && input.value.trim();
+      if (!text) return;
+      input.value = '';
+      await sendStaffMessageText(sessionId, text);
+    }}
+
+    async function sendStaffMessageText(sessionId, text) {{
+      const response = await fetch(BACKEND + '/escalation/message/' + sessionId + '?token=' + encodeURIComponent(TOKEN), {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ session_id: sessionId, text }})
+      }});
+      if (!response.ok) await fetchQueue();
+    }}
+
+    function toggleHistory() {{
+      const panel = document.getElementById('history-panel');
+      panel.style.display = panel.style.display === 'block' ? 'none' : 'block';
+      if (panel.style.display === 'block') fetchHistory();
+    }}
+
+    async function fetchHistory() {{
+      const list = document.getElementById('history-list');
+      try {{
+        const response = await fetch(BACKEND + '/escalation/history?limit=50&token=' + encodeURIComponent(TOKEN));
+        const data = await response.json();
+        const records = data.escalations || [];
+        list.innerHTML = records.length ? records.map(e => `
+          <div class="history-item">
+            <strong>${{e.user_name || 'Guest'}}</strong> · ${{e.status || 'UNKNOWN'}}<br>
+            <span class="meta">${{reasonLabel(e.reason || '')}} · ${{e.created_at ? new Date(e.created_at).toLocaleString() : ''}}</span><br>
+            <span class="meta">${{(e.transcript || []).length}} conversation messages</span>
+            <details>
+              <summary class="summary-toggle">View summary</summary>
+              <div class="history-summary">${{escapeHtml(e.summary || 'No summary was saved for this escalation.')}}</div>
+            </details>
+            <details>
+              <summary class="summary-toggle conversation-toggle">View conversation</summary>
+              <div class="history-conversation">
+                <div class="conversation-section">
+                  <h3>👤 Visitor conversation</h3>
+                  ${{renderSpeakerConversation(e.transcript, 'visitor', 'No visitor messages were saved.')}}
+                </div>
+                <div class="conversation-section">
+                  <h3>🧑‍💼 Staff conversation</h3>
+                  ${{renderSpeakerConversation(e.transcript, 'staff', 'No staff messages were saved.')}}
+                </div>
+                <div class="conversation-section">
+                  <h3>🤖 Nova conversation</h3>
+                  ${{renderSpeakerConversation(e.transcript, 'nova', 'No Nova messages were saved.')}}
+                </div>
+              </div>
+            </details>
+          </div>`).join('') : '<div class="empty">No escalation records found.</div>';
+      }} catch (_) {{
+        list.innerHTML = '<div class="empty">Escalation history is unavailable.</div>';
+      }}
+    }}
+
     // WebSocket for instant push alerts
     function connectWs() {{
       const ws = new WebSocket(WS_URL);
@@ -813,6 +1222,19 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
           }} else if (msg.type === 'escalation_resolved' || msg.type === 'escalation_timeout' || msg.type === 'escalation_cancelled') {{
             delete queue[msg.session_id];
             renderQueue();
+          }} else if (msg.type === 'escalation_message') {{
+            if (!queue[msg.session_id]) {{
+              fetchQueue();
+            }} else {{
+              const messages = queue[msg.session_id].transcript || [];
+              const duplicate = messages.some(m => m.timestamp === msg.message?.timestamp && m.text === msg.message?.text && m.speaker === msg.message?.speaker);
+              if (!duplicate) {{
+                queue[msg.session_id].transcript = messages.concat([msg.message]).slice(-50);
+                renderQueue();
+              }}
+            }}
+          }} else if (msg.type === 'escalation_audio') {{
+            if (msg.speaker === 'visitor') playEscalationAudio(msg);
           }}
         }} catch(_) {{}}
       }};
@@ -829,3 +1251,6 @@ async def staff_dashboard(username: str = Depends(_authenticate_staff)):
   </script>
 </body>
 </html>""")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    return response
