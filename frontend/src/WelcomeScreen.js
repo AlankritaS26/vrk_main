@@ -104,6 +104,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const pendingSpeechRef = useRef(null);         // speech blocked by autoplay policy
   const activeSpeakIdRef = useRef(null);         // identifies the current speak() call; used to cancel it on barge-in
   const activeNodesRef = useRef([]);             // currently scheduled/playing AudioBufferSourceNodes for the active speak()
+  const speakStreamRef = useRef(null);
   const ttsGainRef = useRef(null);               // shared gain node — lets us duck/restore TTS volume smoothly
   const lastAnswerRef = useRef('');              // stores the most recent full answer text for resume-on-interrupt
   const wasInterruptedRef = useRef(false);       // true if TTS was barged-in before it finished — triggers "want to continue?" offer
@@ -168,12 +169,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
 
-  // ── QR Companion & Escalation States ──
+  // ── QR Companion ──
   const [companionToken, setCompanionToken] = useState(null);
   const [companionUrl, setCompanionUrl] = useState('');
   const [showCompanionModal, setShowCompanionModal] = useState(false);
-  const [escalationState, setEscalationState] = useState(null); // null | 'pending' | 'connected' | 'timeout'
-  const [escalationMsg, setEscalationMsg] = useState('');
 
   useEffect(() => {
     if (!session?.session_id) {
@@ -191,30 +190,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       })
       .catch(() => {});
   }, [session?.session_id]);
-
-  const handleRequestEscalation = async () => {
-    try {
-      setEscalationState('pending');
-      setEscalationMsg('Connecting you to front desk staff…');
-      await fetch(BACKEND + '/escalation/request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: 'user_request' }),
-      });
-    } catch (err) {
-      console.error('[ESCALATION] Request failed:', err);
-    }
-  };
-
-  const handleCancelEscalation = async () => {
-    setEscalationState(null);
-    const sid = session?.session_id;
-    if (sid) {
-      try {
-        await fetch(`${BACKEND}/escalation/cancel/${sid}`, { method: 'POST' });
-      } catch (e) { /* silent */ }
-    }
-  };
 
   // The backend composes the greeting (it knows resume-vs-new and the
   // institute intro line); these local strings are only a fallback.
@@ -267,6 +242,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       timestamp: new Date().toLocaleTimeString()
     }]);
   }, [setMessages]);
+
 
   // Creates a new chat bubble for `speaker` and returns a function that
   // appends sentence-by-sentence text into it — keeps the on-screen text
@@ -871,6 +847,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       await browserSpeak();
     }
   }, [startListening, interruptSpeaking]);
+  speakStreamRef.current = speakStream;
 
   // Thin wrapper over speakStream for callers that don't need per-sentence
   // sync (ack bubble, farewell, greeting, error fallback, name flow) — same
@@ -913,10 +890,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
-
-    if (escalationState && /\b(?:stop|cancel|never mind|nevermind|back|continue|dont connect|no staff)\b/i.test(text)) {
-      setEscalationState(null);
-    }
 
     // ── Check if visitor is affirming a pending name confirmation ──────
     const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
@@ -1217,18 +1190,43 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     s = s.replace(/^(?:hi|hello|hey|nova|please)[\s,.]+/i, '');
     s = s.replace(/[.!?]+$/, '').trim();
     if (!s) return '';
+
+    // Discourse markers and sentence-starters that appear before a comma but
+    // are never names: "See, I am...", "Well, I want...", "Actually, ..."
+    // The comma-split below would otherwise extract these as name candidates.
+    const _DISCOURSE_MARKERS = /^(see|well|look|actually|so|now|right|okay|ok|listen|hey|hi|hello|yes|no|sorry|please|anyway|alright|basically|honestly|frankly|clearly|obviously)$/i;
+
     if (s.includes(',')) {
       const firstPart = s.split(',')[0].trim();
+      // Only accept the pre-comma fragment as a name candidate if it's a
+      // single short word that is NOT a discourse marker or common filler.
       if (firstPart && /^[a-zA-Z\s]+$/.test(firstPart)) {
-        s = firstPart;
+        const firstWords = firstPart.trim().split(/\s+/);
+        if (firstWords.length === 1 && !_DISCOURSE_MARKERS.test(firstWords[0])) {
+          s = firstPart;
+        }
+        // Multi-word pre-comma fragments (e.g. "my friend Sneha, ...") are
+        // left intact — the word-count filter below will deal with them.
       }
     }
-    const words = s.split(/\s+/).filter(w => !/^(what|who|where|how|why|which|nova|kiosk|please|my|name|is|to|the)$/i.test(w));
+
+    // Expanded stop-word list: common question words, filler words, and
+    // words that are valid English but never a person's name.
+    const words = s.split(/\s+/).filter(w =>
+      !/^(what|who|where|when|why|which|nova|kiosk|please|my|name|is|to|the|a|an|i|am|are|was|were|be|been|being|it|its|this|that|these|those|and|or|but|if|of|in|on|at|for|with|from|by|about|into|through|just|also|too|very|more|most|so|then|than|not|no|nor|yet|both|either|neither|each|every|all|any|few|more|some|such)$/i.test(w)
+    );
     if (words.length === 0 || words.length > 3) return '';
     // Only accept strictly alphabetic words
     if (!words.every(w => /^[a-zA-Z]+$/.test(w))) return '';
     const result = words.map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(' ');
-    if (words.length === 1 && _REJECTION_WORDS.test(words[0])) return '';
+
+    // Single-word results: reject common emotional states, adjectives, and
+    // non-name words that could leak through (fixes "I am good" → "Good",
+    // "See, I am..." → "See", etc.). Replaces the previously undefined
+    // _REJECTION_WORDS reference which would throw a ReferenceError.
+    const _NON_NAME_WORDS = /^(good|fine|well|great|okay|ok|alright|bad|tired|stressed|happy|sad|sorry|busy|free|ready|done|see|look|right|so|now|listen|anyway|basically|honestly|frankly|clearly|obviously|yes|no|guest|skip|continue|bye|thanks|then|and|but|or)$/i;
+    if (words.length === 1 && _NON_NAME_WORDS.test(words[0])) return '';
+
     return result;
   }, []);
 
@@ -1563,12 +1561,22 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const hasInlineName = /\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+\w/i.test(text)
       || /\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+\w/i.test(text);
 
-    const isExplicitNameIntro = /\b(my name is|call me|i am|i'm|this is)\s+\w/i.test(text);
+    // NOTE: 'i am' and "i'm" are intentionally excluded here.
+    // Those are self-description phrases ("I am good", "I'm stressed") and must
+    // NEVER be treated as name introductions. Only use patterns that are
+    // unambiguously explicit name-introduction requests.
+    // 'i am called' is handled separately in hasInlineName above.
+    const isExplicitNameIntro = /\b(my name is|call me|this is)\s+\w/i.test(text);
 
     if ((isExplicitNameIntro || hasInlineName) && !bareNameChange) {
       const candidateName = extractVisitorName(text);
+      // Reject common emotional/status/adjective words that can leak through
+      // extractVisitorName when the user says "I am <state>" — even though
+      // 'i am' is no longer in isExplicitNameIntro, hasInlineName can still
+      // match edge cases like "my name is good" (unlikely but safe to guard).
+      const _EMOTIONAL_WORDS = /^(good|fine|well|great|okay|ok|alright|bad|tired|stressed|happy|sad|sorry|busy|free|ready|done|yes|no|guest|skip|continue|bye|thanks|thank you|then|well|so|and|but|or|the|a|an)$/i;
       if (candidateName && candidateName.length >= 2 && candidateName.split(' ').length <= 3
-          && !/^(yes|no|guest|skip|continue|ok|okay|bye|thanks|thank you|done|then|well|so|and|but|or|the|a|an)$/i.test(candidateName)) {
+          && !_EMOTIONAL_WORDS.test(candidateName)) {
         // ALWAYS route through spelling capture before saving!
         await runSpellingCaptureAndConfirm(candidateName, () => isMounted.current);
         return;
@@ -1972,18 +1980,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           } else if (msg.type === 'companion_qr') {
             if (msg.token) setCompanionToken(msg.token);
             if (msg.url) setCompanionUrl(msg.url);
-          } else if (msg.type === 'escalation_pending') {
-            setEscalationState('pending');
-            setEscalationMsg(msg.message || 'Connecting you to front desk staff…');
-          } else if (msg.type === 'escalation_connected') {
-            setEscalationState('connected');
-            setEscalationMsg(msg.message || 'A staff member has connected!');
-          } else if (msg.type === 'escalation_timeout') {
-            setEscalationState('timeout');
-            setEscalationMsg(msg.message || 'No staff available right now. Nova will continue helping you.');
-            setTimeout(() => setEscalationState(null), 6000);
-          } else if (msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') {
-            setEscalationState(null);
           }
         } catch (_) { }
       };
@@ -1995,17 +1991,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
 
-  /* ── 3D NOVA AVATAR ACTIVE (replaces legacy SVG) ── */
-
-
-  /* background tint per state */
-  const charBg = {
-    ready: 'linear-gradient(175deg, #dde4ff 0%, #c8d4fc 100%)',
-    listening: 'linear-gradient(175deg, #d8f5dc 0%, #b8eec0 100%)',
-    processing: 'linear-gradient(175deg, #ede4ff 0%, #d8caff 100%)',
-    speaking: 'linear-gradient(175deg, #fff0dd 0%, #ffd8a8 100%)',
-  }[status] || 'linear-gradient(175deg, #dde4ff 0%, #c8d4fc 100%)';
-
   const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
@@ -2013,7 +1998,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   return (
     <div style={{
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
-      fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#f0f4ff'
+      fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#dbeafe'
     }}>
 
       {/* ── MODALS ── */}
@@ -2069,10 +2054,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               ))}
             </div>
 
-            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-              Questions about your data? Speak to a staff member at the Admin Block.
-            </p>
-
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
               <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
             </div>
@@ -2113,7 +2094,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         <div style={{
           width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
           alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
-          background: charBg, transition: 'background 0.8s ease', position: 'relative',
+          background: {
+            ready: '#dbeafe',
+            listening: '#dbeafe',
+            processing: '#dbeafe',
+            speaking: '#dbeafe',
+          }[status] || '#dbeafe', transition: 'background 0.8s ease', position: 'relative',
           overflow: 'hidden'
         }}>
 
@@ -2121,7 +2107,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           <div style={{
             position: 'absolute', bottom: '60px', left: '50%', transform: 'translateX(-50%)',
             width: '320px', height: '320px', borderRadius: '50%',
-            background: 'rgba(255,255,255,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
+            background: 'rgba(56,189,248,0.18)', filter: 'blur(40px)', pointerEvents: 'none'
           }} />
 
           {/* ── happy-moment sparkle burst: first-time-visitor greeting only ── */}
@@ -2177,8 +2163,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
             zIndex: 1, marginTop: '8px'
           }}>
-            <div style={{ fontSize: '20px', fontWeight: '800', color: '#1a237e', letterSpacing: '0.3px' }}>Nova</div>
-            <div style={{ fontSize: '12px', color: '#5c6bc0', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+            <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Nova</div>
+            <div style={{ fontSize: '12px', color: 'rgba(219,234,254,0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
             <div style={{
               padding: '5px 18px', borderRadius: '20px', background: statusBg,
               color: statusColor, fontSize: '13px', fontWeight: '700',
@@ -2192,9 +2178,9 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           {status === 'ready' && messages.length === 0 && (
             <div style={{
               marginTop: '14px', padding: '8px 20px', borderRadius: '20px',
-              background: 'rgba(255,255,255,0.65)', backdropFilter: 'blur(8px)',
-              border: '1px solid rgba(255,255,255,0.8)', fontSize: '12px',
-              color: '#5c6bc0', fontStyle: 'italic', textAlign: 'center',
+              background: 'rgba(6,18,54,0.52)', backdropFilter: 'blur(8px)',
+              border: '1px solid rgba(125,211,252,0.32)', fontSize: '12px',
+              color: 'rgba(224,242,254,0.88)', fontStyle: 'italic', textAlign: 'center',
               maxWidth: '280px', zIndex: 1
             }}>
               {hints[hintIndex]}
@@ -2204,14 +2190,16 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
         {/* ══════════ RIGHT: COMPACT CHAT ══════════ */}
         <div style={{
-          flex: 1, display: 'flex', flexDirection: 'column', background: '#f8f9ff',
-          borderLeft: '1.5px solid #e0e4ff', overflow: 'hidden'
+          flex: 1, display: 'flex', flexDirection: 'column', background: 'rgba(219,234,254,0.72)',
+          border: '1px solid rgba(255,255,255,0.62)', borderRadius: '28px', margin: '14px',
+          boxShadow: '0 16px 36px rgba(30,64,175,0.14)', backdropFilter: 'blur(8px)',
+          overflow: 'hidden'
         }}>
 
           {/* chat header */}
           <div style={{
-            padding: '10px 16px', background: '#fff',
-            borderBottom: '1px solid #e8eaf6', flexShrink: 0,
+            padding: '12px 18px', background: 'rgba(255,255,255,0.22)',
+            borderBottom: '1px solid rgba(255,255,255,0.45)', flexShrink: 0,
             display: 'flex', alignItems: 'center', gap: '8px'
           }}>
             <div style={{
@@ -2219,14 +2207,14 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               background: { ready: '#43a047', listening: '#43a047', processing: '#7e57c2', speaking: '#e53935' }[status] || '#43a047',
               transition: 'background 0.3s', boxShadow: '0 0 0 3px rgba(67,160,71,0.15)'
             }} />
-            <span style={{ fontSize: '13px', fontWeight: '700', color: '#444' }}>Conversation</span>
-            <span style={{ fontSize: '11px', color: '#bbb', marginLeft: 'auto' }}>
+            <span style={{ fontSize: '13px', fontWeight: '800', color: '#1e3a8a' }}>Conversation</span>
+            <span style={{ fontSize: '11px', color: '#64748b', marginLeft: 'auto' }}>
               {messages.length > 0 ? `${messages.length} message${messages.length > 1 ? 's' : ''}` : 'Just started'}
             </span>
           </div>
 
           {/* messages */}
-          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: '4px' }}>
+          <div ref={scrollRef} style={{ flex: '1 1 0', overflowY: 'auto', padding: '14px 18px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
 
             {messages.length === 0 && !liveText && status !== 'processing' && (
               <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px', padding: '30px 12px', textAlign: 'center' }}>
@@ -2248,21 +2236,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 }}>
                   {!prevSame && (
                     <span style={{
-                      fontSize: '10px', color: '#bbb', marginBottom: '2px',
+                      fontSize: '10px', color: '#64748b', marginBottom: '4px',
                       paddingLeft: isNova ? '6px' : 0, paddingRight: !isNova ? '6px' : 0, fontWeight: '600'
                     }}>
                       {isNova ? 'Nova' : visitorName}
                     </span>
                   )}
                   <div className="msg-in" style={{
-                    maxWidth: '88%', padding: '8px 12px',
+                    maxWidth: '86%', padding: '10px 14px',
                     borderRadius: isNova
                       ? (prevSame ? '4px 14px 14px 14px' : '14px 14px 14px 4px')
                       : (prevSame ? '14px 4px 14px 14px' : '14px 14px 4px 14px'),
-                    background: isNova ? '#ffffff' : '#1a237e',
-                    color: isNova ? '#1a1a1a' : '#ffffff',
-                    fontSize: '13.5px', lineHeight: '1.5',
-                    boxShadow: isNova ? '0 1px 3px rgba(0,0,0,0.08)' : '0 1px 4px rgba(26,35,126,0.25)',
+                    background: isNova ? 'rgba(255,255,255,0.72)' : 'rgba(30,64,175,0.88)',
+                    color: isNova ? '#1e293b' : '#ffffff',
+                    fontSize: '13.5px', lineHeight: '1.55',
+                    border: isNova ? '1px solid rgba(255,255,255,0.8)' : '1px solid rgba(147,197,253,0.35)',
+                    boxShadow: isNova ? '0 5px 14px rgba(30,64,175,0.08)' : '0 5px 14px rgba(30,64,175,0.18)',
+                    backdropFilter: 'blur(8px)',
                     wordBreak: 'break-word'
                   }}>
                     {msg.text}
@@ -2325,7 +2315,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
           {/* voice footer */}
           <div style={{
-            padding: '8px 12px', background: '#fff', borderTop: '1px solid #e8eaf6',
+            padding: '10px 14px', background: 'rgba(255,255,255,0.22)', borderTop: '1px solid rgba(255,255,255,0.45)',
             flexShrink: 0, display: 'flex', alignItems: 'center', gap: '10px'
           }}>
             <div style={{
@@ -2366,112 +2356,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           </div>
         </div>
       </div>
-
-      {/* ── ESCALATION MODAL / OVERLAY ── */}
-      {escalationState && (
-        <div style={{
-          position: 'fixed', inset: 0, zIndex: 100,
-          background: 'rgba(15, 23, 42, 0.75)', backdropFilter: 'blur(8px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
-        }}>
-          <div style={{
-            background: '#ffffff', borderRadius: '20px', maxWidth: '440px', width: '100%',
-            padding: '32px 28px', textAlign: 'center', boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
-            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
-          }}>
-            {escalationState === 'pending' && (
-              <>
-                <div style={{
-                  width: '64px', height: '64px', margin: '0 auto 18px', borderRadius: '50%',
-                  border: '4px solid #e0e7ff', borderTopColor: '#4338ca',
-                  animation: 'spin 1s linear infinite',
-                }} />
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#1e1b4b', marginBottom: '8px' }}>
-                  Connecting to Front Desk
-                </h2>
-                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
-                  {escalationMsg || 'A front desk reception team member has been alerted to assist you directly at this kiosk.'}
-                </p>
-                <div style={{
-                  background: 'linear-gradient(135deg, #eef2ff, #f0fdf4)',
-                  borderRadius: '14px', padding: '14px 16px', marginBottom: '16px',
-                  border: '1px solid #c7d2fe', textAlign: 'left',
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#4338ca', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
-                    📞 Front Desk &amp; Campus Helpline
-                  </div>
-                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#1e1b4b', marginBottom: '3px' }}>
-                    +91 80286 11880 / 81 / 82
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#3730a3' }}>
-                    Admissions Helpline: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
-                  </div>
-                </div>
-                <div style={{
-                  background: '#f0f9ff', borderRadius: '12px', padding: '12px 16px',
-                  fontSize: '13px', color: '#0369a1', border: '1px solid #bae6fd',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say <strong>"Stop"</strong> anytime to return to Nova
-                </div>
-              </>
-            )}
-
-            {escalationState === 'connected' && (
-              <>
-                <div style={{ fontSize: '56px', marginBottom: '16px' }}>🤝</div>
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#065f46', marginBottom: '8px' }}>
-                  Staff Member Connected!
-                </h2>
-                <p style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', marginBottom: '20px' }}>
-                  {escalationMsg || 'A front desk team member is now assisting you.'}
-                </p>
-                <div style={{
-                  background: '#f0fdf4', borderRadius: '12px', padding: '12px 16px',
-                  fontSize: '13px', color: '#15803d', border: '1px solid #bbf7d0',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say <strong>&ldquo;Stop&rdquo;</strong> to return to Nova
-                </div>
-              </>
-            )}
-
-            {escalationState === 'timeout' && (
-              <>
-                <div style={{ fontSize: '56px', marginBottom: '16px' }}>⏳</div>
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#92400e', marginBottom: '8px' }}>
-                  Staff Currently Occupied
-                </h2>
-                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
-                  {escalationMsg || 'Front desk staff members are currently assisting other visitors. Nova will gladly continue answering your questions!'}
-                </p>
-                <div style={{
-                  background: 'linear-gradient(135deg, #fef3c7, #fffbeb)',
-                  borderRadius: '14px', padding: '14px 16px', marginBottom: '18px',
-                  border: '1px solid #fde68a', textAlign: 'left',
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
-                    📞 Direct Contact Numbers
-                  </div>
-                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#78350f', marginBottom: '3px' }}>
-                    +91 80286 11880 / 81 / 82
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#92400e' }}>
-                    Admissions Desk: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
-                  </div>
-                </div>
-                <div style={{
-                  background: '#fffbeb', borderRadius: '12px', padding: '10px 16px',
-                  fontSize: '13px', color: '#92400e', border: '1px solid #fde68a',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say anything to continue with Nova
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* ── QR COMPANION MODAL ── */}
       {showCompanionModal && (
@@ -2593,85 +2477,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           100% { opacity:0; transform: translateY(-60px) scale(1.15) rotate(25deg); }
         }
 
-        /* ══════════════════════════════
-             Nova CHARACTER ANIMATIONS
-        ══════════════════════════════ */
-
-        /* BODY — gentle breathing (always on) */
-        .nova-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
-        @keyframes charBreathe { 0%,100%{transform:scaleY(1)} 50%{transform:scaleY(1.016)} }
-
-        /* HEAD — base: idle micro-float */
-        .nova-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
-        @keyframes idleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
-
-        /* ── LISTENING ── */
-        .nova-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
-        @keyframes listenLean { to{transform:translateX(10px) rotate(6deg)} }
-
-        /* pulse ring */
-        .listen-r1 { animation:lRing 2s ease-out infinite; }
-        .listen-r2 { animation:lRing 2s 0.7s ease-out infinite; }
-        @keyframes lRing { 0%{r:92;opacity:0.55} 100%{r:140;opacity:0} }
-
-        /* ── PROCESSING ── */
-        .nova-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
-        @keyframes thinkTilt { to{transform:translateX(-12px) rotate(-7deg)} }
-
-        /* thinking arm rise */
-        .nova-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
-        @keyframes armRise { from{transform:translateY(30px);opacity:0} to{transform:none;opacity:1} }
-
-        /* thinking bubble float */
-        .tbub { animation:tBubFloat 1.6s ease-in-out infinite; }
-        @keyframes tBubFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
-
-        /* furrowed brow when thinking */
-        .brow-think { animation: browFurrow 0.5s ease-out forwards; transform-origin:133px 86px; }
-        @keyframes browFurrow { to{transform:translateY(4px)} }
-
-        /* ── SPEAKING ── */
-        .nova-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
-        @keyframes headBob { 0%,100%{transform:translateY(0) rotate(0)} 30%{transform:translateY(-5px) rotate(1.5deg)} 70%{transform:translateY(2px) rotate(-1deg)} }
-
-        /* mouth alternates: a visible ↔ b visible */
-        .nova-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
-        .nova-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
-        @keyframes mA { 0%,49%{opacity:1} 50%,100%{opacity:0} }
-        @keyframes mB { 0%,49%{opacity:0} 50%,100%{opacity:1} }
-
-        /* sound waves stagger */
-        .wave1 { animation: wv 1s 0.0s ease-in-out infinite; }
-        .wave2 { animation: wv 1s 0.2s ease-in-out infinite; }
-        .wave3 { animation: wv 1s 0.4s ease-in-out infinite; }
-        @keyframes wv { 0%,100%{opacity:0.2;stroke-width:2} 50%{opacity:0.9;stroke-width:3} }
       `}</style>
     </div>
   );
 }
-
-
-// ── Nova's avatar: used in message rows and header ───────────────────────
-const NovaAvatar = ({ size = 38, speaking = false }) => (
-  <div style={{ position: 'relative', flexShrink: 0 }}>
-    {speaking && (
-      <>
-        <div className="avatar-ring r1" style={{ width: size + 14, height: size + 14, top: -7, left: -7 }} />
-        <div className="avatar-ring r2" style={{ width: size + 22, height: size + 22, top: -11, left: -11 }} />
-      </>
-    )}
-    <div style={{
-      width: size, height: size, borderRadius: '50%',
-      background: 'linear-gradient(135deg, #1a237e 0%, #5c35c9 60%, #7c4dff 100%)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      boxShadow: speaking ? '0 0 0 3px #7c4dff55' : '0 2px 8px rgba(26,35,126,0.30)',
-      flexShrink: 0, overflow: 'hidden', position: 'relative',
-    }}>
-      {/* stylised person silhouette */}
-      <svg width={size * 0.62} height={size * 0.62} viewBox="0 0 40 40" fill="none">
-        <circle cx="20" cy="14" r="7" fill="rgba(255,255,255,0.92)" />
-        <path d="M4 38 C4 28 36 28 36 38" fill="rgba(255,255,255,0.92)" />
-      </svg>
-    </div>
-  </div>
-);

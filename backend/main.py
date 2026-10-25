@@ -1,4 +1,4 @@
-﻿r"""
+r"""
 RNSIT Digital Receptionist - Backend Server
 
 HOW TO RUN (from repository root):
@@ -36,8 +36,6 @@ load_dotenv()
 
 # Companion token TTL (minutes) — read once here so companion.py can import it
 COMPANION_TOKEN_TTL_MINUTES: int = int(os.getenv("COMPANION_TOKEN_TTL_MINUTES", "20"))
-# Escalation timeout (seconds)
-ESCALATION_TIMEOUT_SECONDS: int = int(os.getenv("ESCALATION_TIMEOUT_SECONDS", "60"))
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -54,7 +52,6 @@ from backend.database import (
     delete_face_by_name, update_face_name_with_alias, update_session_user_name,
     sessions_collection, faces_collection, interactions_collection,
     find_recent_session_by_face, touch_session, deactivate_session, ensure_indexes,
-    escalations_collection,
 )
 from backend.llm import (
     initialize_rag_knowledge_base, close_llm_client, generate_rag_kiosk_response,
@@ -160,8 +157,6 @@ active_session: dict | None = None
 message_log: list[dict] = []
 visitor_name_response: dict = {"ready": False, "name": "", "save": True}
 _last_activity_ts: float = 0.0
-# Per-session low-confidence answer counter (for escalation trigger)
-_low_confidence_count: int = 0
 
 
 # ==========================================
@@ -551,12 +546,36 @@ def _strip_trailing_closing_phrase(question: str) -> str:
     return " ".join(parts).strip()
 
 
+def _is_meaningful_conversation(txt: str) -> bool:
+    """True if `txt` is a substantive user query rather than a greeting,
+    filler, farewell, name command, or emotional re-engagement reply."""
+    if not txt or not txt.strip():
+        return False
+    clean = txt.strip()
+    if len(clean.split()) < 2:
+        return False
+    q_norm = normalize_query(clean)
+    if _is_closing_only(clean) or _is_closing_only(q_norm):
+        return False
+    if _matches_short_phrase(q_norm, GREETING_PHRASES):
+        return False
+    if _is_farewell(q_norm):
+        return False
+    if _detect_name_change(q_norm):
+        return False
+    if is_emotional_reengagement_response(q_norm):
+        return False
+    if any(p in q_norm for p in ("spelling", "spell my name", "spell your name", "what is your name")):
+        return False
+    return True
+
+
 def _derive_topic_fallback(questions: list[str]) -> str | None:
     """Rule-based backstop for when extract_topic_label() returns None.
     Uses meaningful questions to find recognized campus topics/entities.
     Never invents a topic and never returns generic useless phrases."""
     candidates = []
-    for q in reversed(questions or []):
+    for q in (questions or []):
         if not q or not q.strip():
             continue
         candidate = _strip_trailing_closing_phrase(q)
@@ -569,21 +588,45 @@ def _derive_topic_fallback(questions: list[str]) -> str | None:
     if not candidates:
         return None
 
+    found_topics = []
     # Pass 1 — Keyword match against known topics
     for candidate, normalized in candidates:
         for w in normalized.split():
             if w in _TOPIC_FALLBACK_KEYWORDS:
                 label = _TOPIC_FALLBACK_KEYWORDS[w]
-                logger.info("[SESSION] Topic fallback derived from keyword '%s': %s", w, label)
-                return label
+                if label not in found_topics:
+                    found_topics.append(label)
 
     # Pass 2 — Entity mapping check on meaningful candidates
     for candidate, normalized in candidates:
         detected = detect_entity(normalized) or detect_entity(candidate)
         if detected and detected.canonical_name:
             label = detected.canonical_name.lower()
-            logger.info("[SESSION] Topic fallback derived from entity: %s", label)
-            return label
+            if label not in found_topics:
+                found_topics.append(label)
+
+    if found_topics:
+        if len(found_topics) == 1:
+            return found_topics[0]
+        elif len(found_topics) == 2:
+            return f"{found_topics[0]} and {found_topics[1]}"
+        else:
+            return f"{', '.join(found_topics[:-1])}, and {found_topics[-1]}"
+
+    # Pass 3 — Extract key noun words across candidates
+    keywords = []
+    for candidate, normalized in candidates:
+        words = [w for w in normalized.split() if len(w) > 3 and w not in ("what", "where", "how", "why", "tell", "about", "your", "this", "that", "with", "from", "some", "more", "question", "questions")]
+        for w in words:
+            if w not in keywords:
+                keywords.append(w)
+    if keywords:
+        if len(keywords) == 1:
+            return keywords[0]
+        elif len(keywords) == 2:
+            return f"{keywords[0]} and {keywords[1]}"
+        else:
+            return f"{', '.join(keywords[:2])}, and {keywords[2]}"
 
     return None
 
@@ -599,7 +642,7 @@ def classify_emotion(text: str) -> str:
         return "frustrated"
     if any(w in t for w in ("excited", "pumped", "thrilled", "can't wait", "amazing")):
         return "excited"
-    if any(w in t for w in ("happy", "good", "great", "fine", "awesome", "fantastic", "well", "all good", "doing well", "pretty good", "wonderful")):
+    if any(w in t for w in ("happy", "good", "great", "fine", "awesome", "fantastic", "well", "all good", "doing well", "doing good", "pretty good", "wonderful")):
         return "happy"
     if any(w in t for w in ("okay", "alright", "so so", "normal", "same old")):
         return "neutral"
@@ -621,27 +664,35 @@ async def handle_personalized_reengagement(user_reply: str, session: dict) -> tu
     """
     Handles returning visitor's response to 'How are you doing today?':
     1. Understands emotional tone and provides empathetic, natural response.
-    2. Reconnects to previous session using the last up to 5 meaningful questions.
+    2. Reconnects to previous session using topic summary of last up to 5 meaningful questions.
     Uses LLM when available; uses deterministic fallback when LLM is unavailable.
     """
     previous_questions = session.get("previous_questions", []) if session else []
-    derived_topic = _derive_topic_fallback(previous_questions)
+
+    topic_summary = None
+    if previous_questions:
+        try:
+            topic_summary = await extract_topic_label(previous_questions)
+        except Exception as te:
+            logger.warning("[RE-ENGAGEMENT] Topic extraction failed: %s", te)
+    if not topic_summary:
+        topic_summary = _derive_topic_fallback(previous_questions)
 
     questions_block = "\n".join(f"- {q}" for q in previous_questions) if previous_questions else "(none)"
     prompt = (
         "You are Nova, the warm, empathetic AI digital receptionist at RNS Institute of Technology (RNSIT).\n"
         "A returning visitor just replied to your greeting 'How are you doing today?'.\n\n"
         f"Visitor reply: \"{user_reply}\"\n\n"
-        f"Their questions from their previous session (oldest first):\n{questions_block}\n\n"
+        f"Topics discussed in their previous session: \"{topic_summary or 'None'}\"\n"
+        f"Their previous questions (oldest first):\n{questions_block}\n\n"
         "INSTRUCTIONS:\n"
-        "1. Respond to how the visitor is feeling with genuine warmth in 1 short sentence. "
-        "Be empathetic if they feel stressed, tired, or down; be enthusiastic if they feel good or happy; be pleasant if neutral. "
+        "1. Give ONE short natural emotional response (1 sentence) acknowledging how the visitor is feeling with genuine warmth. "
+        "Be empathetic if they feel stressed or tired; enthusiastic if happy or good; pleasant if neutral. "
         "CRITICAL: Never mention emotion detection, classification, or labels (do NOT say 'I detected that you are sad', 'Your emotional state is', etc.).\n"
-        "2. If the previous questions show a clear meaningful topic (such as placements, hostel facilities, admissions, fees, or a department), reconnect to it in 1 short sentence: "
-        "'Last time we were talking about [topic]. Would you like to continue with that?'\n"
-        "If there are no previous questions or no clear topic, simply say: 'How may I assist you today?'\n"
-        "Never say generic useless phrases like 'Previous topic was RNSIT' or 'Let's continue where we left off'. Never invent a topic not present in their questions.\n"
-        "3. Keep the entire response under 3 sentences total."
+        "2. If there are previous topics, add a second sentence reconnecting to them: "
+        "'Last time, we were discussing [topic summary]. Would you like to continue?'\n"
+        "If there are no previous questions or topic, ask: 'How may I assist you today?'\n"
+        "Never invent or hallucinate topics not present in their previous questions. Keep the response to 2 short sentences total."
     )
 
     try:
@@ -652,22 +703,19 @@ async def handle_personalized_reengagement(user_reply: str, session: dict) -> tu
         )
         cleaned = _clean_repetitive_greeting((raw_text or "").strip())
         if cleaned and len(cleaned.split()) >= 4 and not any(bad in cleaned.lower() for bad in ("detected", "classification", "emotional state")):
-            topic = derived_topic
-            if "continue with" in cleaned.lower() and not topic:
-                topic = await extract_topic_label(previous_questions)
-            return cleaned, topic
+            return cleaned, topic_summary
     except Exception as e:
         logger.warning("[RE-ENGAGEMENT] LLM call failed, falling back to deterministic: %s", e)
 
     # Deterministic fallback
     tone = classify_emotion(user_reply)
-    emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Good to know!")
-    if derived_topic:
-        reconnect_sentence = f"Last time we were talking about {derived_topic}. Would you like to continue with that?"
+    emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Glad to hear that!")
+    if topic_summary:
+        reconnect_sentence = f"Last time, we were discussing {topic_summary}. Would you like to continue?"
     else:
         reconnect_sentence = "How may I assist you today?"
 
-    return f"{emotion_sentence} {reconnect_sentence}", derived_topic
+    return f"{emotion_sentence} {reconnect_sentence}", topic_summary
 
 
 # ── Q/A label stripper ────────────────────────────────────────────────────
@@ -876,10 +924,7 @@ app.add_middleware(
 
 # ── Mount feature routers ────────────────────────────────────────────────────
 from backend.companion import router as companion_router
-from backend.escalation import router as escalation_router, staff_dashboard
 app.include_router(companion_router)
-app.include_router(escalation_router)
-app.add_api_route("/staff", staff_dashboard, response_class=HTMLResponse, methods=["GET"], tags=["escalation"])
 
 
 # ==========================================
@@ -1836,12 +1881,12 @@ async def resume_or_create_session(face_id: str, user_name: str,
     previous_questions = []
     if is_user_returning:
         try:
-            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=10)
+            recent = await get_recent_interactions(session_id=session_id, face_id=face_id, limit=25)
             for r in recent:
                 txt = (r.get("input_text") or "").strip()
-                if txt and not _is_closing_only(txt) and len(txt.split()) > 1:
+                if txt and _is_meaningful_conversation(txt):
                     clean_q = _strip_trailing_closing_phrase(txt)
-                    if clean_q and not _is_closing_only(clean_q):
+                    if clean_q and _is_meaningful_conversation(clean_q):
                         previous_questions.append(clean_q)
             previous_questions = previous_questions[-5:]
             logger.info(
@@ -1919,7 +1964,6 @@ async def start_session(
     active_session      = new_sess
     message_log         = []
     _last_activity_ts   = datetime.now().timestamp()
-    _low_confidence_count = 0  # reset escalation counter on new session
 
     # NOTE: resume_or_create_session() already persisted this session.
     await manager.broadcast({
@@ -1936,7 +1980,7 @@ async def start_session(
 
 @app.post("/session/end")
 async def end_session_endpoint(session_id: str = None):
-    global active_session, _last_activity_ts, _low_confidence_count
+    global active_session, _last_activity_ts
     sid = session_id or (active_session["session_id"] if active_session else None)
 
     # Clean up companion tokens for this session
@@ -1949,7 +1993,6 @@ async def end_session_endpoint(session_id: str = None):
 
     active_session      = None
     _last_activity_ts   = 0.0
-    _low_confidence_count = 0
     await manager.broadcast({"type": "session_end", "session_id": sid})
     return {"status": "success"}
 
@@ -2138,33 +2181,6 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
     """
     global active_session, _last_activity_ts
 
-    # ─── Explicit human-handover intent → escalate before RAG ──────────────
-    # Import lazily to avoid circular import at module load time
-    try:
-        from backend.escalation import _detect_human_intent, _trigger_escalation
-        if _detect_human_intent(q_normalized):
-            # Build transcript from current message_log for staff context
-            transcript = [
-                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-                for m in message_log[-10:]
-            ]
-            asyncio.create_task(_trigger_escalation(
-                session_id=sid,
-                face_id=active_session.get("face_id") if active_session else None,
-                user_name=visitor_name,
-                reason="user_request",
-                transcript=transcript,
-            ))
-            logger.info("[ROUTE] ESCALATION (deterministic) — '%s'", q_normalized)
-            return (
-                "I'm connecting you to a staff member at the front desk right now. "
-                "Please wait a moment — someone will be with you shortly.",
-                "escalation",
-                "CONTINUE",
-            )
-    except Exception as _esc_err:
-        logger.warning("[ROUTE] Escalation intent check failed: %s", _esc_err)
-
     # ─── Greeting → instant, deterministic, zero RAG/LLM round-trip ─────────
     if _matches_short_phrase(q_normalized, GREETING_PHRASES):
         answer = _GREETING_RESPONSES[hash(sid) % len(_GREETING_RESPONSES)]
@@ -2184,19 +2200,15 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             logger.info("[ROUTE] EASTER_EGG (deterministic) — '%s' -> '%s'", q_normalized, phrase)
             return answer, "easter_egg", "CONTINUE"
 
-    # ─── Returning visitor reply to "How are you doing today?" greeting ──────────
+    # ─── Emotional / wellbeing reply (re-engagement or standalone) ────────────
     #
     # INTENT GATE — runs BEFORE NAME_CHANGE, RAG, and entity detection.
-    # awaiting_reengagement_reply does NOT mean 'treat every message as emotional'.
-    # It means: CHECK if the message is actually an emotional response;
-    # otherwise clear the flag and continue normal routing.
-    #
     # Uses POSITIVE detection (is_emotional_reengagement_response) so that
-    # genuine questions like 'Who is the principal?' or garbled inputs like
-    # 'Did I ask you about the journey...' are never consumed as wellbeing replies.
-    if active_session and active_session.get("awaiting_reengagement_reply"):
-        if is_emotional_reengagement_response(q_normalized):
-            # This IS an emotional response — handle it and consume the flag.
+    # genuine questions like 'Who is the principal?' or statements like
+    # 'See, I am a sportsperson...' are never consumed as wellbeing replies.
+    if is_emotional_reengagement_response(q_normalized):
+        if active_session and active_session.get("awaiting_reengagement_reply"):
+            # Returning visitor reply to 'How are you doing today?' greeting
             active_session["awaiting_reengagement_reply"] = False
             answer, topic = await handle_personalized_reengagement(q_normalized, active_session)
             if topic:
@@ -2207,121 +2219,46 @@ async def _deterministic_route(q_normalized: str, sid: str, visitor_name: str):
             logger.info("[ROUTE] PERSONALIZED_REENGAGEMENT — reply=%r topic=%r", q_normalized, topic)
             return answer, "personalized_reengagement", "CONTINUE"
         else:
-            # NOT an emotional response — clear the pending flag and fall through
-            # to normal routing so this query is handled on its own merits.
-            active_session["awaiting_reengagement_reply"] = False
-            logger.info(
-                "[ROUTE] RE-ENGAGEMENT bypassed (not emotional response) — '%s'",
-                q_normalized,
-            )
+            # Standalone emotional / wellbeing reply (subsequent turn or first-time visitor)
+            tone = classify_emotion(q_normalized)
+            emotion_sentence = _DETERMINISTIC_EMOTION_RESPONSES.get(tone, "Glad to hear that!")
+            if tone == "stressed":
+                answer = f"{emotion_sentence} What can I help you with today?"
+            elif tone == "sad":
+                answer = f"{emotion_sentence} How may I assist you today?"
+            elif tone == "frustrated":
+                answer = f"{emotion_sentence} What can I assist you with?"
+            else:
+                answer = f"{emotion_sentence} How can I help you today?"
+            logger.info("[ROUTE] EMOTIONAL_WELLBEING (standalone) — tone=%s reply=%r", tone, q_normalized)
+            return answer, "emotional_wellbeing", "CONTINUE"
+    elif active_session and active_session.get("awaiting_reengagement_reply"):
+        # NOT an emotional response — clear the pending flag and fall through
+        # to normal routing so this query is handled on its own merits.
+        active_session["awaiting_reengagement_reply"] = False
+        logger.info(
+            "[ROUTE] RE-ENGAGEMENT bypassed (not emotional response) — '%s'",
+            q_normalized,
+        )
 
-    # e.g. "change my name to Akshu", "update my name to Rahul", "my name is Rahul", "call me Rahul", "rename to Rahul", "I am Rahul"
-    INVALID_NAME_STARTS = (
-        "a student", "student", "a visitor", "visitor", "a parent", "parent",
-        "looking for", "interested in", "here for", "going to", "from",
-        "trying to", "asking", "calling", "an engineering", "ordering",
-    )
-    INVALID_NAME_WORDS = {
-        "all", "right", "alright", "sure", "fine", "cool", "done", "wait", "stop",
-        "cancel", "yeah", "yep", "nope", "got", "good", "morning", "evening",
-        "afternoon", "night", "understood", "talk", "speak", "staff", "human",
-        "person", "student", "university", "bengaluru", "bangalore", "task", "nature",
-    }
-
-    name_change_match = re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+|the\s+)?name\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:call me|my name is|actually my name is|its actually|it's actually|no my name is|i am called|this is)\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"\b(?:change|update|set|rename)\s+to\s+([a-zA-Z\s,.-]+)", q_normalized) or \
-                        re.search(r"^(?:i am|iam|myself)\s+([a-zA-Z\s,.-]+)", q_normalized)
-
-    if name_change_match:
-        test_raw = name_change_match.group(1).strip().lower()
-        if any(test_raw.startswith(prefix) for prefix in INVALID_NAME_STARTS):
-            name_change_match = None
-    if name_change_match:
-        new_name_raw = name_change_match.group(1).strip()
-        if "," in new_name_raw:
-            new_name_raw = new_name_raw.split(",")[0].strip()
-        new_name_words = [w.capitalize() for w in new_name_raw.split() if w.lower() not in ("what", "who", "where", "how", "why", "which", "nova", "kiosk", "please", "my", "name", "is", "to", "the")]
-        if (
-            new_name_words
-            and len(new_name_words) <= 3
-            and all(w.isalpha() for w in new_name_words)
-            and not any(w.lower() in INVALID_NAME_WORDS for w in new_name_words)
-            and not any(x in new_name_raw.lower() for x in ["blink", "twice", "yes", "no", "eye", "emoji"])
-        ):
-            new_name = " ".join(new_name_words)
-            # Candidate name only — NEVER save or update DB until confirmed with spelling
-            if active_session:
-                active_session["candidate_name"] = new_name
-            answer = f"Thanks, {new_name}. Could you spell your name for me, one letter at a time?"
-            logger.info("[ROUTE] NAME_CHANGE_CANDIDATE (unconfirmed) — candidate='%s', prompting spelling", new_name)
-            return answer, "name_change_ask_spelling", "CONTINUE"
+    # ─── Explicit NAME_CHANGE intent — uses _detect_name_change ────────────────
+    new_name = _detect_name_change(q_normalized)
+    if new_name:
+        if active_session:
+            active_session["candidate_name"] = new_name
+        answer = f"Thanks, {new_name}. Could you spell your name for me, one letter at a time?"
+        logger.info("[ROUTE] NAME_CHANGE_CANDIDATE (unconfirmed) — candidate='%s', prompting spelling", new_name)
+        return answer, "name_change_ask_spelling", "CONTINUE"
 
     if re.search(r"\b(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized) or \
        re.search(r"\b(?:i want to|can i|can you|how do i)\s+(?:change|update|reset|rename)\s+(?:my\s+|the\s+)?name\b", q_normalized):
         answer = "Sure! You can say \"change my name to [Your Name]\" anytime, and I'll update it for you."
         return answer, "name_change_help", "CONTINUE"
 
-    # ─── Stop / Cancel escalation or cancel staff request ──────────────────
-    STOP_PHRASES = (
-        "stop", "cancel", "cancel staff", "no staff", "stop connecting",
-        "dont connect", "don't connect", "never mind", "nevermind",
-        "go back", "back to nova", "continue with nova", "i don't need staff",
-        "i dont need staff", "no human", "continue with bot", "cancel request",
-        "no thanks", "stop it", "abort",
-    )
-    is_stop = any(q_normalized == sp or q_normalized.startswith(sp + " ") or q_normalized.endswith(" " + sp) for sp in STOP_PHRASES)
-    if is_stop:
-        from backend.escalation import _get_escalation_state, cancel_escalation
-        esc_state = _get_escalation_state(sid) if sid else None
-        if esc_state and esc_state.get("status") in ("STAFF_NOTIFIED", "STAFF_CONNECTED"):
-            await cancel_escalation(sid, reason="visitor_cancelled")
-            answer = "Cancelled! Nova will continue assisting you right here. What would you like to know?"
-            logger.info("[ROUTE] ESCALATION_CANCEL (deterministic) — session=%s", sid[:8])
-            return answer, "escalation_cancel", "CONTINUE"
-        elif q_normalized in ("stop", "cancel", "stop it", "abort"):
+    if q_normalized in ("stop", "cancel", "stop it", "abort"):
             answer = "Sure, I'm here! What would you like to know about RNSIT?"
             logger.info("[ROUTE] STOP_COMMAND (deterministic) — session=%s", sid[:8])
             return answer, "stop_command", "CONTINUE"
-
-    # ─── Voice-only Escalation (Pre-RAG Deterministic Handover) ─────────────
-    # Intercept human staff requests and sensitive emergencies BEFORE RAG/LLM
-    # so we never return "I don't have that detail" when the visitor asks for staff!
-    from backend.escalation import _detect_human_intent, _detect_sensitive, _trigger_escalation
-
-    if _detect_sensitive(q_normalized):
-        esc_transcript = [
-            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-            for m in message_log[-10:]
-        ]
-        fid = active_session.get("face_id") if active_session else None
-        await _trigger_escalation(
-            session_id=sid,
-            face_id=fid,
-            user_name=visitor_name,
-            reason="sensitive_topic",
-            transcript=esc_transcript,
-        )
-        answer = "I am alerting campus security and front desk staff immediately to assist you. Please wait right here."
-        logger.info("[ROUTE] SENSITIVE_ESCALATION (deterministic) — session=%s", sid[:8])
-        return answer, "escalation_sensitive", "CONTINUE"
-
-    if _detect_human_intent(q_normalized):
-        esc_transcript = [
-            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-            for m in message_log[-10:]
-        ]
-        fid = active_session.get("face_id") if active_session else None
-        await _trigger_escalation(
-            session_id=sid,
-            face_id=fid,
-            user_name=visitor_name,
-            reason="user_request",
-            transcript=esc_transcript,
-        )
-        answer = "I am connecting you to our front desk staff right now. Please hold on a moment while I alert them to assist you directly at this kiosk. If you want to continue with me instead, simply say 'stop' at any time."
-        logger.info("[ROUTE] HUMAN_ESCALATION (deterministic) — session=%s", sid[:8])
-        return answer, "escalation_request", "CONTINUE"
 
     # ─── Thank you / bye / natural sign-off → end session immediately ───────
     if _is_farewell(q_normalized):
@@ -2502,36 +2439,6 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         logger.warning("[SESSION] context write-back failed: %s", exc)
 
     return await _respond(answer, source=route)
-    # ── Escalation check: low-confidence / sensitive topic detection ──────────
-    global _low_confidence_count
-    answer_is_low_confidence = not _is_cacheable(answer)
-    if answer_is_low_confidence:
-        _low_confidence_count += 1
-    else:
-        _low_confidence_count = max(0, _low_confidence_count - 1)  # decay on good answer
-
-    try:
-        from backend.escalation import maybe_escalate, _detect_sensitive
-        # Build transcript for escalation context
-        esc_transcript = [
-            {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-            for m in message_log[-10:]
-        ]
-        escalated = await maybe_escalate(
-            question=question,
-            answer=answer,
-            session_id=sid,
-            face_id=fid,
-            user_name=visitor_name,
-            low_confidence_count=_low_confidence_count,
-            transcript=esc_transcript,
-        )
-        if escalated:
-            answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
-    except Exception as _esc_err:
-        logger.warning("[ASK] Escalation check failed: %s", _esc_err)
-
-    return await _respond(answer, source="rag_llm")
 
 
 @app.get("/ask/stream")
@@ -2670,32 +2577,6 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             })
         except Exception as exc:
             logger.warning("[SESSION] context write-back failed: %s", exc)
-        # ── Escalation check for streaming path ───────────────────────────────
-        global _low_confidence_count
-        if not _is_cacheable(answer):
-            _low_confidence_count += 1
-        else:
-            _low_confidence_count = max(0, _low_confidence_count - 1)
-        try:
-            from backend.escalation import maybe_escalate
-            esc_transcript = [
-                {"speaker": m.get("speaker", ""), "text": m.get("text", "")}
-                for m in message_log[-10:]
-            ]
-            escalated = await maybe_escalate(
-                question=question,
-                answer=answer,
-                session_id=sid,
-                face_id=fid,
-                user_name=visitor_name,
-                low_confidence_count=_low_confidence_count,
-                transcript=esc_transcript,
-            )
-            if escalated:
-                answer = "I want to make sure you get the right information, so I am connecting you to our front desk staff right now. Please hold on a moment."
-        except Exception as _esc_err:
-            logger.warning("[STREAM] Escalation check failed: %s", _esc_err)
-
         await _finish(answer, "CONTINUE")
         yield f"data: {json.dumps({'done': True, 'answer': answer, 'session_action': 'CONTINUE'})}\n\n"
 
@@ -2938,7 +2819,6 @@ async def greet_visitor(payload: GreetVisitorPayload):
     final_session_id = active_session["session_id"]
     message_log = []
     _last_activity_ts   = datetime.now().timestamp()
-    _low_confidence_count = 0  # reset escalation counter
 
     await manager.broadcast({
         "type": "session_start",

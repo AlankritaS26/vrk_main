@@ -16,7 +16,9 @@ Env vars (matches the provider-abstraction story in EP-03):
 """
 
 import os
+import io
 import re
+import shutil
 import time
 import logging
 import numpy as np
@@ -227,6 +229,37 @@ def transcribe_audio(audio_bytes: bytes) -> dict:
     Still uses ffmpeg; remove once /ws/stt is live everywhere.
     """
     import subprocess, tempfile, wave
+
+    # Mobile Expo recordings are usually AAC/M4A. Decode them with PyAV so
+    # the backend does not depend on a system ffmpeg executable.
+    try:
+        import av
+        container = av.open(io.BytesIO(audio_bytes))
+        resampler = av.audio.resampler.AudioResampler(
+            format="s16", layout="mono", rate=SAMPLE_RATE
+        )
+        chunks = []
+        for frame in container.decode(audio=0):
+            converted = resampler.resample(frame)
+            if not isinstance(converted, list):
+                converted = [converted]
+            for output in converted:
+                if output is not None:
+                    chunks.append(output.to_ndarray().reshape(-1))
+        if chunks:
+            return transcribe_pcm(np.concatenate(chunks))
+    except Exception as e:
+        logging.getLogger("RNSIT_Kiosk.STT").warning(
+            "[STT] PyAV decode failed, trying ffmpeg: %s", e
+        )
+
+    if not shutil.which("ffmpeg"):
+        return {
+            "text": "",
+            "confidence": 0.0,
+            "language": "en",
+            "error": "audio_decoder_unavailable",
+        }
 
     webm_path = wav_path = None
     try:

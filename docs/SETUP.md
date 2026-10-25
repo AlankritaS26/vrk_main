@@ -120,3 +120,5 @@ Boot log must read `Loading large-v3-turbo on cuda (float16)`. Open port 8001 in
 | Kiosk transcribes its own voice | use Chrome; echo-cancellation + VAD pause are built in |
 | Boot shows `on cpu` on the GPU server | CUDA not visible → `nvidia-smi`, reinstall drivers |
 | Everything rejected as `too_quiet` | energy gate too strict → see docs/OPERATIONS.md tuning |
+| QR code not appearing on kiosk | `qrcode` or `Pillow` not installed → `venv\Scripts\python.exe -m pip install -r backend\requirements.txt` |
+| QR scanned but phone can't open link | Wrong IP or firewall → set `COMPANION_BASE_URL=http://<LAN-IP>:8001` in `.env`, open port 8001 in firewall, ensure same Wi-Fi |

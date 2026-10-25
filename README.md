@@ -1,4 +1,4 @@
-﻿# VRK — Voice Receptionist Kiosk (Nova)
+# VRK — Voice Receptionist Kiosk (Nova)
 
 An AI-powered digital receptionist kiosk for **RNS Institute of Technology**. Visitors walk up, are recognized (or greeted and registered) by camera, and engage in natural, synchronized voice conversations — built on a self-hosted, high-performance, cost-effective stack.
 
@@ -33,7 +33,6 @@ venv\Scripts\python.exe run.py
 | Portal / Feature | URL / Endpoint | Default Credentials | Supported Device | Purpose |
 | :--- | :--- | :--- | :--- | :--- |
 | **Interactive Kiosk** | `http://localhost:3000` | *None (Public Voice Terminal)* | **Laptop / Desktop Terminal Only** | Main digital receptionist (Nova). 100% voice-driven, vision recognition, no touch buttons. Blocked on mobile phones. |
-| **Front Desk Staff Dashboard** | `http://127.0.0.1:8001/staff`<br>*(or `http://<LAN-IP>:8001/staff`)* | Username: `staff`<br>Password: `rnsit2024`<br>*(Admin: `admin` / `111111`)* | **Staff Laptop / Tablet** | Real-time human handover queue, incoming visitor alerts with audio chime, live transcripts, Accept & Resolve actions. |
 | **Admin Control Plane** | `http://127.0.0.1:8001/logs-dashboard` | Username: `admin`<br>Password: `111111` | **Admin Laptop / PC** | Live conversation logs, rename history audit, biometric face encodings, and system wipe controls. |
 | **Mobile Session Summary & Brochure Portal** | `http://<LAN-IP>:8001/companion/<token>` | *None (Secured by 20-min session token)* | **Mobile Phone (Scan QR on Kiosk)** | Visitor takes away their session summary, personalized recap, official PDF brochures, and quick links on smartphone. |
 
@@ -47,7 +46,6 @@ venv\Scripts\python.exe run.py
 
 ### 🎙️ Pure Voice-Only Interaction (No Clicking):
 - **Zero Touch Required**: All clickable buttons ("Talk to Staff", "Phone Companion") have been removed from the kiosk header.
-- **Escalation Trigger**: Say *"I want to talk to a person"*, *"Connect me to human staff"*, *"I need a real person"*, or report an emergency (*"There is a medical emergency"*). Nova automatically alerts the staff dashboard.
 
 ---
 
@@ -174,7 +172,6 @@ ANSWER SOURCE: weather_api | traffic_api | entity_kb | general_rag | guardrail_r
 - **State Machine Architecture**: `BOT_HANDLING` $\to$ `ESCALATION_REQUESTED` $\to$ `STAFF_NOTIFIED` $\to$ `STAFF_CONNECTED` $\to$ `RESOLVED` (with a 60-second auto-timeout reverting to bot if staff is unavailable).
 - **Purely Voice-Triggered Escalation — No Buttons**:
   - **Explicit Voice Intent**: Say *"I want to talk to a person"*, *"Speak to human staff"*, *"Connect me to front desk"*, *"I need a real person"*, *"Talk to someone"*, or *"Transfer me"*.
-  - **Low RAG Confidence**: 3 consecutive low-confidence / uncacheable fallback answers automatically trigger escalation.
   - **Sensitive Keywords**: Automatic priority routing on queries containing *"emergency"*, *"medical"*, *"accident"*, *"harassment"*, or *"police"*.
 - **Live Staff Dashboard** — accessed by staff (not visitors) at `http://127.0.0.1:8001/staff`:
   - Protected with HTTP Basic authentication:
@@ -182,9 +179,35 @@ ANSWER SOURCE: weather_api | traffic_api | entity_kb | general_rag | guardrail_r
     - **Admin**: Username `admin` / Password `111111`
   - Real-time WebSocket alerts, live pending queue, conversation transcripts, and **Accept** / **Resolve** controls.
   - Staff open this URL on a separate laptop/tablet at the front desk and log in once.
+  - To test from another computer or phone on the same Wi-Fi, find the backend computer's IPv4 address with `ipconfig`, then open `http://<IPv4-address>:8001/staff` on that device (for example, `http://192.168.1.25:8001/staff`). Allow Python/Uvicorn through Windows Firewall if the page cannot be reached. Use the computer's LAN address, not `127.0.0.1`, because `127.0.0.1` points to the device being used.
+  - On a phone, use the same URL in Chrome/Edge and allow microphone access when using the staff voice control. HTTPS may be required by the browser for microphone access when the dashboard is not opened from localhost.
+  - If the microphone is blocked on another laptop, this is usually because `http://192.168.x.x:8001/staff` is not a secure browser context. Use HTTPS for a permanent setup. For a development-only test in Chrome, open `chrome://flags/#unsafely-treat-insecure-origin-as-secure`, add the exact dashboard origin (for example `http://192.168.0.167:8001`), enable the flag, relaunch Chrome, and then allow microphone access. Do not use this flag on a shared or public computer.
 - **Kiosk Wait UX**: Smooth glassmorphic modal with pulsing indicator, connection countdown, and auto-timeout after 60 seconds.
 
 ---
+
+### 8. 📱 Staff Mobile App (Expo Go)
+
+
+#### Audio routing
+
+| Speaker | Audio destination | Transcription |
+|---|---|---|
+| Visitor at kiosk | Staff browser dashboard and Expo staff phone | Existing kiosk STT |
+| Staff Expo phone | Kiosk as original recorded audio | Existing kiosk STT |
+| Staff text reply | Kiosk through Kokoro `/tts` | Saved in transcript |
+| Visitor audio at kiosk | Not played back on kiosk, preventing echo | Existing kiosk STT |
+
+The browser dashboard may require one click on **Enable visitor audio** before autoplay permits incoming visitor audio. Expo uses native audio playback.
+
+#### Staff troubleshooting
+
+- Use `http://127.0.0.1:8001/staff` only on the backend computer; use `http://<LAN-IP>:8001/staff` from another device.
+- If browser microphone access is blocked over LAN HTTP, use the Expo app or configure HTTPS.
+- For `unsupported FormData implementation`, restart Expo with `--clear`; the app uses native `File.upload`.
+- For a duplicate `setAudioModeAsync` error, close Expo Go and restart Metro with `--clear`.
+- If Connect is slow, the active queue loads first and history loads in the background.
+- If browser visitor audio is silent, click **Enable visitor audio**, check tab mute, and check the output device.
 
 ## System Architecture
 
@@ -261,11 +284,6 @@ ANSWER SOURCE: weather_api | traffic_api | entity_kb | general_rag | guardrail_r
 | `/companion/qr/{token}` | `GET` (PNG) | Generates and streams PNG QR code image for mobile scanning. |
 | `/companion/validate/{token}` | `GET` | Validates companion token and returns session transcript summary. |
 | `/companion/brochure/{token}` | `GET` (PDF) | Streams contextual department or topic brochure PDF. |
-| `/escalation/request` | `POST` | Triggers a human handover request and notifies staff. |
-| `/escalation/active` | `GET` | Lists all active escalation requests for staff queue. |
-| `/escalation/accept/{session_id}` | `POST` | Staff member accepts an escalation request. |
-| `/escalation/resolve/{session_id}` | `POST` | Staff marks escalation resolved, returning kiosk to bot. |
-| `/staff` | `GET` (HTML) | Protected real-time staff escalation dashboard. |
 
 ---
 
@@ -308,8 +326,6 @@ vrk_main/
 |       +-- WelcomeScreen.js    Active voice screen, full-answer render, audio sync
 |       +-- IdleScreen.js       Attract mode, vision state indicators, carousel
 |       +-- GoodbyeScreen.js    Farewell transition card with RNSIT branding
-|       +-- AriaAvatar.js       Animated vector avatar character engine (Nova)
-|       +-- avatarReactions.js  Intent recognition & personality prefixes
 |       +-- kioskMic.js         Browser VAD 16kHz audio capture
 |       +-- index.css           Glassmorphic kiosk design system
 |       +-- index.js            React root mount
@@ -327,7 +343,6 @@ vrk_main/
 ├── backend/               # FastAPI Backend Application (Port 8001)
 │   ├── main.py            # API routes, WebSockets, session management
 │   ├── companion.py       # QR companion endpoints, mobile page, brochure matching
-│   ├── escalation.py      # Human handover state machine & staff dashboard
 │   ├── detection.py       # Camera pipeline, MediaPipe mesh, presence states
 │   ├── recognition.py     # ArcFace + SCRFD face embedding extraction
 │   ├── stt.py             # faster-whisper speech-to-text pipeline
@@ -357,8 +372,6 @@ vrk_main/
 │   │   ├── WelcomeScreen.js# Active voice screen, name capture, audio sync
 │   │   ├── IdleScreen.js  # Attract mode, vision state indicators, carousel
 │   │   ├── GoodbyeScreen.js# Farewell transition card with RNSIT branding
-│   │   ├── AriaAvatar.js  # Animated vector avatar character engine (Nova)
-│   │   ├── avatarReactions.js# Intent recognition & personality prefixes
 │   │   ├── kioskMic.js    # Browser VAD 16kHz audio capture
 │   │   ├── index.css      # Glassmorphic kiosk design system
 │   │   └── index.js       # React root mount
@@ -493,32 +506,62 @@ The following targeted fixes were applied without redesigning the UI or removing
    - Say *"Goodbye"* at the kiosk to conclude the session.
    - Refresh the companion page on your phone → the token is immediately invalidated, displaying the clean **"Session Expired"** card.
 
-### 8. 🛎️ Testing Human Handover & Front Desk Escalation
-1. **Open Staff Dashboard** (staff only — separate device from the kiosk):
-   - On a front-desk laptop or tablet, open a browser and navigate to:
-     ```
-     http://127.0.0.1:8001/staff
-     ```
-     (If on a different machine on the same network: `http://<kiosk-LAN-IP>:8001/staff`)
-   - Log in using staff credentials:
-     - Username: `staff` · Password: `rnsit2024`
-     - *or Admin:* Username: `admin` · Password: `111111`
-   - Note the top status bar: *"Live · WebSocket connected"*.
-2. **Trigger Escalation from Kiosk — Voice Only**:
-   - **Voice (primary)**: Say *"I need to speak to a real person"* or *"Connect me to human staff"* or *"Talk to someone"*.
-   - **Emergency**: Say *"There is a medical emergency"* — this auto-escalates immediately.
-3. **Observe Kiosk Feedback**:
-   - The kiosk displays the glassmorphic overlay: *"Connecting to Front Desk — A front desk reception team member has been alerted..."* with an animated connection spinner.
-4. **Accept Request on Staff Dashboard**:
-   - The staff dashboard flashes a red banner with the visitor's name, reason, and recent chat history.
-   - Click the green **"Accept"** button.
-   - The kiosk screen immediately transitions to: *"🤝 Staff Member Connected!"*.
-5. **Resolve the Escalation**:
-   - On the staff dashboard, click **"Resolve"**.
-   - The kiosk overlay dismisses, and Nova resumes: *"Your query has been addressed. Nova is ready to help you further."*
-6. **Timeout Auto-Revert Test**:
-   - Trigger an escalation and do not accept it on the staff dashboard.
-   - After 60 seconds, the kiosk displays: *"⏳ Staff Currently Occupied — Nova will continue helping you"* and automatically reverts to bot mode.
+### 📦 QR Companion — Required Dependencies & Setup
+
+### Backend Python Packages (in `backend/requirements.txt`)
+
+The QR Companion feature requires these packages installed in the Python virtual environment:
+
+| Package | Version | Purpose |
+|---|---|---|
+| `qrcode[pil]` | `==8.0` | Server-side QR code image generation (PNG) |
+| `Pillow` | `>=10.0.0` | Image processing library required by `qrcode[pil]` |
+| `reportlab` | `==4.4.1` | Dynamic PDF brochure generation |
+
+> **These are already listed in [`backend/requirements.txt`](file:///c:/Users/Akshatha%20A/vrk_main/backend/requirements.txt).** No separate install is needed — just run:
+> ```powershell
+> venv\Scripts\python.exe -m pip install -r backend\requirements.txt
+> ```
+
+### Frontend (React) — No Extra npm Package Needed
+
+The kiosk frontend does **NOT** use a client-side QR library (like `qrcode.react`). Instead, it loads the QR code as a **PNG image from the backend API**:
+```
+GET /companion/qr/{token}  →  returns PNG image
+```
+The React `WelcomeScreen.js` simply renders an `<img>` tag pointing to this backend endpoint. No npm install required for QR.
+
+### ⚠️ QR Code Not Generating? — Common Causes & Fixes
+
+If the QR code is **not appearing on another laptop**, check these causes:
+
+| # | Cause | Symptom | Fix |
+|---|---|---|---|
+| 1 | **`qrcode` package not installed** | Backend logs: `ModuleNotFoundError: No module named 'qrcode'` | Run: `venv\Scripts\python.exe -m pip install -r backend\requirements.txt` |
+| 2 | **`Pillow` not installed** | Backend logs: `ModuleNotFoundError: No module named 'PIL'` | Run: `venv\Scripts\python.exe -m pip install Pillow>=10.0.0` |
+| 3 | **venv copied instead of rebuilt** | Import errors or wrong Python version | **Delete** the `venv/` folder and rebuild: `py -3.12 -m venv venv` then reinstall requirements |
+| 4 | **Backend not running on port 8001** | QR image shows broken icon (404) | Start backend: `venv\Scripts\python.exe run.py` and verify `http://127.0.0.1:8001/health` returns OK |
+| 5 | **Session not started (no token)** | QR card not visible on kiosk screen | QR only appears after a session starts (face detected). Stand in front of camera to trigger session |
+| 6 | **`COMPANION_BASE_URL` points to wrong IP** | QR generates but scanned link doesn't open on phone | Set `COMPANION_BASE_URL=http://<your-LAN-IP>:8001` in `.env`, or let the backend auto-detect LAN IP |
+| 7 | **Firewall blocking port 8001** | Phone can't reach the companion page after scanning | Open port 8001 in Windows Firewall for inbound TCP connections |
+| 8 | **Phone and laptop not on same Wi-Fi** | Phone shows "site can't be reached" after scanning QR | Ensure both devices are on the same local network (LAN/Wi-Fi) |
+| 9 | **Redis / Memurai not running** | Token creation fails silently | Start Redis/Memurai, or check backend logs for Redis connection errors |
+
+### Quick Diagnostic Steps (on the new laptop)
+
+```powershell
+# 1. Verify qrcode is installed in the venv
+venv\Scripts\python.exe -c "import qrcode; print('qrcode OK, version:', qrcode.__version__)"
+
+# 2. Verify Pillow is installed
+venv\Scripts\python.exe -c "from PIL import Image; print('Pillow OK')"
+
+# 3. Test QR generation directly
+venv\Scripts\python.exe -c "import qrcode; img = qrcode.make('https://test.com'); img.save('test_qr.png'); print('QR saved to test_qr.png')"
+
+# 4. Check backend health
+curl http://127.0.0.1:8001/health
+```
 
 ---
 
