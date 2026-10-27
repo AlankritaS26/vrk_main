@@ -2058,6 +2058,30 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#dbeafe'
     }}>
 
+      {/* ── SLIM HEADER ── */}
+      <header style={{
+        background: 'linear-gradient(90deg,#1a237e,#283593)', padding: '9px 20px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <img src="/rnslogo.png" alt="RNSIT"
+            style={{ height: '40px', width: '40px', objectFit: 'contain' }} />
+          <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
+            RNS Institute of Technology
+            <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: '13px', color: '#fff', fontWeight: '700' }}>{visitorName}</div>
+            <div style={{ fontSize: '11px', color: isReturning ? '#a5d6a7' : 'rgba(255,255,255,0.5)', fontWeight: '600' }}>
+              {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
+            </div>
+          </div>
+        </div>
+      </header>
+
       {/* ── MODALS ── */}
       {privacyOpen && (
         <div onClick={e => e.target === e.currentTarget && setPrivacyOpen(false)}
@@ -2191,34 +2215,43 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             <Nova3DAvatar st={status} size={{ width: '100%', height: '550px' }} />
           </div>
 
-          {/* ── Name + status badge ── */}
+          {/* ── Name ── */}
           <div style={{
-            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px',
             zIndex: 1, marginTop: '8px'
           }}>
             <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Nova</div>
             <div style={{ fontSize: '12px', color: 'rgba(12, 110, 171, 0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+          </div>
+
+          {/* ── Bottom-Left Voice Status & Hints UI ── */}
+          <div style={{
+            position: 'absolute', bottom: '24px', left: '24px', zIndex: 20,
+            display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '8px'
+          }}>
             <div style={{
-              padding: '5px 18px', borderRadius: '20px', background: statusBg,
-              color: statusColor, fontSize: '13px', fontWeight: '700',
-              transition: 'all 0.4s ease', boxShadow: '0 2px 10px rgba(0,0,0,0.10)'
+              padding: '8px 22px', borderRadius: '24px', background: statusBg,
+              color: statusColor, fontSize: '13.5px', fontWeight: '700',
+              transition: 'all 0.4s ease', boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+              border: '1.5px solid rgba(255,255,255,0.7)', backdropFilter: 'blur(8px)',
+              display: 'inline-flex', alignItems: 'center', gap: '6px'
             }}>
               {{ ready: '● Voice Ready', listening: '🎤 Listening to you…', processing: '💭 Thinking…', speaking: '🔊 Speaking…' }[status]}
             </div>
-          </div>
 
-          {/* hint pill (ready state only) */}
-          {status === 'ready' && messages.length === 0 && (
-            <div style={{
-              marginTop: '14px', padding: '8px 20px', borderRadius: '20px',
-              background: 'rgba(6,18,54,0.52)', backdropFilter: 'blur(8px)',
-              border: '1px solid rgba(125,211,252,0.32)', fontSize: '12px',
-              color: 'rgba(224,242,254,0.88)', fontStyle: 'italic', textAlign: 'center',
-              maxWidth: '280px', zIndex: 1
-            }}>
-              {hints[hintIndex]}
-            </div>
-          )}
+            {/* hint pill (ready state only) */}
+            {status === 'ready' && messages.length === 0 && (
+              <div style={{
+                padding: '6px 14px', borderRadius: '14px',
+                background: 'rgba(6,18,54,0.52)', backdropFilter: 'blur(8px)',
+                border: '1px solid rgba(125,211,252,0.32)', fontSize: '12px',
+                color: 'rgba(224,242,254,0.88)', fontStyle: 'italic', textAlign: 'left',
+                maxWidth: '280px', zIndex: 1
+              }}>
+                {hints[hintIndex]}
+              </div>
+            )}
+          </div>
         </div>
 
         {false && (<div style={{ display: 'none' }}>
