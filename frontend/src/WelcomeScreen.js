@@ -175,6 +175,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, []);
   const [liveText, setLiveText] = useState('');
   const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
+  const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  const [captionText, setCaptionText] = useState('');
+  const captionsEnabledRef = useRef(true);
+  useEffect(() => { captionsEnabledRef.current = captionsEnabled; }, [captionsEnabled]);
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
 
@@ -236,11 +240,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   useEffect(() => { sessionRef.current = session; }, [session]);
 
   useEffect(() => {
-    if (scrollRef.current)
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, liveText, processingHint]);
-
-  useEffect(() => {
     isMounted.current = true;
     return () => { isMounted.current = false; stopWaveform(); };
   }, []);
@@ -267,6 +266,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const addMessage = useCallback((text, speaker) => {
     if (!text || text === '__BLINK__' || /👁|\[Blinked/i.test(text)) return;
     text = cleanText(text);
+    if (speaker === 'kiosk') setCaptionText(text);
     setMessages(prev => [...prev, {
       text, speaker,
       timestamp: new Date().toLocaleTimeString()
@@ -293,6 +293,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           ? { ...m, text: m.text ? m.text + ' ' + cleaned : cleaned }
           : m
       ));
+      if (speaker === 'kiosk') setCaptionText(prev => prev ? `${prev} ${cleaned}` : cleaned);
     };
   }, [setMessages]);
 
@@ -631,6 +632,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (activeSpeakIdRef.current !== myId) return;
       window.__novaTtsActive = false;  // lipsync off — mouth returns to rest
       isSpeaking.current = false;
+      setCaptionText('');
       if (isMounted.current) startListening();
       setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
       if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
@@ -1570,6 +1572,22 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
     if (!text) return;
+    const captionCommand = text.trim().toLowerCase().replace(/[.!?]+$/, '');
+    if (/^(?:off|stop|disable|turn off|hide) captions?$/.test(captionCommand)
+        || /^(?:stop|turn off|disable|hide) the captions?$/.test(captionCommand)) {
+      captionsEnabledRef.current = false;
+      setCaptionsEnabled(false);
+      setCaptionText('');
+      setLiveText('');
+      setProcessingHint('');
+      return;
+    }
+    if (/^(?:on|enable|show|turn on) captions?$/.test(captionCommand)
+        || /^(?:turn on|enable|show) the captions?$/.test(captionCommand)) {
+      captionsEnabledRef.current = true;
+      setCaptionsEnabled(true);
+      return;
+    }
     setLiveText('');
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
@@ -2031,7 +2049,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
 
-  const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
@@ -2103,37 +2120,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
 
 
-      {/* ── SLIM HEADER ── */}
-      <header style={{
-        background: 'linear-gradient(90deg,#1a237e,#283593)', padding: '9px 20px',
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <img src="/rnslogo.png" alt="RNSIT"
-            style={{ height: '40px', width: '40px', objectFit: 'contain' }} />
-          <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
-            RNS Institute of Technology
-            <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
-          </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ textAlign: 'right' }}>
-            <div style={{ fontSize: '13px', color: '#fff', fontWeight: '700' }}>{visitorName}</div>
-            <div style={{ fontSize: '11px', color: isReturning ? '#a5d6a7' : 'rgba(255,255,255,0.5)', fontWeight: '600' }}>
-              {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
-            </div>
-          </div>
-        </div>
-      </header>
-
       {/* ── MAIN BODY ── */}
-      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
+      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden', position: 'relative' }}>
 
         {/* ══════════ LEFT: ANIMATED Nova CHARACTER ══════════ */}
         <div style={{
-          width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
-          alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
+          width: '100%', height: '100%', flexShrink: 0, display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'flex-start', padding: '18px 24px 24px',
           background: {
             ready: '#dbeafe',
             listening: '#dbeafe',
@@ -2195,7 +2188,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
           {/* ── Nova 3D Character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
-            <Nova3DAvatar st={status} />
+            <Nova3DAvatar st={status} size={{ width: '100%', height: '550px' }} />
           </div>
 
           {/* ── Name + status badge ── */}
@@ -2204,7 +2197,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
             zIndex: 1, marginTop: '8px'
           }}>
             <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Nova</div>
-            <div style={{ fontSize: '12px', color: 'rgba(219,234,254,0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+            <div style={{ fontSize: '12px', color: 'rgba(12, 110, 171, 0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
             <div style={{
               padding: '5px 18px', borderRadius: '20px', background: statusBg,
               color: statusColor, fontSize: '13px', fontWeight: '700',
@@ -2228,7 +2221,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           )}
         </div>
 
-        {/* ══════════ RIGHT: COMPACT CHAT ══════════ */}
+        {false && (<div style={{ display: 'none' }}>
+        {/* Legacy conversation panel is intentionally not shown on the kiosk. */}
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column', background: 'rgba(219,234,254,0.72)',
           border: '1px solid rgba(255,255,255,0.62)', borderRadius: '28px', margin: '14px',
@@ -2352,51 +2346,31 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               </div>
             )}
           </div>
+        </div>
+          </div>)}
 
-          {/* voice footer */}
-          <div style={{
-            padding: '10px 14px', background: 'rgba(255,255,255,0.22)', borderTop: '1px solid rgba(255,255,255,0.45)',
-            flexShrink: 0, display: 'flex', alignItems: 'center', gap: '10px'
-          }}>
+          {captionsEnabled && (
             <div style={{
-              width: '36px', height: '36px', borderRadius: '50%', flexShrink: 0,
-              background: { ready: '#f5f5f5', listening: '#e8f5e9', processing: '#ede7f6', speaking: '#fce4ec' }[status],
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              boxShadow: status === 'listening' ? '0 0 0 5px rgba(67,160,71,0.12)' : 'none',
-              transition: 'all 0.3s'
+              position: 'absolute', left: '50%', bottom: '24px', transform: 'translateX(-50%)',
+              width: 'min(760px, 88vw)', zIndex: 5, pointerEvents: 'none',
+              display: 'flex', justifyContent: 'center'
             }}>
-              {status === 'speaking' ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e53935" strokeWidth="2.2">
-                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-                </svg>
-              ) : (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-                  stroke={status === 'listening' ? '#43a047' : status === 'processing' ? '#7e57c2' : '#aaa'} strokeWidth="2.2">
-                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                  <line x1="12" y1="19" x2="12" y2="23" />
-                  <line x1="8" y1="23" x2="16" y2="23" />
-                </svg>
+              {captionText && (
+                <div style={{
+                  padding: '12px 20px', borderRadius: '12px',
+                  background: 'rgba(0, 0, 0, 0.72)', color: '#fff',
+                  fontSize: 'clamp(16px, 2vw, 24px)', lineHeight: '1.45',
+                  textAlign: 'center', textShadow: '0 1px 2px rgba(0,0,0,0.5)',
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.25)'
+                }}>
+                  {captionText}
+                </div>
               )}
             </div>
-            <canvas ref={canvasRef} width={130} height={32}
-              style={{ borderRadius: '6px', background: 'rgba(67,160,71,0.05)', display: listening ? 'block' : 'none' }} />
-            {!listening && (
-              <span style={{
-                fontSize: '12px', fontWeight: '700',
-                color: { ready: '#aaa', listening: '#43a047', processing: '#7e57c2', speaking: '#e53935' }[status],
-                transition: 'color 0.3s'
-              }}>
-                {statusLabel}
-              </span>
-            )}
-            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Nova AI</span>
-          </div>
-        </div>
-      </div>
+          )}
 
+          <canvas ref={canvasRef} width={130} height={32} style={{ display: 'none' }} />
+        </div>
       {/* ── QR COMPANION MODAL ── */}
       {showCompanionModal && (
         <div style={{

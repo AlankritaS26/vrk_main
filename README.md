@@ -65,6 +65,8 @@ opened by scanning the QR card shown on the kiosk.
 - Mid-session name changes synchronized with MongoDB
 - Barge-in interruption and answer-resume flow
 - Farewell and inactivity handling
+- Automatic response captions displayed over the kiosk screen
+- Say "off captions" or "stop the captions" to hide captions and continue with voice only
 
 ### Vision and recognition
 
