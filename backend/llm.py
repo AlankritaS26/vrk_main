@@ -83,6 +83,17 @@ _INTRO_FULL_PATTERNS = [
     re.compile(r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[\s,!.:-]+)?(?:i am nova|i'm nova|im nova|this is nova|my name is nova|nova here|hello nova|hi nova)[\s,!.]*$", re.I),
     re.compile(r"^(?:(?:hello|hi|hey|hii|heyy|greetings|welcome(?: to rnsit)?)[\s,!.:-]+)?(?:i am|i'm|im|this is|my name is|as) nova(?:,?\s+(?:the|an|your|rnsit's)\s+(?:ai\s+)?(?:digital\s+)?receptionist(?:\s+(?:for|at|of|here at)\s+rnsit)?)?[\s,!.]*$", re.I),
     re.compile(r"^(?:i am|i'm|im)\s+(?:the|an|your|rnsit's)\s+(?:ai\s+)?(?:digital\s+)?receptionist(?:\s+(?:for|at|of|here at)\s+rnsit)?[\s,!.]*$", re.I),
+    re.compile(
+        r"^(?:let\s+me\s+think(?:(?:\s+about\s+(?:that|it))|(?:\s+for\s+a\s+moment))?"
+        r"|let\s+me\s+see"
+        r"|let\s+me\s+check(?:\s+(?:that|this))?(?:\s+for\s+you)?"
+        r"|let\s+me\s+(?:look|find)(?:\s+(?:that|it|this))?(?:\s+up)?(?:\s+for\s+you)?"
+        r"|sure,?\s*(?:(?:i\s+(?:will|can|shall|ll)\s+find|let\s+me\s+(?:check|find|look|think|see)|i\s+can\s+help)(?:\s+(?:that|this|it|out))?(?:\s+up)?(?:\s+for\s+you)?)"
+        r"|right,?\s+let\s+me\s+find\s+that"
+        r"|good\s+question(?:\s*[-—–]\s*one\s+moment)?"
+        r"|of\s+course,?\s+just\s+a\s+second)[\s,!.]*$",
+        re.I
+    ),
 ]
 
 _PREFIX_PATTERNS = [
@@ -96,7 +107,19 @@ _PREFIX_PATTERNS = [
     ),
     re.compile(r"^(?:(?:hello|hi|hey|hii|heyy|greetings|hi there|hello there)[,\s!.:-]+)+(?:welcome to (?:rnsit|rns institute of technology)[.!]*\s*)?", re.I),
     re.compile(r"^(?:welcome to (?:rnsit|rns institute of technology)[,!.:\s-]+)", re.I),
-    re.compile(r"^(?:sure[!,.]*\s*(?:here is the information[.:\s]*)?|certainly[!,.]*\s*)", re.I),
+    re.compile(
+        r"^(?:let\s+me\s+think(?:(?:\s+about\s+(?:that|it))|(?:\s+for\s+a\s+moment))?"
+        r"|let\s+me\s+see"
+        r"|let\s+me\s+check(?:\s+(?:that|this))?(?:\s+for\s+you)?"
+        r"|let\s+me\s+(?:look|find)(?:\s+(?:that|it|this))?(?:\s+up)?(?:\s+for\s+you)?"
+        r"|sure(?:[!,.]|\s*[,!.-])*\s*(?:(?:i\s+(?:will|can|shall|ll)\s+find|let\s+me\s+(?:check|find|look|think|see)|i\s+can\s+help)(?:\s+(?:that|this|it|out))?(?:\s+up)?(?:\s+for\s+you)?)"
+        r"|right,?\s+let\s+me\s+find\s+that"
+        r"|good\s+question(?:\s*[-—–]\s*one\s+moment)?"
+        r"|of\s+course,?\s+just\s+a\s+second)"
+        r"[,!\s.:-]+",
+        re.I
+    ),
+    re.compile(r"^(?:sure[!,.]*\s*(?:here is the information[.:\s]*)?|certainly[!,.]*\s*|of\s+course[!,.]*\s*)", re.I),
 ]
 
 

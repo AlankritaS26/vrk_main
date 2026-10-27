@@ -69,6 +69,36 @@ function buildTtsSentenceChunks(text) {
   return sentences;
 }
 
+function isEmotionalResponse(text) {
+  if (!text) return false;
+  const t = text.trim().toLowerCase().replace(/[.,!?;:"'()]/g, ' ');
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > 7) return false;
+
+  // Interrogative / action openers indicate a question or request, not an emotional state
+  const questionStarters = ['who', 'what', 'where', 'when', 'why', 'how', 'which', 'can', 'could', 'would', 'did', 'do', 'does', 'is', 'are', 'tell', 'show', 'find', 'explain', 'give'];
+  if (questionStarters.includes(words[0])) return false;
+
+  const emotionWords = new Set([
+    'happy', 'depressed', 'sad', 'stressed', 'stress', 'anxious', 'worried',
+    'nervous', 'overwhelmed', 'exhausted', 'tired', 'hectic', 'rough', 'low',
+    'unhappy', 'terrible', 'awful', 'frustrated', 'annoyed', 'irritated',
+    'angry', 'upset', 'excited', 'pumped', 'thrilled', 'wonderful', 'fantastic',
+    'amazing', 'good', 'fine', 'well', 'great', 'okay', 'ok', 'alright', 'bad',
+    'down', 'cheerful', 'pleased'
+  ]);
+
+  if (words.some(w => emotionWords.has(w))) return true;
+
+  const phrase = words.join(' ');
+  const emotionPhrases = [
+    'not good', 'not great', 'not okay', 'not well', 'not fine', 'not bad',
+    'pretty good', 'pretty bad', 'so so', 'doing well', 'doing good',
+    'doing fine', 'doing great', 'doing okay', 'all good', 'same old'
+  ];
+  return emotionPhrases.some(p => phrase.includes(p));
+}
+
 export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
   const camVideoRef = useRef(null);
@@ -1095,12 +1125,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ];
     const isInstantCmd = hasInlineName || bareNameChange ||
       /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+    const isEmotion = isEmotionalResponse(text);
 
-    if (!isInstantCmd && text.split(' ').length >= 3) {
+    if (!isInstantCmd && !isEmotion && text.split(' ').length >= 3) {
       const ack = acks[Math.floor(Math.random() * acks.length)];
       speak(ack, () => setProcessingHint(ack));
     } else {
-      setProcessingHint('Thinking...');
+      if (!isEmotion && !isInstantCmd) {
+        setProcessingHint('Thinking...');
+      } else {
+        setProcessingHint('');
+      }
       statusRef.current = 'processing';
       setStatus('processing');
     }
@@ -1632,10 +1667,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ];
     const isInstantCmd = hasInlineName || bareNameChange ||
       /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+    const isEmotion = isEmotionalResponse(text);
 
     let ackTimer = null;
 
-    if (!isInstantCmd && text.split(' ').length >= 3 && !lastQuestionHadAckRef.current) {
+    if (!isInstantCmd && !isEmotion && text.split(' ').length >= 3 && !lastQuestionHadAckRef.current) {
       ackTimer = setTimeout(() => {
         if (!awaitingAnswerRef.current) return;
         const ack = acks[Math.floor(Math.random() * acks.length)];
@@ -1647,7 +1683,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }, 750);
     } else {
       lastQuestionHadAckRef.current = false;
-      setProcessingHint('Thinking...');
+      if (!isEmotion && !isInstantCmd) {
+        setProcessingHint('Thinking...');
+      } else {
+        setProcessingHint('');
+      }
       statusRef.current = 'processing';
       setStatus('processing');
     }
