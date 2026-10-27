@@ -689,6 +689,7 @@ async def handle_personalized_reengagement(user_reply: str, session: dict) -> tu
         "1. Give ONE short natural emotional response (1 sentence) acknowledging how the visitor is feeling with genuine warmth. "
         "Be empathetic if they feel stressed or tired; enthusiastic if happy or good; pleasant if neutral. "
         "CRITICAL: Never mention emotion detection, classification, or labels (do NOT say 'I detected that you are sad', 'Your emotional state is', etc.).\n"
+        "CRITICAL: Never start with conversational filler phrases like 'Let me think', 'Sure, I will find', 'Let me look that up', 'Sure', 'Of course', etc. Answer directly.\n"
         "2. If there are previous topics, add a second sentence reconnecting to them: "
         "'Last time, we were discussing [topic summary]. Would you like to continue?'\n"
         "If there are no previous questions or topic, ask: 'How may I assist you today?'\n"
@@ -696,8 +697,19 @@ async def handle_personalized_reengagement(user_reply: str, session: dict) -> tu
     )
 
     try:
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are Nova, the AI digital receptionist at RNSIT. "
+                    "Respond with empathy and warmth directly. "
+                    "Never begin with conversational filler like 'Let me think', 'Sure, I will find', 'Let me see', 'Sure', etc."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ]
         raw_text, _tier, _model = await chat_completion_with_fallback(
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
             temperature=0.3,
             max_tokens=100,
         )
