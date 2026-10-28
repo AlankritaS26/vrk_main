@@ -114,6 +114,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // cycle). Comparing session_id for "staleness" was dropping perfectly
   // valid answers whenever the backend ended/resumed the session mid-request.
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
+  const activeSpeakDoneRef = useRef(null);
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
   // (explicitly non-interruptible, per spec — it
@@ -399,6 +400,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       // If a specific conversation prompt (e.g. name prompt, Yes/No confirm) is waiting for speech:
       if (activePromptResolverRef.current) {
+        if (result.low_confidence && ['name', 'spelling'].includes(currentMode)) {
+          console.info(`[STT] Ignoring low-confidence ${currentMode} transcript`);
+          statusRef.current = 'ready';
+          setStatus('ready');
+          return;
+        }
         if (heard && heard.length > 0) {
           const resolver = activePromptResolverRef.current;
           activePromptResolverRef.current = null;
@@ -454,40 +461,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, []);
 
-  // Barge-in has two stages, matching the two things the VAD can tell us:
-  //
-  //  1. onSpeechStart fires OPTIMISTICALLY — the instant sound crosses the
-  //     probability threshold, before the VAD knows if it's real speech or
-  //     a cough/click/echo blip. We respond by DUCKING the TTS volume —
-  //     fast, but non-destructive and reversible.
-  //  2. The VAD itself later tells us which it was:
-  //       - onSpeechEnd   -> real speech, confirmed. NOW we hard-stop TTS.
-  //       - onVADMisfire  -> false alarm. We restore TTS volume and carry on.
-  //
-  // This avoids killing the kiosk's sentence over noise/echo while still
-  // reacting within ~80ms when someone genuinely starts talking.
-
   const duckSpeaking = useCallback(() => {
     if (!isSpeaking.current || !ttsGainRef.current || !playCtxRef.current) return;
-    const g = ttsGainRef.current.gain;
+    const gain = ttsGainRef.current.gain;
     const now = playCtxRef.current.currentTime;
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(0.12, now + 0.08);   // quick, gentle duck — not a hard cut
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(0.12, now + 0.08);
   }, []);
 
   const restoreSpeaking = useCallback(() => {
     if (!ttsGainRef.current || !playCtxRef.current) return;
-    const g = ttsGainRef.current.gain;
+    const gain = ttsGainRef.current.gain;
     const now = playCtxRef.current.currentTime;
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(1, now + 0.15);      // false alarm — fade back to full volume
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(1, now + 0.15);
   }, []);
 
-  // Hard commit: only called once the VAD has CONFIRMED real speech
-  // (onSpeechEnd), or on session-ending events (e.g. goodbye). Stops all
-  // scheduled/playing TTS audio immediately and hands control back to the mic.
+  // Stops playback after VAD confirms the visitor finished an interruption.
   const interruptSpeaking = useCallback(() => {
     if (!isSpeaking.current) return;
     activeSpeakIdRef.current = null;        // any in-flight speak() loop sees this and stops
@@ -502,6 +494,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ttsGainRef.current.gain.setValueAtTime(1, now);   // reset for the next speak() call
     }
     isSpeaking.current = false;
+    const onDone = activeSpeakDoneRef.current;
+    activeSpeakDoneRef.current = null;
+    if (onDone) {
+      try { onDone(); } catch (e) { console.error('[TTS] Interrupted playback callback failed:', e); }
+    }
   }, []);
   useEffect(() => { interruptSpeakingRef.current = interruptSpeaking; }, [interruptSpeaking]);
 
@@ -534,10 +531,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         onSpeechStart: () => {
           if (!isMounted.current) return;
           if (isSpeaking.current) {
-            if (greetingPlayingRef.current) return;
-            // Duck volume gently on sound onset — do NOT kill TTS audio immediately.
-            // If it's a misfire (echo/noise spike), onMisfire will restore volume.
-            // If it's real speech, onSpeechEnd below will hard-stop TTS.
+            if (greetingPlayingRef.current || farewellPlayingRef.current) return;
             duckSpeaking();
             return;
           }
@@ -549,6 +543,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         },
         onSpeechEnd: (audio) => {
           if (isSpeaking.current) {
+            if (greetingPlayingRef.current || farewellPlayingRef.current) {
+              restoreSpeaking();
+              return;
+            }
+            console.info('[TTS] Visitor speech confirmed; interrupting playback');
+            statusRef.current = 'speaking';
             if (lastAnswerRef.current && !farewellPlayingRef.current && !greetingPlayingRef.current) {
               wasInterruptedRef.current = true;
             }
@@ -560,11 +560,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (!isMounted.current) return;
           if (isSpeaking.current) {
             restoreSpeaking();
-          } else {
-            isListening.current = false;
-            setListening(false);
-            setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+            return;
           }
+          isListening.current = false;
+          setListening(false);
+          setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
         },
 
       });
@@ -574,7 +574,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       console.error('[MIC] Error:', err);
       if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     }
-  }, [startWaveform, handleUtterance, duckSpeaking, restoreSpeaking]);
+  }, [startWaveform, handleUtterance, interruptSpeaking, duckSpeaking, restoreSpeaking]);
 
   // release mic + VAD on unmount (session end)
   useEffect(() => () => {
@@ -616,6 +616,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const myId = Symbol('speak');
     activeSpeakIdRef.current = myId;
     isSpeaking.current = true;
+    isListening.current = false;
+    setListening(false);
+    const completePlayback = () => {
+      if (onDone) {
+        try { onDone(); } catch (e) { console.error('[TTS] Playback callback failed:', e); }
+        onDone = null;
+      }
+    };
+    activeSpeakDoneRef.current = completePlayback;
 
     let hasStartedAvatar = false;
     let firstAudioPlayStart = 0;
@@ -623,6 +632,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const fireStart = () => {
       if (hasStartedAvatar) return;
       hasStartedAvatar = true;
+      isListening.current = false;
+      setListening(false);
       window.__novaTtsActive = true;   // tell the avatar animation loop that lipsync is live
       setStatus('speaking');    // avatar flips to "speaking" ONLY when first audio buffer starts
       if (onStart) { onStart(); onStart = null; }
@@ -633,9 +644,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       window.__novaTtsActive = false;  // lipsync off — mouth returns to rest
       isSpeaking.current = false;
       setCaptionText('');
-      if (isMounted.current) startListening();
+      if (isMounted.current && !awaitingAnswerRef.current) startListening();
       setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
-      if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
+      if (activeSpeakDoneRef.current === completePlayback) {
+        activeSpeakDoneRef.current = null;
+        completePlayback();
+      }
     };
 
     // Web Audio setup
@@ -661,48 +675,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
 
-    // Sentence splitting with natural chunking
-    const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
-      .map(s => s.trim()).filter(Boolean);
-
-    const sentences = [];
-    if (raw.length) {
-      let first = raw[0];
-      if (first.length > 55) {
-        const cut = first.indexOf(',');
-        if (cut > 15) {
-          sentences.push(first.slice(0, cut + 1));
-          first = first.slice(cut + 1).trim();
-        }
-      }
-      if (first) sentences.push(first);
-      let buf = '';
-      for (let i = 1; i < raw.length; i++) {
-        buf = buf ? buf + ' ' + raw[i] : raw[i];
-        if (buf.length >= 80) { sentences.push(buf); buf = ''; }
-      }
-      if (buf) sentences.push(buf);
-    }
-
-    if (sentences.length > 1 && sentences[0].length < 20) {
-      sentences[1] = sentences[0] + ' ' + sentences[1];
-      sentences.shift();
-    }
+    const sentences = buildTtsSentenceChunks(text);
 
     console.log('TTS QUEUE:', sentences);
 
     // Fallback: browser speech synthesis
     const browserSpeak = async () => {
-      fireStart();
       for (let i = 0; i < sentences.length; i++) {
         if (activeSpeakIdRef.current !== myId) break;
-        if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
         await new Promise((resolveEnd) => {
           const utter = new SpeechSynthesisUtterance(sentences[i]);
           utter.lang = 'en-US';
           utter.rate = 1.05;
           utter.volume = 1;
-          utter.onstart = () => fireStart();
+          utter.onstart = () => {
+            fireStart();
+            if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
+          };
           utter.onend = () => resolveEnd();
           utter.onerror = () => resolveEnd();
           window.speechSynthesis.speak(utter);
@@ -737,31 +726,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         const buf = await pctx.decodeAudioData(bytes.buffer);
         const tDecoded = performance.now();
         return { buf, tReq, tAudioRecv, tDecoded };
-        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
-        const node = pctx.createBufferSource();
-        node.buffer = buf;
-        node.connect(ttsAnalyserRef.current || ttsGainRef.current);
-        activeNodesRef.current.push(node);
-        node.onended = () => {
-          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-        };
-
-        const at = Math.max(pctx.currentTime, playCursorRef.current);
-        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
-        node.start(at);
-        playCursorRef.current = at + buf.duration;
-
-        // Fire onStart/onSentence exactly when THIS clip's audio begins —
-        // if it's scheduled to start later than "now" (queued behind an
-        // earlier clip that's still playing), wait for that moment instead
-        // of firing immediately, so text and voice stay in lockstep.
-        const announce = () => {
-          fireStart();                                     // status + first-clip-only hook
-          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
-          resolveStarted();
-        };
-        if (delayMs > 0) setTimeout(announce, delayMs);
-        else announce();
       } catch (e) {
         console.warn('[TTS] Fetch or decode error for sentence:', sentenceText, e);
         return { buf: null, tReq, tAudioRecv: performance.now(), tDecoded: performance.now() };
@@ -799,7 +763,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (activeSpeakIdRef.current !== myId) break;
 
         const currentSentence = sentences[i];
-        if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
 
         // Trigger pre-fetch & pre-decode of chunk N+1 WHILE chunk N is prepared/played
         const nextPromise = (i + 1 < sentences.length) ? fetchAndDecodeClip(sentences[i + 1]) : null;
@@ -829,7 +792,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 const tPlayStart = performance.now();
                 if (i === 0) {
                   firstAudioPlayStart = tPlayStart;
-                  fireStart(); // Avatar flips to speaking EXACTLY when buffer starts playing!
 
                   const tAns = timingBase != null ? timingBase : clipData.tReq;
                   const ttsSynthNet = clipData.tAudioRecv - clipData.tReq;
@@ -843,6 +805,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   console.log(`[LATENCY-FLOW] AUDIO_PLAY_START: t=${tPlayStart.toFixed(1)}ms (time-to-first-audio: ${timeToFirstAudio.toFixed(0)}ms)`);
                 }
                 node.start(0);
+                fireStart();
+                if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
               });
               playedSuccessfully = true;
             }
@@ -854,12 +818,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // Fallback recovery if backend TTS returned null or decode failed
         if (!playedSuccessfully && activeSpeakIdRef.current === myId) {
           console.log('[TTS] Browser voice fallback for:', currentSentence);
-          fireStart();
           await new Promise((resolveEnd) => {
             const utter = new SpeechSynthesisUtterance(currentSentence);
             utter.lang = 'en-US';
             utter.rate = 1.05;
             utter.volume = 1;
+            utter.onstart = () => {
+              fireStart();
+              if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
+            };
             utter.onend = () => resolveEnd();
             utter.onerror = () => resolveEnd();
             window.speechSynthesis.speak(utter);
@@ -1478,12 +1445,28 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // 1. Check if user spoke a full multi-letter sequence in one utterance (e.g. "A L A N K R I T A", "A, L, A...", "A-L-A...")
         const fullNorm = normalizeSpelledName(heardSpelling);
         if (fullNorm && fullNorm.letters && fullNorm.letters.length >= 2) {
+          const expectedLen = cleanCandidate.replace(/[^a-zA-Z]/g, '').length;
+          if (expectedLen > 0 && fullNorm.letters.length > Math.max(expectedLen + 3, expectedLen * 2)) {
+            retryCount++;
+            const retrySpelling = `I heard too many letters. Please spell ${cleanCandidate} again, one letter at a time.`;
+            addMessage(retrySpelling, 'kiosk');
+            await speakAndWait(retrySpelling);
+            continue;
+          }
           accumulatedLetters = fullNorm.letters;
           console.log('[NAME-STATE] Full utterance spelling captured in one text:', fullNorm);
         } else {
           // If cleanCandidate exists and user's utterance has all letters together (e.g. "ALANKRITA")
           const cleanLetters = heardSpelling.toUpperCase().replace(/[^A-Z]/g, '');
           if (cleanLetters.length >= 2) {
+            const expectedLen = cleanCandidate.replace(/[^a-zA-Z]/g, '').length;
+            if (expectedLen > 0 && cleanLetters.length > Math.max(expectedLen + 3, expectedLen * 2)) {
+              retryCount++;
+              const retrySpelling = `I heard too many letters. Please spell ${cleanCandidate} again, one letter at a time.`;
+              addMessage(retrySpelling, 'kiosk');
+              await speakAndWait(retrySpelling);
+              continue;
+            }
             accumulatedLetters = cleanLetters.split('');
             console.log('[NAME-STATE] Clean letter string captured:', accumulatedLetters);
           } else {
@@ -1736,6 +1719,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         isSpeaking.current = false;
         setProcessingHint('');
         setStatus('ready');
+        startListening();
         return;
       }
 
@@ -1750,15 +1734,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
 
-      const firstChunkText = (ans) => {
-        const raw = (ans.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [ans]).map(s => s.trim()).filter(Boolean);
-        let first = raw.length ? raw[0] : ans;
-        if (first.length > 55) {
-          const cut = first.indexOf(',');
-          if (cut > 15) first = first.slice(0, cut + 1);
-        }
-        return first;
-      };
+      const firstChunkText = (ans) => buildTtsSentenceChunks(ans)[0] || ans;
 
       lastAnswerRef.current = answer;
       wasInterruptedRef.current = false;
@@ -1770,10 +1746,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       });
 
       setProcessingHint('');
-      awaitingAnswerRef.current = false;
-
-      // Render FULL answer text into the response box
-      addMessage(answer, 'kiosk');
+      let appendSentence = null;
 
       // Start prefetching chunk 0 immediately — zero artificial wait!
       const tTtsReqStart = performance.now();
@@ -1788,7 +1761,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         return d.audio || null;
       }).catch(() => null);
 
-      await speakStream(answer, { initialClipPromise: firstClipPromise, timingBase: tAnswerReceived });
+      await speakStream(answer, {
+        initialClipPromise: firstClipPromise,
+        timingBase: tAnswerReceived,
+        onStart: () => {
+          awaitingAnswerRef.current = false;
+          appendSentence = startProgressiveMessage('kiosk');
+        },
+        onSentence: (sentence) => { if (appendSentence) appendSentence(sentence); },
+      });
 
     } catch (e) {
       clearTimeout(askTimeout);
@@ -1802,7 +1783,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       addMessage(fallback, 'kiosk');
       speak(fallback);
     }
-  }, [session, addMessage, speakStream, runSpellingCaptureAndConfirm, extractVisitorName, speakAndWait, captureUtteranceText, speak]);
+  }, [session, addMessage, speakStream, startProgressiveMessage, runSpellingCaptureAndConfirm, extractVisitorName, speakAndWait, captureUtteranceText, speak]);
 
   // ── Integrated Conversation Start Flow (Voice + Double-Blink: Yes / No / Guest / Name) ──
   const greetedRef = useRef(null);

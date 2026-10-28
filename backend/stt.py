@@ -41,11 +41,8 @@ NAME_PROMPT = (
 )
 
 SPELLING_PROMPT = (
-    "Letters: A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z. "
-    "Spelled letters: A B C D E F G H I J K L M N O P Q R S T U V W X Y Z. "
-    "NATO phonetic alphabet: Alpha, Bravo, Charlie, Delta, Echo, Foxtrot, Golf, Hotel, India, Juliet, "
-    "Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, Uniform, Victor, Whiskey, "
-    "X-ray, Yankee, Zulu. A as in Apple, B as in Boy, C as in Cat."
+    "A visitor is spelling a name, one letter at a time. "
+    "Transcribe only the letters or phonetic words that are spoken. Do not add letters."
 )
 
 STT_BEAM_SIZE = int(os.getenv("STT_BEAM_SIZE", "1"))
@@ -149,12 +146,8 @@ def transcribe_pcm(pcm_bytes: bytes, language: "str | None" = "en", mode: str = 
                 cand_clean = candidate.strip().title()
                 cand_letters = " ".join(list(re.sub(r'[^A-Za-z]', '', cand_clean).upper()))
                 prompt = (
-                    f"Spelling visitor name: {cand_clean}. Spelled letters: {cand_letters}. "
-                    f"Letters: A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z. "
-                    f"Spelled letters: A B C D E F G H I J K L M N O P Q R S T U V W X Y Z. "
-                    f"NATO: Alpha, Bravo, Charlie, Delta, Echo, Foxtrot, Golf, Hotel, India, Juliet, "
-                    f"Kilo, Lima, Mike, November, Oscar, Papa, Quebec, Romeo, Sierra, Tango, Uniform, Victor, "
-                    f"Whiskey, X-ray, Yankee, Zulu."
+                    f"The visitor is spelling the name {cand_clean} as {cand_letters}. "
+                    "Transcribe only what is spoken; do not complete or add letters."
                 )
             else:
                 prompt = SPELLING_PROMPT
