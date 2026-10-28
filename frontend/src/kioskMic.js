@@ -9,7 +9,7 @@
  * Why this is faster + more accurate than before:
  *  - neural VAD end-of-speech (~300 ms) vs 1200 ms fixed silence timer
  *  - raw PCM straight to Whisper — no WebM encode, no ffmpeg decode
- *  - positiveSpeechThreshold 0.8 rejects distant crowd chatter
+ *  - a sustained positiveSpeechThreshold rejects brief echo/noise triggers
  *
  * Assets: run `npm run copy-vad` once (auto-runs before npm start) so the
  * VAD worklet/onnx/wasm files are served from public/ — this is the fix
@@ -50,10 +50,10 @@ export async function createKioskMic({ onSpeechStart, onSpeechEnd, onMisfire, on
     baseAssetPath: '/',         // served from public/ (see scripts/copyVadAssets.js)
     onnxWASMBasePath: '/',
 
-    // Conversational VAD tuning — natural voice pickup with quick ~600ms end-of-speech
-    positiveSpeechThreshold: 0.50,   // natural voice pickup threshold
-    negativeSpeechThreshold: 0.35,
-    minSpeechFrames: 2,         // ~64 ms to confirm speech onset
+    // Require a sustained voice onset to reduce TTS echo/noise false barge-ins.
+    positiveSpeechThreshold: 0.62,
+    negativeSpeechThreshold: 0.40,
+    minSpeechFrames: 3,         // ~96 ms to confirm speech onset
     redemptionFrames: 8,        // ~800 ms pause = end of utterance
 
     onSpeechStart,
