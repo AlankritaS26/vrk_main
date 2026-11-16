@@ -69,9 +69,38 @@ function buildTtsSentenceChunks(text) {
   return sentences;
 }
 
+function isEmotionalResponse(text) {
+  if (!text) return false;
+  const t = text.trim().toLowerCase().replace(/[.,!?;:"'()]/g, ' ');
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length === 0 || words.length > 7) return false;
+
+  // Interrogative / action openers indicate a question or request, not an emotional state
+  const questionStarters = ['who', 'what', 'where', 'when', 'why', 'how', 'which', 'can', 'could', 'would', 'did', 'do', 'does', 'is', 'are', 'tell', 'show', 'find', 'explain', 'give'];
+  if (questionStarters.includes(words[0])) return false;
+
+  const emotionWords = new Set([
+    'happy', 'depressed', 'sad', 'stressed', 'stress', 'anxious', 'worried',
+    'nervous', 'overwhelmed', 'exhausted', 'tired', 'hectic', 'rough', 'low',
+    'unhappy', 'terrible', 'awful', 'frustrated', 'annoyed', 'irritated',
+    'angry', 'upset', 'excited', 'pumped', 'thrilled', 'wonderful', 'fantastic',
+    'amazing', 'good', 'fine', 'well', 'great', 'okay', 'ok', 'alright', 'bad',
+    'down', 'cheerful', 'pleased'
+  ]);
+
+  if (words.some(w => emotionWords.has(w))) return true;
+
+  const phrase = words.join(' ');
+  const emotionPhrases = [
+    'not good', 'not great', 'not okay', 'not well', 'not fine', 'not bad',
+    'pretty good', 'pretty bad', 'so so', 'doing well', 'doing good',
+    'doing fine', 'doing great', 'doing okay', 'all good', 'same old'
+  ];
+  return emotionPhrases.some(p => phrase.includes(p));
+}
+
 export default function WelcomeScreen({ session, messages, setMessages, askingName, detState, doubleBlink, blink }) {
   const scrollRef = useRef(null);
-  const escalationScrollRef = useRef(null);
   const camVideoRef = useRef(null);
   const camStreamRef = useRef(null);
   const isMounted = useRef(true);
@@ -85,6 +114,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // cycle). Comparing session_id for "staleness" was dropping perfectly
   // valid answers whenever the backend ended/resumed the session mid-request.
   const interruptSpeakingRef = useRef(null);   // lets the WS handler stop TTS
+  const activeSpeakDoneRef = useRef(null);
   const farewellPlayingRef = useRef(false);    // true while the goodbye line plays
   const greetingPlayingRef = useRef(false);    // true while the NEW-VISITOR greeting plays
   // (explicitly non-interruptible, per spec — it
@@ -146,6 +176,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   }, []);
   const [liveText, setLiveText] = useState('');
   const [processingHint, setProcessingHint] = useState('');   // transient "let me check that" indicator
+  const [captionsEnabled, setCaptionsEnabled] = useState(true);
+  const [captionText, setCaptionText] = useState('');
+  const captionsEnabledRef = useRef(true);
+  useEffect(() => { captionsEnabledRef.current = captionsEnabled; }, [captionsEnabled]);
   const [listening, setListening] = useState(false);
   const [status, setStatus] = useState('ready');
 
@@ -170,15 +204,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const isReturning = session?.is_returning || false;
   const visitCount = session?.visit_count || 1;
 
-  // ── QR Companion & Escalation States ──
+  // ── QR Companion ──
   const [companionToken, setCompanionToken] = useState(null);
   const [companionUrl, setCompanionUrl] = useState('');
   const [showCompanionModal, setShowCompanionModal] = useState(false);
-  const [escalationState, setEscalationState] = useState(null); // null | 'pending' | 'connected' | 'timeout'
-  const [escalationMsg, setEscalationMsg] = useState('');
-  const [escalationMessages, setEscalationMessages] = useState([]);
-  const escalationStateRef = useRef(null);
-  useEffect(() => { escalationStateRef.current = escalationState; }, [escalationState]);
 
   useEffect(() => {
     if (!session?.session_id) {
@@ -197,31 +226,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       .catch(() => {});
   }, [session?.session_id]);
 
-  const handleRequestEscalation = async () => {
-    try {
-      setEscalationState('pending');
-      setEscalationMessages([]);
-      setEscalationMsg('Connecting you to front desk staff…');
-      await fetch(BACKEND + '/escalation/request', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ reason: 'user_request' }),
-      });
-    } catch (err) {
-      console.error('[ESCALATION] Request failed:', err);
-    }
-  };
-
-  const handleCancelEscalation = async () => {
-    setEscalationState(null);
-    const sid = sessionRef.current?.session_id;
-    if (sid) {
-      try {
-        await fetch(`${BACKEND}/escalation/cancel/${sid}`, { method: 'POST' });
-      } catch (e) { /* silent */ }
-    }
-  };
-
   // The backend composes the greeting (it knows resume-vs-new and the
   // institute intro line); these local strings are only a fallback.
   const greeting = session?.greeting || (isReturning
@@ -235,20 +239,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   useEffect(() => { statusRef.current = status; }, [status]);
   const sessionRef = useRef(null);
   useEffect(() => { sessionRef.current = session; }, [session]);
-
-  useEffect(() => {
-    if (scrollRef.current)
-      scrollRef.current.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' });
-  }, [messages, liveText, processingHint]);
-
-  useEffect(() => {
-    const panel = escalationScrollRef.current;
-    if (!panel) return undefined;
-    const frame = requestAnimationFrame(() => {
-      panel.scrollTo({ top: panel.scrollHeight, behavior: 'smooth' });
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [escalationMessages]);
 
   useEffect(() => {
     isMounted.current = true;
@@ -277,50 +267,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   const addMessage = useCallback((text, speaker) => {
     if (!text || text === '__BLINK__' || /👁|\[Blinked/i.test(text)) return;
     text = cleanText(text);
+    if (speaker === 'kiosk') setCaptionText(text);
     setMessages(prev => [...prev, {
       text, speaker,
       timestamp: new Date().toLocaleTimeString()
     }]);
   }, [setMessages]);
 
-  const playEscalationAudio = useCallback(async (payload) => {
-    if (!payload?.audio) return;
-    try {
-      interruptSpeakingRef.current?.();
-      if (!playCtxRef.current) {
-        playCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
-      }
-      const ctx = playCtxRef.current;
-      if (ctx.state === 'suspended') await ctx.resume();
-      const binary = atob(payload.audio);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-      let buffer;
-      if (payload.mime_type?.startsWith('audio/pcm')) {
-        const samples = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
-        buffer = ctx.createBuffer(1, samples.length, 16000);
-        const channel = buffer.getChannelData(0);
-        for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
-      } else {
-        buffer = await ctx.decodeAudioData(bytes.buffer);
-      }
-      const source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      const startAt = Math.max(ctx.currentTime, playCursorRef.current);
-      source.start(startAt);
-      playCursorRef.current = startAt + buffer.duration;
-      activeNodesRef.current.push(source);
-      source.onended = () => {
-        activeNodesRef.current = activeNodesRef.current.filter(node => node !== source);
-      };
-    } catch (error) {
-      console.warn('[ESC] Audio playback failed:', error);
-      if (payload.speaker === 'staff' && payload.text) {
-        speakStreamRef.current?.(payload.text);
-      }
-    }
-  }, []);
 
   // Creates a new chat bubble for `speaker` and returns a function that
   // appends sentence-by-sentence text into it — keeps the on-screen text
@@ -341,6 +294,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           ? { ...m, text: m.text ? m.text + ' ' + cleaned : cleaned }
           : m
       ));
+      if (speaker === 'kiosk') setCaptionText(prev => prev ? `${prev} ${cleaned}` : cleaned);
     };
   }, [setMessages]);
 
@@ -446,6 +400,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       // If a specific conversation prompt (e.g. name prompt, Yes/No confirm) is waiting for speech:
       if (activePromptResolverRef.current) {
+        if (result.low_confidence && ['name', 'spelling'].includes(currentMode)) {
+          console.info(`[STT] Ignoring low-confidence ${currentMode} transcript`);
+          statusRef.current = 'ready';
+          setStatus('ready');
+          return;
+        }
         if (heard && heard.length > 0) {
           const resolver = activePromptResolverRef.current;
           activePromptResolverRef.current = null;
@@ -473,36 +433,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         lastProcessedTextRef.current = { text: heard, time: now };
         wasInterruptedRef.current = false;   // visitor spoke something — clear interrupt flag
         if (isMounted.current) setLiveText(heard);
-        if (escalationStateRef.current === 'connected') {
-          const sid = session?.session_id;
-          if (sid) {
-            fetch(BACKEND + '/escalation/visitor-audio/' + sid, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/octet-stream' },
-              body: i16.buffer
-            }).catch(error => console.warn('[ESC] Visitor audio relay failed:', error));
-            fetch(BACKEND + '/escalation/message', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ session_id: sid, text: heard }),
-            }).then(async response => {
-              if (!response.ok) throw new Error(await response.text());
-              const data = await response.json();
-              if (data.message) {
-                setEscalationMessages(prev => prev.some(m =>
-                  m.timestamp === data.message.timestamp && m.text === data.message.text
-                ) ? prev : [...prev, data.message].slice(-50));
-              }
-            }).catch(err => {
-              console.error('[ESCALATION] Spoken message failed:', err);
-              setEscalationMsg('Your message could not be delivered. Please speak again.');
-            });
-          }
-          setLiveText('');
-          setStatus('ready');
-        } else {
-          sendToBackend(heard);
-        }
+        sendToBackend(heard);
       } else {
         // Empty/too-short STT result after a barge-in interruption:
         // offer to resume the answer rather than silently going to 'ready'.
@@ -530,40 +461,25 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
   }, []);
 
-  // Barge-in has two stages, matching the two things the VAD can tell us:
-  //
-  //  1. onSpeechStart fires OPTIMISTICALLY — the instant sound crosses the
-  //     probability threshold, before the VAD knows if it's real speech or
-  //     a cough/click/echo blip. We respond by DUCKING the TTS volume —
-  //     fast, but non-destructive and reversible.
-  //  2. The VAD itself later tells us which it was:
-  //       - onSpeechEnd   -> real speech, confirmed. NOW we hard-stop TTS.
-  //       - onVADMisfire  -> false alarm. We restore TTS volume and carry on.
-  //
-  // This avoids killing the kiosk's sentence over noise/echo while still
-  // reacting within ~80ms when someone genuinely starts talking.
-
   const duckSpeaking = useCallback(() => {
     if (!isSpeaking.current || !ttsGainRef.current || !playCtxRef.current) return;
-    const g = ttsGainRef.current.gain;
+    const gain = ttsGainRef.current.gain;
     const now = playCtxRef.current.currentTime;
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(0.12, now + 0.08);   // quick, gentle duck — not a hard cut
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(0.12, now + 0.08);
   }, []);
 
   const restoreSpeaking = useCallback(() => {
     if (!ttsGainRef.current || !playCtxRef.current) return;
-    const g = ttsGainRef.current.gain;
+    const gain = ttsGainRef.current.gain;
     const now = playCtxRef.current.currentTime;
-    g.cancelScheduledValues(now);
-    g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(1, now + 0.15);      // false alarm — fade back to full volume
+    gain.cancelScheduledValues(now);
+    gain.setValueAtTime(gain.value, now);
+    gain.linearRampToValueAtTime(1, now + 0.15);
   }, []);
 
-  // Hard commit: only called once the VAD has CONFIRMED real speech
-  // (onSpeechEnd), or on session-ending events (e.g. goodbye). Stops all
-  // scheduled/playing TTS audio immediately and hands control back to the mic.
+  // Stops playback after VAD confirms the visitor finished an interruption.
   const interruptSpeaking = useCallback(() => {
     if (!isSpeaking.current) return;
     activeSpeakIdRef.current = null;        // any in-flight speak() loop sees this and stops
@@ -578,6 +494,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       ttsGainRef.current.gain.setValueAtTime(1, now);   // reset for the next speak() call
     }
     isSpeaking.current = false;
+    const onDone = activeSpeakDoneRef.current;
+    activeSpeakDoneRef.current = null;
+    if (onDone) {
+      try { onDone(); } catch (e) { console.error('[TTS] Interrupted playback callback failed:', e); }
+    }
   }, []);
   useEffect(() => { interruptSpeakingRef.current = interruptSpeaking; }, [interruptSpeaking]);
 
@@ -610,10 +531,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         onSpeechStart: () => {
           if (!isMounted.current) return;
           if (isSpeaking.current) {
-            if (greetingPlayingRef.current) return;
-            // Duck volume gently on sound onset — do NOT kill TTS audio immediately.
-            // If it's a misfire (echo/noise spike), onMisfire will restore volume.
-            // If it's real speech, onSpeechEnd below will hard-stop TTS.
+            if (greetingPlayingRef.current || farewellPlayingRef.current) return;
             duckSpeaking();
             return;
           }
@@ -625,6 +543,12 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         },
         onSpeechEnd: (audio) => {
           if (isSpeaking.current) {
+            if (greetingPlayingRef.current || farewellPlayingRef.current) {
+              restoreSpeaking();
+              return;
+            }
+            console.info('[TTS] Visitor speech confirmed; interrupting playback');
+            statusRef.current = 'speaking';
             if (lastAnswerRef.current && !farewellPlayingRef.current && !greetingPlayingRef.current) {
               wasInterruptedRef.current = true;
             }
@@ -636,11 +560,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           if (!isMounted.current) return;
           if (isSpeaking.current) {
             restoreSpeaking();
-          } else {
-            isListening.current = false;
-            setListening(false);
-            setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
+            return;
           }
+          isListening.current = false;
+          setListening(false);
+          setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
         },
 
       });
@@ -650,7 +574,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       console.error('[MIC] Error:', err);
       if (!isSpeaking.current) setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
     }
-  }, [startWaveform, handleUtterance, duckSpeaking, restoreSpeaking]);
+  }, [startWaveform, handleUtterance, interruptSpeaking, duckSpeaking, restoreSpeaking]);
 
   // release mic + VAD on unmount (session end)
   useEffect(() => () => {
@@ -692,6 +616,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const myId = Symbol('speak');
     activeSpeakIdRef.current = myId;
     isSpeaking.current = true;
+    isListening.current = false;
+    setListening(false);
+    const completePlayback = () => {
+      if (onDone) {
+        try { onDone(); } catch (e) { console.error('[TTS] Playback callback failed:', e); }
+        onDone = null;
+      }
+    };
+    activeSpeakDoneRef.current = completePlayback;
 
     let hasStartedAvatar = false;
     let firstAudioPlayStart = 0;
@@ -699,6 +632,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     const fireStart = () => {
       if (hasStartedAvatar) return;
       hasStartedAvatar = true;
+      isListening.current = false;
+      setListening(false);
       window.__novaTtsActive = true;   // tell the avatar animation loop that lipsync is live
       setStatus('speaking');    // avatar flips to "speaking" ONLY when first audio buffer starts
       if (onStart) { onStart(); onStart = null; }
@@ -708,9 +643,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       if (activeSpeakIdRef.current !== myId) return;
       window.__novaTtsActive = false;  // lipsync off — mouth returns to rest
       isSpeaking.current = false;
-      if (isMounted.current) startListening();
+      setCaptionText('');
+      if (isMounted.current && !awaitingAnswerRef.current) startListening();
       setStatus(awaitingAnswerRef.current ? 'processing' : 'ready');
-      if (onDone) { try { onDone(); } catch (e) { } onDone = null; }
+      if (activeSpeakDoneRef.current === completePlayback) {
+        activeSpeakDoneRef.current = null;
+        completePlayback();
+      }
     };
 
     // Web Audio setup
@@ -736,48 +675,23 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ttsGainRef.current.gain.cancelScheduledValues(pctx.currentTime);
     ttsGainRef.current.gain.setValueAtTime(1, pctx.currentTime);
 
-    // Sentence splitting with natural chunking
-    const raw = (text.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [text])
-      .map(s => s.trim()).filter(Boolean);
-
-    const sentences = [];
-    if (raw.length) {
-      let first = raw[0];
-      if (first.length > 55) {
-        const cut = first.indexOf(',');
-        if (cut > 15) {
-          sentences.push(first.slice(0, cut + 1));
-          first = first.slice(cut + 1).trim();
-        }
-      }
-      if (first) sentences.push(first);
-      let buf = '';
-      for (let i = 1; i < raw.length; i++) {
-        buf = buf ? buf + ' ' + raw[i] : raw[i];
-        if (buf.length >= 80) { sentences.push(buf); buf = ''; }
-      }
-      if (buf) sentences.push(buf);
-    }
-
-    if (sentences.length > 1 && sentences[0].length < 20) {
-      sentences[1] = sentences[0] + ' ' + sentences[1];
-      sentences.shift();
-    }
+    const sentences = buildTtsSentenceChunks(text);
 
     console.log('TTS QUEUE:', sentences);
 
     // Fallback: browser speech synthesis
     const browserSpeak = async () => {
-      fireStart();
       for (let i = 0; i < sentences.length; i++) {
         if (activeSpeakIdRef.current !== myId) break;
-        if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
         await new Promise((resolveEnd) => {
           const utter = new SpeechSynthesisUtterance(sentences[i]);
           utter.lang = 'en-US';
           utter.rate = 1.05;
           utter.volume = 1;
-          utter.onstart = () => fireStart();
+          utter.onstart = () => {
+            fireStart();
+            if (onSentence) { try { onSentence(sentences[i], i); } catch (e) { } }
+          };
           utter.onend = () => resolveEnd();
           utter.onerror = () => resolveEnd();
           window.speechSynthesis.speak(utter);
@@ -812,31 +726,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         const buf = await pctx.decodeAudioData(bytes.buffer);
         const tDecoded = performance.now();
         return { buf, tReq, tAudioRecv, tDecoded };
-        if (activeSpeakIdRef.current !== myId) return resolveStarted();  // interrupted while decoding
-        const node = pctx.createBufferSource();
-        node.buffer = buf;
-        node.connect(ttsAnalyserRef.current || ttsGainRef.current);
-        activeNodesRef.current.push(node);
-        node.onended = () => {
-          activeNodesRef.current = activeNodesRef.current.filter((n) => n !== node);
-        };
-
-        const at = Math.max(pctx.currentTime, playCursorRef.current);
-        const delayMs = Math.max(0, (at - pctx.currentTime) * 1000);
-        node.start(at);
-        playCursorRef.current = at + buf.duration;
-
-        // Fire onStart/onSentence exactly when THIS clip's audio begins —
-        // if it's scheduled to start later than "now" (queued behind an
-        // earlier clip that's still playing), wait for that moment instead
-        // of firing immediately, so text and voice stay in lockstep.
-        const announce = () => {
-          fireStart();                                     // status + first-clip-only hook
-          if (onSentence) { try { onSentence(sentenceText, sentenceIndex); } catch (e) { } }
-          resolveStarted();
-        };
-        if (delayMs > 0) setTimeout(announce, delayMs);
-        else announce();
       } catch (e) {
         console.warn('[TTS] Fetch or decode error for sentence:', sentenceText, e);
         return { buf: null, tReq, tAudioRecv: performance.now(), tDecoded: performance.now() };
@@ -874,7 +763,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         if (activeSpeakIdRef.current !== myId) break;
 
         const currentSentence = sentences[i];
-        if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
 
         // Trigger pre-fetch & pre-decode of chunk N+1 WHILE chunk N is prepared/played
         const nextPromise = (i + 1 < sentences.length) ? fetchAndDecodeClip(sentences[i + 1]) : null;
@@ -904,7 +792,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                 const tPlayStart = performance.now();
                 if (i === 0) {
                   firstAudioPlayStart = tPlayStart;
-                  fireStart(); // Avatar flips to speaking EXACTLY when buffer starts playing!
 
                   const tAns = timingBase != null ? timingBase : clipData.tReq;
                   const ttsSynthNet = clipData.tAudioRecv - clipData.tReq;
@@ -918,6 +805,8 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
                   console.log(`[LATENCY-FLOW] AUDIO_PLAY_START: t=${tPlayStart.toFixed(1)}ms (time-to-first-audio: ${timeToFirstAudio.toFixed(0)}ms)`);
                 }
                 node.start(0);
+                fireStart();
+                if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
               });
               playedSuccessfully = true;
             }
@@ -929,12 +818,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // Fallback recovery if backend TTS returned null or decode failed
         if (!playedSuccessfully && activeSpeakIdRef.current === myId) {
           console.log('[TTS] Browser voice fallback for:', currentSentence);
-          fireStart();
           await new Promise((resolveEnd) => {
             const utter = new SpeechSynthesisUtterance(currentSentence);
             utter.lang = 'en-US';
             utter.rate = 1.05;
             utter.volume = 1;
+            utter.onstart = () => {
+              fireStart();
+              if (onSentence) { try { onSentence(currentSentence, i); } catch (e) { } }
+            };
             utter.onend = () => resolveEnd();
             utter.onerror = () => resolveEnd();
             window.speechSynthesis.speak(utter);
@@ -997,10 +889,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
     addMessage(text, 'user');
-
-    if (escalationState && /\b(?:stop|cancel|never mind|nevermind|back|continue|dont connect|no staff)\b/i.test(text)) {
-      setEscalationState(null);
-    }
 
     // ── Check if visitor is affirming a pending name confirmation ──────
     const isAffirmation = /^(?:yes|yeah|yep|yup|sure|ok|okay|correct|right|true|thats right|that is right|thats me|that is me|yes please|i am|it is|confirm|confirmed)[.!?]*$/i.test(text.trim())
@@ -1206,12 +1094,17 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ];
     const isInstantCmd = hasInlineName || bareNameChange ||
       /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+    const isEmotion = isEmotionalResponse(text);
 
-    if (!isInstantCmd && text.split(' ').length >= 3) {
+    if (!isInstantCmd && !isEmotion && text.split(' ').length >= 3) {
       const ack = acks[Math.floor(Math.random() * acks.length)];
       speak(ack, () => setProcessingHint(ack));
     } else {
-      setProcessingHint('Thinking...');
+      if (!isEmotion && !isInstantCmd) {
+        setProcessingHint('Thinking...');
+      } else {
+        setProcessingHint('');
+      }
       statusRef.current = 'processing';
       setStatus('processing');
     }
@@ -1552,12 +1445,28 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         // 1. Check if user spoke a full multi-letter sequence in one utterance (e.g. "A L A N K R I T A", "A, L, A...", "A-L-A...")
         const fullNorm = normalizeSpelledName(heardSpelling);
         if (fullNorm && fullNorm.letters && fullNorm.letters.length >= 2) {
+          const expectedLen = cleanCandidate.replace(/[^a-zA-Z]/g, '').length;
+          if (expectedLen > 0 && fullNorm.letters.length > Math.max(expectedLen + 3, expectedLen * 2)) {
+            retryCount++;
+            const retrySpelling = `I heard too many letters. Please spell ${cleanCandidate} again, one letter at a time.`;
+            addMessage(retrySpelling, 'kiosk');
+            await speakAndWait(retrySpelling);
+            continue;
+          }
           accumulatedLetters = fullNorm.letters;
           console.log('[NAME-STATE] Full utterance spelling captured in one text:', fullNorm);
         } else {
           // If cleanCandidate exists and user's utterance has all letters together (e.g. "ALANKRITA")
           const cleanLetters = heardSpelling.toUpperCase().replace(/[^A-Z]/g, '');
           if (cleanLetters.length >= 2) {
+            const expectedLen = cleanCandidate.replace(/[^a-zA-Z]/g, '').length;
+            if (expectedLen > 0 && cleanLetters.length > Math.max(expectedLen + 3, expectedLen * 2)) {
+              retryCount++;
+              const retrySpelling = `I heard too many letters. Please spell ${cleanCandidate} again, one letter at a time.`;
+              addMessage(retrySpelling, 'kiosk');
+              await speakAndWait(retrySpelling);
+              continue;
+            }
             accumulatedLetters = cleanLetters.split('');
             console.log('[NAME-STATE] Clean letter string captured:', accumulatedLetters);
           } else {
@@ -1646,6 +1555,22 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const sendToBackend = useCallback(async (text) => {
     if (!text) return;
+    const captionCommand = text.trim().toLowerCase().replace(/[.!?]+$/, '');
+    if (/^(?:off|stop|disable|turn off|hide) captions?$/.test(captionCommand)
+        || /^(?:stop|turn off|disable|hide) the captions?$/.test(captionCommand)) {
+      captionsEnabledRef.current = false;
+      setCaptionsEnabled(false);
+      setCaptionText('');
+      setLiveText('');
+      setProcessingHint('');
+      return;
+    }
+    if (/^(?:on|enable|show|turn on) captions?$/.test(captionCommand)
+        || /^(?:turn on|enable|show) the captions?$/.test(captionCommand)) {
+      captionsEnabledRef.current = true;
+      setCaptionsEnabled(true);
+      return;
+    }
     setLiveText('');
     setProcessingHint('');
     const sid = session?.session_id || 'guest';
@@ -1743,10 +1668,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     ];
     const isInstantCmd = hasInlineName || bareNameChange ||
       /^(hi|hello|hey|good morning|good afternoon|good evening|bye|thank you|thanks)/i.test(text.trim());
+    const isEmotion = isEmotionalResponse(text);
 
     let ackTimer = null;
 
-    if (!isInstantCmd && text.split(' ').length >= 3 && !lastQuestionHadAckRef.current) {
+    if (!isInstantCmd && !isEmotion && text.split(' ').length >= 3 && !lastQuestionHadAckRef.current) {
       ackTimer = setTimeout(() => {
         if (!awaitingAnswerRef.current) return;
         const ack = acks[Math.floor(Math.random() * acks.length)];
@@ -1758,7 +1684,11 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       }, 750);
     } else {
       lastQuestionHadAckRef.current = false;
-      setProcessingHint('Thinking...');
+      if (!isEmotion && !isInstantCmd) {
+        setProcessingHint('Thinking...');
+      } else {
+        setProcessingHint('');
+      }
       statusRef.current = 'processing';
       setStatus('processing');
     }
@@ -1789,6 +1719,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         isSpeaking.current = false;
         setProcessingHint('');
         setStatus('ready');
+        startListening();
         return;
       }
 
@@ -1803,15 +1734,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
       const answer = data.answer || 'Sorry, I do not have that information. Please visit the Admin Block.';
 
-      const firstChunkText = (ans) => {
-        const raw = (ans.match(/[^.!?]+[.!?]+["']?\s*|[^.!?]+$/g) || [ans]).map(s => s.trim()).filter(Boolean);
-        let first = raw.length ? raw[0] : ans;
-        if (first.length > 55) {
-          const cut = first.indexOf(',');
-          if (cut > 15) first = first.slice(0, cut + 1);
-        }
-        return first;
-      };
+      const firstChunkText = (ans) => buildTtsSentenceChunks(ans)[0] || ans;
 
       lastAnswerRef.current = answer;
       wasInterruptedRef.current = false;
@@ -1823,10 +1746,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       });
 
       setProcessingHint('');
-      awaitingAnswerRef.current = false;
-
-      // Render FULL answer text into the response box
-      addMessage(answer, 'kiosk');
+      let appendSentence = null;
 
       // Start prefetching chunk 0 immediately — zero artificial wait!
       const tTtsReqStart = performance.now();
@@ -1841,7 +1761,15 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
         return d.audio || null;
       }).catch(() => null);
 
-      await speakStream(answer, { initialClipPromise: firstClipPromise, timingBase: tAnswerReceived });
+      await speakStream(answer, {
+        initialClipPromise: firstClipPromise,
+        timingBase: tAnswerReceived,
+        onStart: () => {
+          awaitingAnswerRef.current = false;
+          appendSentence = startProgressiveMessage('kiosk');
+        },
+        onSentence: (sentence) => { if (appendSentence) appendSentence(sentence); },
+      });
 
     } catch (e) {
       clearTimeout(askTimeout);
@@ -1855,7 +1783,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       addMessage(fallback, 'kiosk');
       speak(fallback);
     }
-  }, [session, addMessage, speakStream, runSpellingCaptureAndConfirm, extractVisitorName, speakAndWait, captureUtteranceText, speak]);
+  }, [session, addMessage, speakStream, startProgressiveMessage, runSpellingCaptureAndConfirm, extractVisitorName, speakAndWait, captureUtteranceText, speak]);
 
   // ── Integrated Conversation Start Flow (Voice + Double-Blink: Yes / No / Guest / Name) ──
   const greetedRef = useRef(null);
@@ -2091,32 +2019,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           } else if (msg.type === 'companion_qr') {
             if (msg.token) setCompanionToken(msg.token);
             if (msg.url) setCompanionUrl(msg.url);
-          } else if (msg.type === 'escalation_pending' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState('pending');
-            setEscalationMsg(msg.message || 'Connecting you to front desk staff…');
-          } else if (msg.type === 'escalation_connected' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState('connected');
-            setEscalationMsg(msg.message || 'A staff member has connected!');
-          } else if (msg.type === 'escalation_message' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationMessages(prev => [...prev, msg.message].slice(-50));
-            if (msg.message?.speaker === 'staff' && msg.message.text && !msg.message.has_audio) {
-              speakStreamRef.current?.(msg.message.text);
-            }
-          } else if (msg.type === 'escalation_audio' &&
-                     msg.session_id === sessionRef.current?.session_id &&
-                     msg.speaker === 'staff') {
-            playEscalationAudio(msg);
-          } else if (msg.type === 'escalation_timeout' &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState('timeout');
-            setEscalationMsg(msg.message || 'No staff available right now. Nova will continue helping you.');
-            setTimeout(() => setEscalationState(null), 6000);
-          } else if ((msg.type === 'escalation_cancelled' || msg.type === 'escalation_resolved') &&
-                     msg.session_id === sessionRef.current?.session_id) {
-            setEscalationState(null);
           }
         } catch (_) { }
       };
@@ -2124,14 +2026,10 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
     }
     connect();
     return () => { dead = true; ws?.close(); };
-  }, [handleDepartureCheck, playEscalationAudio]);
+  }, [handleDepartureCheck]);
 
   const btnPrimary = { padding: '11px 24px', border: 'none', borderRadius: '8px', background: '#1a237e', color: '#fff', cursor: 'pointer', fontSize: '14px', fontWeight: '600' };
 
-  /* ── 3D NOVA AVATAR ACTIVE (replaces legacy SVG) ── */
-
-
-  const statusLabel = { ready: 'Ready', listening: 'Listening…', processing: 'Thinking…', speaking: 'Speaking…' }[status] || 'Ready';
   const statusColor = { ready: '#1a237e', listening: '#2e7d32', processing: '#6a1b9a', speaking: '#bf360c' }[status] || '#1a237e';
   const statusBg = { ready: '#e8eaf6', listening: '#e8f5e9', processing: '#f3e5f5', speaking: '#fff3e0' }[status] || '#e8eaf6';
 
@@ -2140,6 +2038,30 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
       height: '100vh', overflow: 'hidden', display: 'flex', flexDirection: 'column',
       fontFamily: "'Segoe UI', system-ui, -apple-system, sans-serif", background: '#dbeafe'
     }}>
+
+      {/* ── SLIM HEADER ── */}
+      <header style={{
+        background: 'linear-gradient(90deg,#1a237e,#283593)', padding: '9px 20px',
+        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+        boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <img src="/rnslogo.png" alt="RNSIT"
+            style={{ height: '40px', width: '40px', objectFit: 'contain' }} />
+          <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
+            RNS Institute of Technology
+            <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
+          </div>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+          <div style={{ textAlign: 'right' }}>
+            <div style={{ fontSize: '13px', color: '#fff', fontWeight: '700' }}>{visitorName}</div>
+            <div style={{ fontSize: '11px', color: isReturning ? '#a5d6a7' : 'rgba(255,255,255,0.5)', fontWeight: '600' }}>
+              {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
+            </div>
+          </div>
+        </div>
+      </header>
 
       {/* ── MODALS ── */}
       {privacyOpen && (
@@ -2194,10 +2116,6 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               ))}
             </div>
 
-            <p style={{ fontSize: '11.5px', color: '#aaa', marginTop: '18px', lineHeight: '1.6' }}>
-              Questions about your data? Speak to a staff member at the Admin Block.
-            </p>
-
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '20px' }}>
               <button onClick={() => setPrivacyOpen(false)} style={btnPrimary}>Got it</button>
             </div>
@@ -2207,37 +2125,13 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
 
 
-      {/* ── SLIM HEADER ── */}
-      <header style={{
-        background: 'linear-gradient(90deg,#1a237e,#283593)', padding: '9px 20px',
-        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-        boxShadow: '0 2px 10px rgba(0,0,0,0.22)', flexShrink: 0, zIndex: 10
-      }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-          <img src="/rnslogo.png" alt="RNSIT"
-            style={{ height: '40px', width: '40px', objectFit: 'contain' }} />
-          <div style={{ fontSize: '15px', fontWeight: '700', color: '#fff', letterSpacing: '0.2px' }}>
-            RNS Institute of Technology
-            <span style={{ fontSize: '11px', fontWeight: '400', color: 'rgba(255,255,255,0.5)', marginLeft: '8px' }}>Digital Receptionist</span>
-          </div>
-        </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ textAlign: 'right' }}>
-            <div style={{ fontSize: '13px', color: '#fff', fontWeight: '700' }}>{visitorName}</div>
-            <div style={{ fontSize: '11px', color: isReturning ? '#a5d6a7' : 'rgba(255,255,255,0.5)', fontWeight: '600' }}>
-              {isReturning ? `🌟 Visit #${visitCount}` : 'New Visitor'}
-            </div>
-          </div>
-        </div>
-      </header>
-
       {/* ── MAIN BODY ── */}
-      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden' }}>
+      <div style={{ flex: '1 1 0', display: 'flex', overflow: 'hidden', position: 'relative' }}>
 
         {/* ══════════ LEFT: ANIMATED Nova CHARACTER ══════════ */}
         <div style={{
-          width: '58%', flexShrink: 0, display: 'flex', flexDirection: 'column',
-          alignItems: 'center', justifyContent: 'flex-end', padding: '0 24px 20px',
+          width: '100%', height: '100%', flexShrink: 0, display: 'flex', flexDirection: 'column',
+          alignItems: 'center', justifyContent: 'flex-start', padding: '18px 24px 24px',
           background: {
             ready: '#dbeafe',
             listening: '#dbeafe',
@@ -2299,40 +2193,50 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
 
           {/* ── Nova 3D Character ── */}
           <div style={{ width: '100%', display: 'flex', justifyContent: 'center', position: 'relative', zIndex: 1 }}>
-            <Nova3DAvatar st={status} />
+            <Nova3DAvatar st={status} size={{ width: '100%', height: '550px' }} />
           </div>
 
-          {/* ── Name + status badge ── */}
+          {/* ── Name ── */}
           <div style={{
-            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px',
+            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '4px',
             zIndex: 1, marginTop: '8px'
           }}>
             <div style={{ fontSize: '22px', fontWeight: '800', color: '#ffffff', letterSpacing: '0.3px', textShadow: '0 2px 12px rgba(0,0,0,0.35)' }}>Nova</div>
-            <div style={{ fontSize: '12px', color: 'rgba(219,234,254,0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+            <div style={{ fontSize: '12px', color: 'rgba(12, 110, 171, 0.82)', fontWeight: '600', letterSpacing: '0.5px' }}>RNSIT Digital Receptionist</div>
+          </div>
+
+          {/* ── Bottom-Left Voice Status & Hints UI ── */}
+          <div style={{
+            position: 'absolute', bottom: '24px', left: '24px', zIndex: 20,
+            display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: '8px'
+          }}>
             <div style={{
-              padding: '5px 18px', borderRadius: '20px', background: statusBg,
-              color: statusColor, fontSize: '13px', fontWeight: '700',
-              transition: 'all 0.4s ease', boxShadow: '0 2px 10px rgba(0,0,0,0.10)'
+              padding: '8px 22px', borderRadius: '24px', background: statusBg,
+              color: statusColor, fontSize: '13.5px', fontWeight: '700',
+              transition: 'all 0.4s ease', boxShadow: '0 4px 16px rgba(0,0,0,0.12)',
+              border: '1.5px solid rgba(255,255,255,0.7)', backdropFilter: 'blur(8px)',
+              display: 'inline-flex', alignItems: 'center', gap: '6px'
             }}>
               {{ ready: '● Voice Ready', listening: '🎤 Listening to you…', processing: '💭 Thinking…', speaking: '🔊 Speaking…' }[status]}
             </div>
-          </div>
 
-          {/* hint pill (ready state only) */}
-          {status === 'ready' && messages.length === 0 && (
-            <div style={{
-              marginTop: '14px', padding: '8px 20px', borderRadius: '20px',
-              background: 'rgba(6,18,54,0.52)', backdropFilter: 'blur(8px)',
-              border: '1px solid rgba(125,211,252,0.32)', fontSize: '12px',
-              color: 'rgba(224,242,254,0.88)', fontStyle: 'italic', textAlign: 'center',
-              maxWidth: '280px', zIndex: 1
-            }}>
-              {hints[hintIndex]}
-            </div>
-          )}
+            {/* hint pill (ready state only) */}
+            {status === 'ready' && messages.length === 0 && (
+              <div style={{
+                padding: '6px 14px', borderRadius: '14px',
+                background: 'rgba(6,18,54,0.52)', backdropFilter: 'blur(8px)',
+                border: '1px solid rgba(125,211,252,0.32)', fontSize: '12px',
+                color: 'rgba(224,242,254,0.88)', fontStyle: 'italic', textAlign: 'left',
+                maxWidth: '280px', zIndex: 1
+              }}>
+                {hints[hintIndex]}
+              </div>
+            )}
+          </div>
         </div>
 
-        {/* ══════════ RIGHT: COMPACT CHAT ══════════ */}
+        {false && (<div style={{ display: 'none' }}>
+        {/* Legacy conversation panel is intentionally not shown on the kiosk. */}
         <div style={{
           flex: 1, display: 'flex', flexDirection: 'column', background: 'rgba(219,234,254,0.72)',
           border: '1px solid rgba(255,255,255,0.62)', borderRadius: '28px', margin: '14px',
@@ -2456,185 +2360,31 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
               </div>
             )}
           </div>
+        </div>
+          </div>)}
 
-          {/* voice footer */}
-          <div style={{
-            padding: '10px 14px', background: 'rgba(255,255,255,0.22)', borderTop: '1px solid rgba(255,255,255,0.45)',
-            flexShrink: 0, display: 'flex', alignItems: 'center', gap: '10px'
-          }}>
+          {captionsEnabled && (
             <div style={{
-              width: '36px', height: '36px', borderRadius: '50%', flexShrink: 0,
-              background: { ready: '#f5f5f5', listening: '#e8f5e9', processing: '#ede7f6', speaking: '#fce4ec' }[status],
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              boxShadow: status === 'listening' ? '0 0 0 5px rgba(67,160,71,0.12)' : 'none',
-              transition: 'all 0.3s'
+              position: 'absolute', left: '50%', bottom: '24px', transform: 'translateX(-50%)',
+              width: 'min(760px, 88vw)', zIndex: 5, pointerEvents: 'none',
+              display: 'flex', justifyContent: 'center'
             }}>
-              {status === 'speaking' ? (
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#e53935" strokeWidth="2.2">
-                  <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" />
-                  <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
-                  <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
-                </svg>
-              ) : (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
-                  stroke={status === 'listening' ? '#43a047' : status === 'processing' ? '#7e57c2' : '#aaa'} strokeWidth="2.2">
-                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                  <line x1="12" y1="19" x2="12" y2="23" />
-                  <line x1="8" y1="23" x2="16" y2="23" />
-                </svg>
+              {captionText && (
+                <div style={{
+                  padding: '12px 20px', borderRadius: '12px',
+                  background: 'rgba(0, 0, 0, 0.72)', color: '#fff',
+                  fontSize: 'clamp(16px, 2vw, 24px)', lineHeight: '1.45',
+                  textAlign: 'center', textShadow: '0 1px 2px rgba(0,0,0,0.5)',
+                  boxShadow: '0 4px 16px rgba(0,0,0,0.25)'
+                }}>
+                  {captionText}
+                </div>
               )}
             </div>
-            <canvas ref={canvasRef} width={130} height={32}
-              style={{ borderRadius: '6px', background: 'rgba(67,160,71,0.05)', display: listening ? 'block' : 'none' }} />
-            {!listening && (
-              <span style={{
-                fontSize: '12px', fontWeight: '700',
-                color: { ready: '#aaa', listening: '#43a047', processing: '#7e57c2', speaking: '#e53935' }[status],
-                transition: 'color 0.3s'
-              }}>
-                {statusLabel}
-              </span>
-            )}
-            <span style={{ fontSize: '10px', color: '#ddd', marginLeft: 'auto' }}>RNSIT · Nova AI</span>
-          </div>
+          )}
+
+          <canvas ref={canvasRef} width={130} height={32} style={{ display: 'none' }} />
         </div>
-      </div>
-
-      {/* ── ESCALATION MODAL / OVERLAY ── */}
-      {escalationState && (
-        <div style={{
-          position: 'fixed', inset: 0, zIndex: 100,
-          background: 'rgba(15, 23, 42, 0.75)', backdropFilter: 'blur(8px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '20px',
-        }}>
-          <div style={{
-            background: '#ffffff', borderRadius: '20px', maxWidth: '440px', width: '100%',
-            padding: '32px 28px', textAlign: 'center', boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
-            animation: 'msgIn 0.3s cubic-bezier(0.18,0.89,0.32,1.28) both',
-          }}>
-            {escalationState === 'pending' && (
-              <>
-                <div style={{
-                  width: '64px', height: '64px', margin: '0 auto 18px', borderRadius: '50%',
-                  border: '4px solid #e0e7ff', borderTopColor: '#4338ca',
-                  animation: 'spin 1s linear infinite',
-                }} />
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#1e1b4b', marginBottom: '8px' }}>
-                  Connecting to Front Desk
-                </h2>
-                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
-                  {escalationMsg || 'A front desk reception team member has been alerted to assist you directly at this kiosk.'}
-                </p>
-                <div style={{
-                  background: 'linear-gradient(135deg, #eef2ff, #f0fdf4)',
-                  borderRadius: '14px', padding: '14px 16px', marginBottom: '16px',
-                  border: '1px solid #c7d2fe', textAlign: 'left',
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#4338ca', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
-                    📞 Front Desk &amp; Campus Helpline
-                  </div>
-                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#1e1b4b', marginBottom: '3px' }}>
-                    +91 80286 11880 / 81 / 82
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#3730a3' }}>
-                    Admissions Helpline: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
-                  </div>
-                </div>
-                <div style={{
-                  background: '#f0f9ff', borderRadius: '12px', padding: '12px 16px',
-                  fontSize: '13px', color: '#0369a1', border: '1px solid #bae6fd',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say <strong>"Stop"</strong> anytime to return to Nova
-                </div>
-              </>
-            )}
-
-            {escalationState === 'connected' && (
-              <>
-                <div style={{ fontSize: '56px', marginBottom: '16px' }}>🤝</div>
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#065f46', marginBottom: '8px' }}>
-                  Staff Member Connected!
-                </h2>
-                <p style={{ fontSize: '14px', color: '#334155', lineHeight: '1.6', marginBottom: '20px' }}>
-                  {escalationMsg || 'A front desk team member is now assisting you.'}
-                </p>
-                <div ref={escalationScrollRef} style={{
-                  maxHeight: '180px', overflowY: 'auto', textAlign: 'left',
-                  background: '#f8fafc', border: '1px solid #e2e8f0',
-                  borderRadius: '14px', padding: '10px', marginBottom: '12px'
-                }}>
-                  {escalationMessages.length === 0 && (
-                    <div style={{ fontSize: '12px', color: '#94a3b8', textAlign: 'center', padding: '12px' }}>
-                      Speak normally. Your voice is sent to the connected staff member.
-                    </div>
-                  )}
-                  {escalationMessages.map((message, index) => (
-                    <div key={`${message.timestamp}-${index}`} style={{
-                      display: 'flex', justifyContent: message.speaker === 'visitor' ? 'flex-end' : 'flex-start',
-                      marginBottom: '6px'
-                    }}>
-                      <div style={{
-                        maxWidth: '82%', padding: '8px 10px', borderRadius: '10px',
-                        background: message.speaker === 'visitor' ? '#dbeafe' : '#dcfce7',
-                        color: '#334155', fontSize: '12px', lineHeight: '1.4'
-                      }}>
-                        <strong style={{ display: 'block', fontSize: '10px', color: '#64748b', marginBottom: '2px' }}>
-                          {message.speaker === 'visitor' ? 'You' : 'Staff'}
-                        </strong>
-                        {message.text}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                <div style={{
-                  background: '#f0fdf4', borderRadius: '12px', padding: '12px 16px',
-                  fontSize: '13px', color: '#15803d', border: '1px solid #bbf7d0',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say <strong>&ldquo;Stop&rdquo;</strong> to return to Nova
-                </div>
-              </>
-            )}
-
-            {escalationState === 'timeout' && (
-              <>
-                <div style={{ fontSize: '56px', marginBottom: '16px' }}>⏳</div>
-                <h2 style={{ fontSize: '20px', fontWeight: '800', color: '#92400e', marginBottom: '8px' }}>
-                  Staff Currently Occupied
-                </h2>
-                <p style={{ fontSize: '14px', color: '#475569', lineHeight: '1.6', marginBottom: '16px' }}>
-                  {escalationMsg || 'Front desk staff members are currently assisting other visitors. Nova will gladly continue answering your questions!'}
-                </p>
-                <div style={{
-                  background: 'linear-gradient(135deg, #fef3c7, #fffbeb)',
-                  borderRadius: '14px', padding: '14px 16px', marginBottom: '18px',
-                  border: '1px solid #fde68a', textAlign: 'left',
-                }}>
-                  <div style={{ fontSize: '11px', fontWeight: '700', color: '#92400e', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '4px' }}>
-                    📞 Direct Contact Numbers
-                  </div>
-                  <div style={{ fontSize: '15px', fontWeight: '800', color: '#78350f', marginBottom: '3px' }}>
-                    +91 80286 11880 / 81 / 82
-                  </div>
-                  <div style={{ fontSize: '12px', color: '#92400e' }}>
-                    Admissions Desk: <strong>+91 81472 86667</strong> · Admin Block Ground Floor
-                  </div>
-                </div>
-                <div style={{
-                  background: '#fffbeb', borderRadius: '12px', padding: '10px 16px',
-                  fontSize: '13px', color: '#92400e', border: '1px solid #fde68a',
-                  fontWeight: '600',
-                }}>
-                  🎤 Say anything to continue with Nova
-                </div>
-              </>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* ── QR COMPANION MODAL ── */}
       {showCompanionModal && (
         <div style={{
@@ -2755,85 +2505,7 @@ export default function WelcomeScreen({ session, messages, setMessages, askingNa
           100% { opacity:0; transform: translateY(-60px) scale(1.15) rotate(25deg); }
         }
 
-        /* ══════════════════════════════
-             Nova CHARACTER ANIMATIONS
-        ══════════════════════════════ */
-
-        /* BODY — gentle breathing (always on) */
-        .nova-svg .body-grp { animation: charBreathe 5s ease-in-out infinite; }
-        @keyframes charBreathe { 0%,100%{transform:scaleY(1)} 50%{transform:scaleY(1.016)} }
-
-        /* HEAD — base: idle micro-float */
-        .nova-svg .head-grp { animation: idleFloat 6s ease-in-out infinite; }
-        @keyframes idleFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-5px)} }
-
-        /* ── LISTENING ── */
-        .nova-listening .head-grp { animation: listenLean 0.7s ease-out forwards, idleFloat 0s; }
-        @keyframes listenLean { to{transform:translateX(10px) rotate(6deg)} }
-
-        /* pulse ring */
-        .listen-r1 { animation:lRing 2s ease-out infinite; }
-        .listen-r2 { animation:lRing 2s 0.7s ease-out infinite; }
-        @keyframes lRing { 0%{r:92;opacity:0.55} 100%{r:140;opacity:0} }
-
-        /* ── PROCESSING ── */
-        .nova-processing .head-grp { animation: thinkTilt 0.6s ease-out forwards, idleFloat 0s; }
-        @keyframes thinkTilt { to{transform:translateX(-12px) rotate(-7deg)} }
-
-        /* thinking arm rise */
-        .nova-processing .arm-think { animation: armRise 0.6s ease-out both; transform-origin:265px 228px; }
-        @keyframes armRise { from{transform:translateY(30px);opacity:0} to{transform:none;opacity:1} }
-
-        /* thinking bubble float */
-        .tbub { animation:tBubFloat 1.6s ease-in-out infinite; }
-        @keyframes tBubFloat { 0%,100%{transform:translateY(0)} 50%{transform:translateY(-6px)} }
-
-        /* furrowed brow when thinking */
-        .brow-think { animation: browFurrow 0.5s ease-out forwards; transform-origin:133px 86px; }
-        @keyframes browFurrow { to{transform:translateY(4px)} }
-
-        /* ── SPEAKING ── */
-        .nova-speaking .head-grp { animation: headBob 0.55s ease-in-out infinite; }
-        @keyframes headBob { 0%,100%{transform:translateY(0) rotate(0)} 30%{transform:translateY(-5px) rotate(1.5deg)} 70%{transform:translateY(2px) rotate(-1deg)} }
-
-        /* mouth alternates: a visible ↔ b visible */
-        .nova-speaking .mouth-a { animation: mA 0.38s ease-in-out infinite; }
-        .nova-speaking .mouth-b { animation: mB 0.38s ease-in-out infinite; }
-        @keyframes mA { 0%,49%{opacity:1} 50%,100%{opacity:0} }
-        @keyframes mB { 0%,49%{opacity:0} 50%,100%{opacity:1} }
-
-        /* sound waves stagger */
-        .wave1 { animation: wv 1s 0.0s ease-in-out infinite; }
-        .wave2 { animation: wv 1s 0.2s ease-in-out infinite; }
-        .wave3 { animation: wv 1s 0.4s ease-in-out infinite; }
-        @keyframes wv { 0%,100%{opacity:0.2;stroke-width:2} 50%{opacity:0.9;stroke-width:3} }
       `}</style>
     </div>
   );
 }
-
-
-// ── Nova's avatar: used in message rows and header ───────────────────────
-const NovaAvatar = ({ size = 38, speaking = false }) => (
-  <div style={{ position: 'relative', flexShrink: 0 }}>
-    {speaking && (
-      <>
-        <div className="avatar-ring r1" style={{ width: size + 14, height: size + 14, top: -7, left: -7 }} />
-        <div className="avatar-ring r2" style={{ width: size + 22, height: size + 22, top: -11, left: -11 }} />
-      </>
-    )}
-    <div style={{
-      width: size, height: size, borderRadius: '50%',
-      background: 'linear-gradient(135deg, #1a237e 0%, #5c35c9 60%, #7c4dff 100%)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      boxShadow: speaking ? '0 0 0 3px #7c4dff55' : '0 2px 8px rgba(26,35,126,0.30)',
-      flexShrink: 0, overflow: 'hidden', position: 'relative',
-    }}>
-      {/* stylised person silhouette */}
-      <svg width={size * 0.62} height={size * 0.62} viewBox="0 0 40 40" fill="none">
-        <circle cx="20" cy="14" r="7" fill="rgba(255,255,255,0.92)" />
-        <path d="M4 38 C4 28 36 28 36 38" fill="rgba(255,255,255,0.92)" />
-      </svg>
-    </div>
-  </div>
-);

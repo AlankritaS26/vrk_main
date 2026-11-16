@@ -570,6 +570,8 @@ def is_emotional_reengagement_response(text: str) -> bool:
     _SHORT_EMOTIONAL = {
         "good", "fine", "well", "great", "okay", "ok", "alright",
         "bad", "tired", "stressed", "happy", "sad", "exhausted",
+        "depressed", "unhappy", "terrible", "awful", "down", "low", "rough",
+        "worried", "anxious", "hectic",
         "not good", "not bad", "not great", "not okay",
         "pretty good", "so so", "quite good", "doing well",
     }
@@ -769,7 +771,7 @@ _SYSTEM_PROMPT_TMPL = (
     "Use the verified campus facts below to answer the visitor's question:\n\n"
     "Facts:\n{context}\n\n"
     "CRITICAL CONSTRAINTS:\n"
-    "1. Never start with a greeting or self-introduction — answer directly.\n"
+    "1. Never start with a greeting, self-introduction, or conversational filler (never say 'Let me think', 'Sure, I will find', 'Let me look that up', 'Sure', etc.) — answer directly.\n"
     "2. Keep the answer concise (2-3 sentences maximum).\n"
     "3. Ground your response in the facts provided above. Synthesize the facts naturally to address the question.\n"
     "4. For broad, subjective, or comparison questions (e.g. 'Which department is good?', 'Which branch should I choose?', 'Which department is better for software?'): "
@@ -2021,6 +2023,8 @@ async def handle_query_stream(question: str, history: list | None = None,
                 for s in ready:
                     if not first_sentence_sent:
                         s = _clean_repetitive_greeting(s)
+                        if not s:
+                            continue
                         first_sentence_sent = True
                     if s:
                         parts.append(s)
@@ -2122,6 +2126,8 @@ async def handle_query_stream(question: str, history: list | None = None,
                 for s in ready:
                     if not first_sentence_sent:
                         s = _clean_repetitive_greeting(s)
+                        if not s:
+                            continue
                         first_sentence_sent = True
                     if s:
                         parts.append(s)
@@ -2195,6 +2201,8 @@ async def handle_query_stream(question: str, history: list | None = None,
                 for s in ready:
                     if not first_sentence_sent:
                         s = _clean_repetitive_greeting(s)
+                        if not s:
+                            continue
                         first_sentence_sent = True
                     if s:
                         parts.append(s)
@@ -2315,6 +2323,8 @@ async def handle_query_stream(question: str, history: list | None = None,
                 for s in ready:
                     if not first_sentence_sent:
                         s = _clean_repetitive_greeting(s)
+                        if not s:
+                            continue
                         first_sentence_sent = True
                     if s:
                         parts.append(s)
@@ -2507,6 +2517,8 @@ async def handle_query_stream(question: str, history: list | None = None,
             for s in ready:
                 if not first_sentence_sent:
                     s = _clean_repetitive_greeting(s)
+                    if not s:
+                        continue
                     first_sentence_sent = True
                 if s:
                     parts.append(s)

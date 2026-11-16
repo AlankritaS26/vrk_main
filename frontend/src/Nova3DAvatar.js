@@ -122,8 +122,8 @@ export default function Nova3DAvatar({ st = 'idle', size = { width: '100%', heig
 
       // Tight half-body framing ends around the upper waist.
       camera = new THREE.PerspectiveCamera(23, W / H, 0.1, 20);
-      camera.position.set(0, 1.45, 2.00);
-      camera.lookAt(0, 1.45, 0);
+      camera.position.set(0, 1.45, 1.78);
+      camera.lookAt(0, 1.41, 0);
 
       try {
         renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: 'default' });

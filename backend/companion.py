@@ -455,7 +455,6 @@ async def _summarize_interactions(interactions: list[dict], user_name: str = "Gu
     # Build clean transcript, filtering out internal name changes and noise
     lines = []
     questions = []
-    has_staff_request = False
 
     for ia in interactions[-12:]:
         q = (ia.get("input_text") or "").strip()
@@ -465,16 +464,12 @@ async def _summarize_interactions(interactions: list[dict], user_name: str = "Gu
         # Skip name change operations from polluting the session recap
         if "changed your name to" in a or re.search(r"\b(?:change|update|set|rename)\s+(?:my\s+)?name\b", q, re.I):
             continue
-        if re.search(r"\b(?:staff|human|person|reception|front\s*desk|supervisor)\b", q, re.I):
-            has_staff_request = True
         questions.append(q)
         lines.append(f"Visitor: {q}")
         if a:
             lines.append(f"Nova: {a}")
 
     if not lines:
-        if has_staff_request:
-            return f"{user_name}, during your visit to RNSIT, you requested to connect with our front desk staff. Our reception team at the Admin Block is available to assist you."
         return f"{user_name}, you had an interaction with Nova at the RNSIT reception kiosk."
 
     transcript_text = "\n".join(lines)
@@ -482,7 +477,6 @@ async def _summarize_interactions(interactions: list[dict], user_name: str = "Gu
     try:
         from backend.llm import chat_completion_with_fallback
         name_clause = f" for {user_name}" if user_name and user_name != "Visitor" else ""
-        staff_note = "Explicitly note that the visitor requested to connect with front desk staff for direct assistance. " if has_staff_request else ""
         messages = [
             {
                 "role": "system",
@@ -492,7 +486,6 @@ async def _summarize_interactions(interactions: list[dict], user_name: str = "Gu
                     "Write an accurate, friendly, and concise 2 to 3 sentence recap of what the visitor asked about "
                     "and the key campus information Nova provided (e.g. courses, admissions, facilities, hostel). "
                     f"Address the visitor directly using their name (e.g., '{user_name}, during your visit to RNSIT, you asked about...'). "
-                    f"{staff_note}"
                     "Stick strictly to the facts mentioned in the transcript below. "
                     "Do NOT invent details, do NOT include greetings or farewells, and do NOT repeat back the transcript verbatim."
                 ),
@@ -514,8 +507,7 @@ async def _summarize_interactions(interactions: list[dict], user_name: str = "Gu
     # Fallback to accurate bullet list of questions asked
     if questions:
         bullets = "\n".join(f"• {q}" for q in questions[-5:])
-        staff_msg = "\n• Requested human staff connection at the front desk." if has_staff_request else ""
-        return f"During your visit to the RNSIT kiosk, you inquired about:\n{bullets}{staff_msg}\n\nFeel free to explore the official brochures below or contact the campus admissions desk."
+        return f"During your visit to the RNSIT kiosk, you inquired about:\n{bullets}\n\nFeel free to explore the official brochures below or contact the campus admissions desk."
 
     return f"You had a session at the RNSIT kiosk."
 

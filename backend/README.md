@@ -88,7 +88,7 @@ venv\Scripts\python.exe -m backend.detection
 
 ### 2. Speech & Voice Pipeline
 - `POST /stt/pcm` — Accepts raw 16 kHz 16-bit mono PCM audio from frontend VAD and returns transcribed text.
-- `POST /tts` — Accepts text JSON `{"text": "..."}` and returns base64-encoded WAV audio (cached in-memory for instant playback).
+- `POST /tts` — Accepts text JSON `{"text": "..."}` and returns base64-encoded WAV audio (cached in-memory for instant playback). Speech speed defaults to `1.12` and can be overridden with `TTS_SPEED`.
 - `GET /ask` — Primary question-answering route: validates query safety, performs RAG retrieval, runs Qwen/Gemini response generation, and attaches personality/context.
 - `GET /ask/stream` — Server-Sent Events (SSE) stream for real-time word-by-word LLM token generation.
 - `POST /api/chat` — Direct diagnostic route to test RAG retrieval + answer generation.
