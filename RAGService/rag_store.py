@@ -47,6 +47,46 @@ class RAGCollection:
         self._coll.add(embeddings=embeddings, documents=list(nt), metadatas=list(nm), ids=list(ni))
         return len(ni)
 
+    def sync_source(self, source: str, chunks: List[dict]) -> dict:
+        """
+        Make the set of chunks tagged `source` EXACTLY equal to `chunks`:
+          - chunks that are new/changed are embedded and added FIRST,
+          - chunks of this source that are no longer wanted (deleted or edited
+            information) are removed AFTER,
+          - unchanged chunks are neither re-embedded nor touched.
+        There is never a moment with no data, and nothing outdated survives.
+        IDs hash the FULL text (+source), so an edit anywhere in a chunk
+        produces a new id (the old 128-char-prefix id could miss tail edits).
+        """
+        want: dict[str, tuple[str, dict]] = {}
+        for c in chunks:
+            text = (c.get("text") or "").strip()
+            if not text:
+                continue
+            meta = {**(c.get("metadata") or {}), "source": source}
+            cid = hashlib.sha256(f"{source}::{text}".encode()).hexdigest()
+            want[cid] = (text, meta)
+
+        have = set(self._coll.get(where={"source": source})["ids"])
+        new_ids = [i for i in want if i not in have]
+        stale   = list(have - set(want))
+
+        if new_ids:
+            vecs = self._provider.embed_documents([want[i][0] for i in new_ids])
+            self._coll.add(
+                embeddings=vecs,
+                documents=[want[i][0] for i in new_ids],
+                metadatas=[want[i][1] for i in new_ids],
+                ids=new_ids,
+            )
+        if stale:
+            self._coll.delete(ids=stale)
+        return {"added": len(new_ids), "deleted": len(stale), "unchanged": len(want) - len(new_ids)}
+
+    def list_files_by_source(self, source: str) -> List[str]:
+        metas = self._coll.get(where={"source": source}, include=["metadatas"])["metadatas"]
+        return sorted({m.get("filename") for m in metas if m.get("filename")})
+
     def upsert_text(self, text: str, metadata: dict | None = None) -> int:
         """Index a raw text string directly."""
         from file_parser import _chunk

@@ -16,6 +16,7 @@ import re
 from typing import NamedTuple
 
 from backend.query_correction import normalize_query
+from backend.faq_guard import filter_entity_answer, fresh_faqs
 
 logger = logging.getLogger("RNSIT_Kiosk.EntityMapping")
 
@@ -47,17 +48,60 @@ def get_kb_data() -> dict:
 # ── Canonical Entities & Verified Answers ─────────────────────────────────
 # Extracted directly from college_info.json to ensure 100% fidelity.
 
-def _build_verified_answers() -> dict[str, dict]:
-    kb = _KB_DATA
+# ── "Strict" mode: used ONLY to detect which hand-written answers depend on
+# JSON data that has since been deleted. The hand-written answers carry the
+# OLD value as a fallback default (e.g. admin.get('phone', '+91 94489 ...')),
+# so deleting a field would silently keep serving the old value. In strict
+# mode every .get() ignores its default and returns a marker instead.
+_MISSING_TAG = "\u2063\u2063MISSING\u2063\u2063"
+
+
+class _Missing:
+    def get(self, *a, **k): return self
+    def __getitem__(self, k): return self
+    def __iter__(self): return iter([_MISSING_TAG])
+    def __bool__(self): return False
+    def __len__(self): return 0
+    def __contains__(self, k): return False
+    def keys(self): return []
+    def values(self): return []
+    def items(self): return []
+    def __str__(self): return _MISSING_TAG
+    __repr__ = __str__
+    def __format__(self, spec): return _MISSING_TAG
+
+
+_MISSING = _Missing()
+
+
+class _Strict(dict):
+    def get(self, key, default=None):
+        return dict.get(self, key, _MISSING)
+
+
+def _strictify(obj):
+    if isinstance(obj, dict):
+        return _Strict({k: _strictify(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return [_strictify(v) for v in obj]
+    return obj
+
+
+def _build_verified_answers(kb: dict | None = None, strict: bool = False) -> dict[str, dict]:
+    kb = _KB_DATA if kb is None else kb
+    if strict:
+        kb = _strictify(kb)
     college = kb.get("college", {})
     admin = kb.get("administration", {})
     depts = kb.get("departments", {})
     facs = kb.get("facilities", {})
     placements = kb.get("placements", {})
     admissions = kb.get("admissions", {})
-    faqs = kb.get("faqs", {})
+    faqs = fresh_faqs(kb)
 
     faq_map = {f["question"].strip().lower(): f["answer"].strip() for f in faqs if "question" in f and "answer" in f}
+    if strict:
+        faq_map = _Strict(faq_map)
 
     cse = depts.get("cse", {})
     aiml = depts.get("aiml", {})
@@ -82,41 +126,30 @@ def _build_verified_answers() -> dict[str, dict]:
         "PRINCIPAL": {
             "name": "Principal",
             "type": "administration",
-            "answer": faq_map.get(
-                "who is the principal of rnsit?",
-                f"Dr. Ramesh Babu H S is the current Principal of RNSIT. Contact: {admin.get('principal', {}).get('phone', '+91 94489 53800')}."
-            ),
+            "answer": f"{admin.get('principal', {}).get('name', 'Dr. Ramesh Babu H S')} is the current Principal of RNSIT. Contact: {admin.get('principal', {}).get('phone', '+91 94489 53800')}.",
         },
         "DIRECTOR": {
             "name": "Director",
             "type": "administration",
-            "answer": faq_map.get(
-                "who is the director of rnsit?",
-                f"Dr. M K Venkatesha is the Director of RNSIT. Contact: {admin.get('director', {}).get('phone', '+91 98808 67337')}."
-            ),
+            "answer": f"{admin.get('director', {}).get('name', 'Dr. M K Venkatesha')} is the Director of RNSIT. Contact: {admin.get('director', {}).get('phone', '+91 98808 67337')}.",
         },
         "CHAIRMAN_FOUNDER": {
             "name": "Group Chairman & Founder",
             "type": "administration",
-            "answer": faq_map.get(
-                "who is the chairman of rnsit?",
-                f"Dr. R. N. Shetty is the Group Chairman and founder of RNSIT."
-            ),
+            "answer": f"{admin.get('group_chairman', college.get('founder', 'Dr. R. N. Shetty'))} is the Group Chairman and founder of RNSIT.",
         },
         "ESTABLISHED_YEAR": {
             "name": "Established Year",
             "type": "college",
-            "answer": faq_map.get(
-                "when was rnsit established?",
-                f"RNSIT was established in the year {college.get('established', 2001)}."
-            ),
+            "answer": f"RNSIT was established in the year {college.get('established', 2001)}.",
         },
         "COLLEGE_OVERVIEW": {
             "name": "College Overview",
             "type": "college",
             "answer": (
-                f"RNS Institute of Technology (RNSIT) was established in 2001 by Dr. R. N. Shetty. "
-                f"It is an autonomous private engineering college affiliated to VTU, located in Channasandra, Bengaluru."
+                f"{college.get('name', 'RNS Institute of Technology')} ({college.get('short_name', 'RNSIT')}) was established in "
+                f"{college.get('established', 2001)} by {college.get('founder', 'Dr. R. N. Shetty')}. "
+                f"It is an autonomous private engineering college affiliated to VTU, located in {college.get('location', 'Channasandra, Bengaluru')}."
             ),
         },
         "AFFILIATION": {
@@ -130,26 +163,17 @@ def _build_verified_answers() -> dict[str, dict]:
         "COLLEGE_LOCATION": {
             "name": "College Location",
             "type": "college",
-            "answer": faq_map.get(
-                "where is rnsit located?",
-                f"RNSIT is located at {college.get('location', 'R R Nagar Post, Channasandra, Bengaluru - 560098')}."
-            ),
+            "answer": f"RNSIT is located at {college.get('location', 'R R Nagar Post, Channasandra, Bengaluru - 560098')}.",
         },
         "WEBSITE": {
             "name": "Official Website",
             "type": "college",
-            "answer": faq_map.get(
-                "what is the website of rnsit?",
-                f"The official website of RNSIT is {college.get('website', 'https://www.rnsit.ac.in')}."
-            ),
+            "answer": f"The official website of RNSIT is {college.get('website', 'https://www.rnsit.ac.in')}.",
         },
         "WORKING_HOURS": {
             "name": "Working Hours & Timings",
             "type": "administration",
-            "answer": faq_map.get(
-                "what are the college working hours?",
-                f"The college working hours are {admin.get('working_hours', '9:20 AM to 5:00 PM on all working days')}."
-            ),
+            "answer": f"The college working hours are {admin.get('working_hours', '9:20 AM to 5:00 PM on all working days')}.",
         },
         "ADMIN_BLOCK": {
             "name": "Administrative Block",
@@ -170,10 +194,7 @@ def _build_verified_answers() -> dict[str, dict]:
         "ADMISSIONS_CONTACT": {
             "name": "Admissions Contact",
             "type": "admissions",
-            "answer": faq_map.get(
-                "how can i contact the admissions department?",
-                f"Call {admin.get('contacts', {}).get('admissions_phone', '+91 81472 86667')} or email {admin.get('contacts', {}).get('admissions_email', 'admissions@rnsit.ac.in')}. The admissions office is open on all Saturdays and Sundays too."
-            ),
+            "answer": f"Call {admin.get('contacts', {}).get('admissions_phone', '+91 81472 86667')} or email {admin.get('contacts', {}).get('admissions_email', 'admissions@rnsit.ac.in')}. The admissions office is open on all Saturdays and Sundays too.",
         },
         "GENERAL_ENQUIRY": {
             "name": "General Enquiry",
@@ -185,18 +206,12 @@ def _build_verified_answers() -> dict[str, dict]:
         "COMEDK_CODE": {
             "name": "COMEDK Code",
             "type": "admissions",
-            "answer": faq_map.get(
-                "what is the comedk code for rnsit?",
-                f"The COMEDK code for RNSIT is {admissions.get('comedk_code', college.get('admission_codes', {}).get('comedk', 'E104'))}."
-            ),
+            "answer": f"The COMEDK code for RNSIT is {admissions.get('comedk_code', college.get('admission_codes', {}).get('comedk', 'E104'))}.",
         },
         "CET_CODE": {
             "name": "CET Code",
             "type": "admissions",
-            "answer": faq_map.get(
-                "what is the cet code for rnsit?",
-                f"The CET code for RNSIT is {admissions.get('cet_code', college.get('admission_codes', {}).get('cet', 'E118'))}."
-            ),
+            "answer": f"The CET code for RNSIT is {admissions.get('cet_code', college.get('admission_codes', {}).get('cet', 'E118'))}.",
         },
         "ADMISSION_CODES": {
             "name": "Admission Codes",
@@ -267,18 +282,12 @@ def _build_verified_answers() -> dict[str, dict]:
         "CSE_HOD": {
             "name": "HOD of Computer Science and Engineering",
             "type": "department",
-            "answer": faq_map.get(
-                "who is the hod of cse?",
-                f"Dr. Kiran Y.C. is the HOD of the CSE department at RNSIT."
-            ),
+            "answer": f"{cse.get('hod', 'Dr. Kiran Y.C.')} is the HOD of the CSE department at RNSIT.",
         },
         "CSE_INTAKE": {
             "name": "CSE Department Intake",
             "type": "department",
-            "answer": faq_map.get(
-                "what is the intake for the cse department?",
-                f"The CSE department has an intake of {cse.get('intake', 720)} students per year."
-            ),
+            "answer": f"The CSE department has an intake of {cse.get('intake', 720)} students per year.",
         },
         "CSE_DEPT": {
             "name": "Computer Science and Engineering Department",
@@ -291,10 +300,7 @@ def _build_verified_answers() -> dict[str, dict]:
         "AIML_HOD": {
             "name": "HOD of AI and ML",
             "type": "department",
-            "answer": faq_map.get(
-                "who is the hod of ai ml?",
-                f"Dr. Andhe Pallavi is the HOD of the AI and ML department at RNSIT."
-            ),
+            "answer": f"{aiml.get('hod', 'Dr. Andhe Pallavi')} is the HOD of the AI and ML department at RNSIT.",
         },
         "AIML_DEPT": {
             "name": "CSE (AI and ML) Department",
@@ -535,9 +541,7 @@ def _build_verified_answers() -> dict[str, dict]:
             "answer": (
                 "RNSIT provides campus-wide facilities including "
                 + ", ".join(k.replace("_", " ").title() for k in facs.keys())
-                + ". Key facilities on campus include Central Library, Canteen, Shivaram Karanth Auditorium, "
-                "Boys and Girls Hostels, Gym, Sports Ground, Placement Cell, Medical & 24/7 Ambulance service, "
-                "Campus-wide Wi-Fi, Canara Bank ATM, Toyota Center of Excellence, and Student Counselling."
+                + "."
             ),
         },
         "CAPABILITIES": {
@@ -551,7 +555,11 @@ def _build_verified_answers() -> dict[str, dict]:
     }
 
 
-VERIFIED_ENTITIES = _build_verified_answers()
+VERIFIED_ENTITIES = {
+    entity_id: entity
+    for entity_id, entity in _build_verified_answers().items()
+    if filter_entity_answer(entity.get("answer"), _KB_DATA)
+}
 
 
 # ── Pattern & Keyword Matchers ───────────────────────────────────────────
@@ -1079,6 +1087,270 @@ _ENTITY_RULES: list[tuple[str, list[re.Pattern]]] = [
 ]
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  AUTO ENTITIES + LIVE RELOAD
+#  Anything added to college_info.json that the hand-written entities above
+#  don't cover (new department, new facility, new clubs/transport/... section,
+#  new administration person) gets an entity + regex rules generated
+#  automatically. Hand-written rules always run first, so existing behaviour
+#  is unchanged; auto rules only fill the gaps.
+#  reload_entities() is called by backend/kb_sync.py whenever the JSON
+#  changes - no restart needed.
+# ══════════════════════════════════════════════════════════════════════
+
+_AUTO_RULES: list[tuple[str, list[re.Pattern]]] = []
+
+_AUTO_HANDLED_SECTIONS = {"meta", "college", "administration", "departments",
+                          "facilities", "placements", "admissions", "faqs"}
+# phrases too generic to ever become a trigger on their own
+_AUTO_GENERIC = {"details", "detail", "info", "information", "name", "type", "note", "notes",
+                 "description", "overview", "status", "general", "timings", "timing",
+                 "contact", "location", "phone", "email", "available", "list", "data"}
+_DEPT_INTENT = (r"(?:hod|head|department|dept|intake|block|located|location|where|about|"
+                r"tell|labs?|faculty|phd|courses?|seats?)")
+
+
+def _auto_norm(s: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(s).lower())).strip()
+
+
+def _auto_tokens(s: str) -> set[str]:
+    return {t[:-1] if len(t) > 3 and t.endswith("s") else t for t in _auto_norm(s).split()}
+
+
+def _auto_leaf_text(prefix: str, value) -> str:
+    def flat(v, path=()):
+        out = []
+        if isinstance(v, dict):
+            for k, x in v.items():
+                out += flat(x, path + (k,))
+        elif isinstance(v, list):
+            if v and all(not isinstance(x, (dict, list)) for x in v):
+                out.append((path, ", ".join(str(x) for x in v)))
+            else:
+                for i, x in enumerate(v, 1):
+                    out += flat(x, path + (str(i),))
+        elif v is not None and str(v).strip() != "":
+            out.append((path, "Yes" if v is True else "No" if v is False else str(v)))
+        return out
+
+    leaves = flat(value)
+    if not leaves:
+        return ""
+    body = "; ".join(
+        (" - ".join(str(x).replace("_", " ").title() for x in pth) + ": " if pth else "") + txt
+        for pth, txt in leaves
+    )
+    return f"{prefix}: {body}."
+
+
+def _auto_regex(phrase: str, intent: bool = False) -> re.Pattern | None:
+    ph = _auto_norm(phrase)
+    if len(ph) < 3 or ph in _AUTO_GENERIC:
+        return None
+    core = r"\s+".join(re.escape(w) for w in ph.split()) + r"(?:s|es)?"
+    if intent:
+        return re.compile(rf"\b{core}\b.{{0,40}}\b{_DEPT_INTENT}\b|\b{_DEPT_INTENT}\b.{{0,40}}\b{core}\b")
+    return re.compile(rf"\b{core}\b")
+
+
+def _build_auto_entities(kb: dict, existing: dict) -> tuple[dict, list]:
+    taken: set[str] = set()
+    for k, v in existing.items():
+        taken |= _auto_tokens(k.replace("_", " "))
+        taken |= _auto_tokens(v.get("name", ""))
+    ents: dict[str, dict] = {}
+    rules: list[tuple[str, list[re.Pattern]]] = []
+
+    def add(eid, name, etype, answer, phrases, intent=False):
+        if not answer or eid in existing or eid in ents:
+            return
+        pats = [r for r in (_auto_regex(p, intent) for p in phrases) if r]
+        if not pats:
+            return
+        ents[eid] = {"name": name, "type": etype, "answer": answer}
+        rules.append((eid, pats))
+
+    # departments - one entity per dept key not already hand-covered
+    for code, dept in (kb.get("departments") or {}).items():
+        if not isinstance(dept, dict) or _auto_tokens(code) & taken:
+            continue
+        name = dept.get("name") or code.upper()
+        add(f"AUTO_DEPT_{code.upper()}", name, "department",
+            _auto_leaf_text(f"{name} ({code.upper()})", {k: v for k, v in dept.items() if k != "name"}),
+            [name, code], intent=True)
+
+    # facilities
+    for key, val in (kb.get("facilities") or {}).items():
+        if _auto_tokens(key) & taken:
+            continue
+        label = key.replace("_", " ").title()
+        fname = val.get("name") if isinstance(val, dict) else None
+        add(f"AUTO_FAC_{key.upper()}", fname or label, "facility",
+            _auto_leaf_text(f"Facility {fname or label}", val) if not isinstance(val, str)
+            else f"Facility {label}: {val}.",
+            [label, fname or ""])
+
+    # administration people / offices
+    for key, val in (kb.get("administration") or {}).items():
+        if key in ("working_hours", "contacts") or _auto_tokens(key) & taken:
+            continue
+        label = key.replace("_", " ").title()
+        pname = val.get("name") if isinstance(val, dict) else (val if isinstance(val, str) else "")
+        add(f"AUTO_ADMIN_{key.upper()}", label, "administration",
+            _auto_leaf_text(f"RNSIT {label}", val) if isinstance(val, dict) else f"RNSIT {label}: {val}.",
+            [label, pname or ""])
+
+    # every other section (academics, clubs, transport, anything new)
+    for section, content in kb.items():
+        if section in _AUTO_HANDLED_SECTIONS:
+            continue
+        sec_label = section.replace("_", " ").title()
+        items = content.items() if isinstance(content, dict) else [(section, content)]
+        for key, val in items:
+            if _auto_tokens(key) & taken:
+                continue
+            label = key.replace("_", " ").title()
+            add(f"AUTO_{section.upper()}_{key.upper()}", label, section,
+                _auto_leaf_text(f"{sec_label} - {label}", val),
+                [label])
+    return ents, rules
+
+
+# hand-written entity id -> the JSON node that is its source of truth
+_SOURCE_PATHS: dict[str, tuple] = {
+    "LIBRARY": ("facilities", "library"), "LIBRARY_TIMINGS": ("facilities", "library"),
+    "CANTEEN": ("facilities", "canteen"), "AUDITORIUM": ("facilities", "auditorium"),
+    "GYM": ("facilities", "gym"), "HOSTELS": ("facilities", "hostels"),
+    "BOYS_HOSTEL": ("facilities", "hostels", "boys"), "GIRLS_HOSTEL": ("facilities", "hostels", "girls"),
+    "SPORTS": ("facilities", "sports"), "PLACEMENT_CELL": ("facilities", "placement_cell"),
+    "MEDICAL": ("facilities", "medical"), "WIFI": ("facilities", "wifi"),
+    "BANKING_ATM": ("facilities", "banking"), "TOYOTA_CENTER": ("facilities", "toyota_center"),
+    "COUNSELLING": ("facilities", "counselling"),
+    "CULTURAL_FEST": ("academics", "cultural_fest"),
+    "SCHOLARSHIPS": ("admissions", "scholarships"), "FEES": ("admissions", "fees"),
+    "ADMISSIONS_PROCESS": ("admissions", "process_steps"),
+    "PLACEMENTS_HIGHEST": ("placements", "stats"),
+    "DEPARTMENTS_OVERVIEW": ("departments",),
+    "CAMPUS_FACILITIES": ("facilities",),
+}
+
+
+def _json_has(kb: dict, path: tuple) -> bool:
+    node = kb
+    for key in path:
+        if not isinstance(node, dict) or key not in node or node[key] in (None, "", {}, []):
+            return False
+        node = node[key]
+    return True
+
+
+BASELINE_PATH = os.path.join(os.path.dirname(__file__), "..", "data", ".entity_baseline.json")
+
+
+def _load_baseline() -> set[str]:
+    try:
+        with open(BASELINE_PATH, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+
+def _save_baseline(ids: set[str]) -> None:
+    try:
+        with open(BASELINE_PATH, "w", encoding="utf-8") as f:
+            json.dump(sorted(ids), f)
+    except Exception as err:
+        logger.warning("[EntityMapping] could not save entity baseline: %s", err)
+
+
+def _dept_sentence(dept: dict, code: str) -> str:
+    name = dept.get("name") or code
+    parts = [f"The Department of {name}" + (f" is located in the {dept['block']}." if dept.get("block") else ".")]
+    if dept.get("hod"):
+        parts.append(f"The HOD is {dept['hod']}.")
+    if dept.get("intake"):
+        parts.append(f"The annual intake is {dept['intake']} students.")
+    if dept.get("phd_center"):
+        parts.append("It also has a PhD research center.")
+    extra = {k: v for k, v in dept.items() if k not in ("name", "block", "hod", "intake", "phd_center")}
+    if extra:
+        parts.append(_auto_leaf_text("Other details", extra))
+    return " ".join(parts)
+
+
+def reload_entities() -> int:
+    """Re-read college_info.json and rebuild VERIFIED_ENTITIES + auto rules
+    IN PLACE (other modules hold references to these objects). Synchronous,
+    so it is atomic with respect to the asyncio event loop."""
+    global _KB_DATA
+    try:
+        with open(DATA_PATH, "r", encoding="utf-8") as f:
+            fresh = json.load(f)
+    except Exception as err:
+        logger.error("[EntityMapping] reload skipped - cannot read college_info.json: %s", err)
+        return len(VERIFIED_ENTITIES)
+    if not isinstance(fresh, dict) or not fresh:
+        return len(VERIFIED_ENTITIES)
+
+    _KB_DATA.clear()
+    _KB_DATA.update(fresh)
+    verified = {
+        entity_id: entity
+        for entity_id, entity in _build_verified_answers().items()
+        if filter_entity_answer(entity.get("answer"), _KB_DATA)
+    }
+
+    # ── Retract entities whose source data was DELETED from the JSON ──
+    # An entity counts as "JSON-backed" once its strict build has been marker-free
+    # (remembered in data/.entity_baseline.json). If that data later disappears,
+    # the entity is removed instead of answering from its baked-in default.
+    strict = _build_verified_answers(_KB_DATA, strict=True)
+    depts_now = {k.lower() for k in (_KB_DATA.get("departments") or {})}
+    backed_now = {eid for eid, v in strict.items() if _MISSING_TAG not in str(v["answer"])}
+    backed_now |= {eid for eid in verified if eid.endswith("_DEPT") and eid[:-5].lower() in depts_now}
+    baseline = _load_baseline() | backed_now
+    _save_baseline(baseline)
+    for eid in sorted(baseline - backed_now):
+        if eid in verified:
+            verified.pop(eid)
+            logger.warning("[EntityMapping] retracted %s - its data was removed from college_info.json", eid)
+
+    # ── Explicit source map (baseline-independent) for entities whose answer is
+    # FIXED TEXT in this file: if the JSON node they describe is gone, retract
+    # them. Works even on the very first run after the data was deleted. ──
+    for eid in list(verified):
+        path = _SOURCE_PATHS.get(eid)
+        if path is None and eid.endswith("_DEPT"):
+            path = ("departments", eid[:-5].lower())
+        if path and not _json_has(_KB_DATA, path):
+            verified.pop(eid)
+            logger.warning("[EntityMapping] retracted %s - %s no longer in college_info.json",
+                           eid, "/".join(path))
+
+    for eid, info in verified.items():          # hand-written *_DEPT answers -> JSON truth
+        if eid.endswith("_DEPT"):
+            dept = (_KB_DATA.get("departments") or {}).get(eid[:-5].lower())
+            if isinstance(dept, dict):
+                info["answer"] = _dept_sentence(dept, eid[:-5])
+    auto_ents, auto_rules = _build_auto_entities(_KB_DATA, verified)
+    verified.update(auto_ents)
+    verified = {
+        entity_id: entity
+        for entity_id, entity in verified.items()
+        if filter_entity_answer(entity.get("answer"), _KB_DATA)
+    }
+    VERIFIED_ENTITIES.clear()
+    VERIFIED_ENTITIES.update(verified)
+    _AUTO_RULES[:] = auto_rules
+    logger.info("[EntityMapping] reloaded: %d entities (%d auto-generated)",
+                len(VERIFIED_ENTITIES), len(auto_ents))
+    return len(VERIFIED_ENTITIES)
+
+
+reload_entities()
+
+
 def detect_entity(query: str) -> DetectedEntity | None:
     """
     Deterministically maps a user query to its canonical entity using
@@ -1093,7 +1365,7 @@ def detect_entity(query: str) -> DetectedEntity | None:
     clean_query = normalize_query(query).lower()
 
     # Rule matching
-    for entity_id, patterns in _ENTITY_RULES:
+    for entity_id, patterns in (*_ENTITY_RULES, *_AUTO_RULES):
         for pat in patterns:
             if pat.search(clean_query):
                 entity_info = VERIFIED_ENTITIES.get(entity_id)

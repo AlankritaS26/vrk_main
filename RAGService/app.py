@@ -174,6 +174,7 @@ async def index_file(
     collection: str,
     file:   UploadFile = File(..., description="File to index (.pptx .docx .pdf .xlsx .csv .txt .md)"),
     source: str        = Form("",  description="Source label, e.g. department or project name"),
+    replace: bool      = Form(True, description="Delete the file's old chunks first, so an edited file never leaves stale text behind"),
 ):
     """
     Upload and index a file into a collection.
@@ -192,6 +193,8 @@ async def index_file(
         raise HTTPException(422, f"Failed to parse '{file.filename}': {e}")
 
     coll  = _get_collection(collection)
+    if replace:
+        coll.delete_by_filename(file.filename)
     added = coll.upsert(chunks)
     log.info("Indexed %s → collection=%s chunks=%d new=%d", file.filename, collection, len(chunks), added)
     return IndexResponse(
@@ -277,6 +280,29 @@ def delete_entry(collection: str, entry_id: str):
     an admin deletes/retracts a verified answer)."""
     _get_collection(collection).delete_entry(entry_id)
     return {"message": f"Entry '{entry_id}' removed from '{collection}'."}
+
+
+class SyncSourceRequest(BaseModel):
+    chunks: list[dict[str, Any]] = Field(..., description="[{text, metadata}] - the COMPLETE desired set for this source")
+
+
+@app.post("/v1/collections/{collection}/source/{source}/sync", tags=["Knowledge Entries"])
+def sync_source(collection: str, source: str, body: SyncSourceRequest):
+    """
+    Exact sync for a source (e.g. "college_info.json"): adds new/changed
+    chunks, deletes every chunk of that source that is no longer in the
+    list (information removed or edited upstream), leaves unchanged chunks
+    alone. Prevents outdated embeddings from surviving a deletion.
+    """
+    r = _get_collection(collection).sync_source(source, body.chunks)
+    log.info("sync source=%s collection=%s -> %s", source, collection, r)
+    return r
+
+
+@app.get("/v1/collections/{collection}/source/{source}/files", tags=["File Management"])
+def list_files_by_source(collection: str, source: str):
+    """Filenames indexed under a given source tag (used to detect orphans)."""
+    return {"files": _get_collection(collection).list_files_by_source(source)}
 
 
 @app.delete("/v1/collections/{collection}/source/{source}", tags=["Indexing"])

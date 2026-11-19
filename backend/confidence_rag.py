@@ -302,51 +302,56 @@ def extract_comparison_departments(query: str) -> tuple[str, str] | tuple[str, N
     return None
 
 
+_DEPT_TITLES_FOCUS = {
+    "CSE": ("Computer Science & Engineering (CSE)",
+            "- Focus areas & curriculum: Software engineering, algorithms, programming languages, data structures, computing systems, operating systems, and computer architecture fundamentals."),
+    "ECE": ("Electronics & Communication Engineering (ECE)",
+            "- Focus areas & curriculum: Hardware systems, VLSI design, embedded systems, electronic circuits, microcontrollers, telecommunications, and digital signal processing."),
+    "ISE": ("Information Science & Engineering (ISE)",
+            "- Focus areas & curriculum: Software systems, information architecture, data engineering, web applications, and network management."),
+    "EEE": ("Electrical & Electronics Engineering (EEE)",
+            "- Focus areas & curriculum: Electrical power systems, electrical machines, control systems, and electronic instrumentation."),
+    "MECH": ("Mechanical Engineering",
+             "- Focus areas: Mechanical design, manufacturing, thermal engineering, robotics, and CAD/CAM."),
+    "CIVIL": ("Civil Engineering",
+              "- Focus areas: Structural engineering, geotechnical engineering, environmental engineering, and surveying."),
+    "AIML": ("Artificial Intelligence & Machine Learning (AIML)",
+             "- Focus areas: Artificial intelligence, machine learning algorithms, data analysis, and intelligent systems."),
+}
+
+
+def _live_dept_line(code: str) -> str | None:
+    """Facts for one department straight from college_info.json (reloaded live).
+    Returns None when the department no longer exists in the JSON."""
+    dept = ((get_kb_data() or {}).get("departments") or {}).get(code.lower())
+    if not isinstance(dept, dict):
+        return None
+    bits = []
+    if dept.get("block"):
+        bits.append(f"Located in the {dept['block']}")
+    if dept.get("hod"):
+        bits.append(f"HOD is {dept['hod']}")
+    if dept.get("intake"):
+        bits.append(f"annual intake is {dept['intake']} students")
+    if dept.get("phd_center"):
+        bits.append("has a recognized PhD research center")
+    for k, v in dept.items():
+        if k not in ("name", "block", "hod", "intake", "phd_center") and isinstance(v, (str, int, float)):
+            bits.append(f"{k.replace('_', ' ')}: {v}")
+    return ("- " + ", ".join(bits) + ".") if bits else "- (no further details on record)"
+
+
 def _get_department_comparison_facts(dept_a: str, dept_b: str, user_interest: str | None = None) -> str:
     """Builds verified factual context for comparing two departments."""
-    facts = {
-        "CSE": (
-            "Computer Science & Engineering (CSE):\n"
-            "- Located in the CSE Block, HOD is Dr. Kiran Y.C., annual intake is 720 students.\n"
-            "- VTU recognized PhD research center.\n"
-            "- Focus areas & curriculum: Software engineering, algorithms, programming languages, data structures, "
-            "computing systems, operating systems, and computer architecture fundamentals."
-        ),
-        "ECE": (
-            "Electronics & Communication Engineering (ECE):\n"
-            "- Located in the Main Campus with a recognized PhD research center.\n"
-            "- Focus areas & curriculum: Hardware systems, VLSI design, embedded systems, electronic circuits, "
-            "microcontrollers, telecommunications, and digital signal processing."
-        ),
-        "ISE": (
-            "Information Science & Engineering (ISE):\n"
-            "- Located in the CSE Block.\n"
-            "- Focus areas & curriculum: Software systems, information architecture, data engineering, web applications, and network management."
-        ),
-        "EEE": (
-            "Electrical & Electronics Engineering (EEE):\n"
-            "- Equipped with state-of-the-art laboratory facilities.\n"
-            "- Focus areas & curriculum: Electrical power systems, electrical machines, control systems, and electronic instrumentation."
-        ),
-        "MECH": (
-            "Mechanical Engineering:\n"
-            "- Located in the Mechanical Block, houses the Toyota Center of Excellence and recognized PhD research center.\n"
-            "- Focus areas: Mechanical design, manufacturing, thermal engineering, robotics, and CAD/CAM."
-        ),
-        "CIVIL": (
-            "Civil Engineering:\n"
-            "- Located in the Civil Block with recognized PhD research center.\n"
-            "- Focus areas: Structural engineering, geotechnical engineering, environmental engineering, and surveying."
-        ),
-        "AIML": (
-            "Artificial Intelligence & Machine Learning (AIML):\n"
-            "- Located in the CSE Block, HOD is Dr. Andhe Pallavi.\n"
-            "- Focus areas: Artificial intelligence, machine learning algorithms, data analysis, and intelligent systems."
-        ),
-    }
+    facts = {}
+    for code, (title, focus) in _DEPT_TITLES_FOCUS.items():
+        line = _live_dept_line(code)
+        if line is None:
+            continue            # department was removed from the JSON -> no stale facts
+        facts[code] = f"{title}:\n{line}\n{focus}"
 
-    fact_a = facts.get(dept_a, f"{dept_a} Department at RNSIT.")
-    fact_b = facts.get(dept_b, f"{dept_b} Department at RNSIT.")
+    fact_a = facts.get(dept_a, f"{dept_a} Department: no verified details are currently on record.")
+    fact_b = facts.get(dept_b, f"{dept_b} Department: no verified details are currently on record.")
 
     interest_context = f"\nVisitor's Stated Interest: {user_interest}\n" if user_interest else ""
     return (
@@ -417,14 +422,14 @@ def _get_interest_departments_fact(interest: str) -> str:
     if "hardware" in interest.lower() or "embedded" in interest.lower() or "vlsi" in interest.lower():
         return (
             "RNSIT Departments for Hardware Engineering:\n"
-            "- Electronics & Communication Engineering (ECE) and Electrical & Electronics Engineering (EEE) focus directly on hardware systems, electronic circuits, embedded systems, microcontrollers, and VLSI design. ECE is located in the Main Campus with state-of-the-art labs and a PhD research center.\n"
+            "- Electronics & Communication Engineering (ECE) and Electrical & Electronics Engineering (EEE) focus directly on hardware systems, electronic circuits, embedded systems, microcontrollers, and VLSI design. " + ("ECE: " + (_live_dept_line("ECE") or "").lstrip("- ") if _live_dept_line("ECE") else "") + "\n"
             "- Computer Science & Engineering (CSE) focuses primarily on software and algorithms, but covers computer organization and computing hardware fundamentals.\n"
             "If you are deciding between branches like ECE and CSE, I can explain the specific differences between them."
         )
     elif "software" in interest.lower():
         return (
             "RNSIT Departments for Software Engineering:\n"
-            "- Computer Science & Engineering (CSE) and Information Science & Engineering (ISE) focus directly on software development, algorithms, data structures, and computing systems. CSE has an annual intake of 720 students in the CSE Block.\n"
+            "- Computer Science & Engineering (CSE) and Information Science & Engineering (ISE) focus directly on software development, algorithms, data structures, and computing systems. " + (_live_dept_line("CSE") or "").lstrip("- ") + "\n"
             "- Specialized branches like CSE (AI & ML), CSE (Data Science), and CSE (Cyber Security) offer targeted software curriculums."
         )
     return _get_broad_departments_fact()
@@ -631,24 +636,42 @@ def is_college_evaluation_query(query: str) -> bool:
 
 
 def _get_broad_departments_fact() -> str:
-    """Builds a rich, factual overview of RNSIT departments and streams for broad synthesis."""
-    try:
-        kb = get_kb_data() or {}
-        placements = kb.get("placements", {})
-        total_cos = placements.get("total_companies", "200+")
-        highest = placements.get("stats", {}).get("2025", {}).get("highest_ctc_lpa", "26.1")
-        avg = placements.get("stats", {}).get("2025", {}).get("average_ctc_lpa", "6.5")
-    except Exception:
-        total_cos, highest, avg = "200+", "26.1", "6.5"
+    """Overview of departments built ONLY from college_info.json (live), so a
+    deleted/changed department, HOD, intake or placement figure is never
+    served from stale hardcoded text."""
+    kb = get_kb_data() or {}
+    lines = ["RNSIT Departments and Academic Offerings:"]
+    for code, dept in (kb.get("departments") or {}).items():
+        if not isinstance(dept, dict):
+            continue
+        name = dept.get("name") or code.upper()
+        bits = []
+        if dept.get("block"):
+            bits.append(f"located in {dept['block']}")
+        if dept.get("hod"):
+            bits.append(f"HOD {dept['hod']}")
+        if dept.get("intake"):
+            bits.append(f"annual intake {dept['intake']}")
+        if dept.get("phd_center"):
+            bits.append("PhD research center")
+        lines.append(f"- {name} ({code.upper()})" + (": " + ", ".join(bits) if bits else "") + ".")
 
-    return (
-        "RNSIT Departments and Academic Offerings:\n"
-        "- Software & Computing Branches: Computer Science & Engineering (CSE - annual intake 720, located in CSE Block, HOD Dr. Kiran Y.C., VTU PhD research center), Information Science & Engineering (ISE, located in CSE Block), Artificial Intelligence & Machine Learning (AIML, HOD Dr. Andhe Pallavi), Artificial Intelligence & Data Science (AIDS), CSE Data Science, and CSE Cyber Security. These branches focus on software development, algorithms, artificial intelligence, and computing systems.\n"
-        "- Electronics & Electrical Branches: Electronics & Communication Engineering (ECE - located in Main Campus with PhD research center) and Electrical & Electronics Engineering (EEE - state-of-the-art labs). These branches focus on embedded systems, telecommunications, VLSI, and electrical systems.\n"
-        "- Core Engineering Branches: Mechanical Engineering (located in Mechanical Block, houses the Toyota Center of Excellence and PhD center) and Civil Engineering (located in Civil Block with recognized PhD research center).\n"
-        "- Postgraduate Programs: Master of Computer Applications (MCA) and Master of Business Administration (MBA).\n"
-        f"- Placements Across Departments: Over {total_cos} companies recruit from RNSIT (highest CTC {highest} LPA, average CTC {avg} LPA) including recruiters like Adobe, Amazon, Cisco, Cognizant, Infosys, and IBM. Campus-wide placement training and opportunities are available across engineering disciplines."
-    )
+    pl = kb.get("placements") or {}
+    stats = (pl.get("stats") or {})
+    if pl:
+        latest = stats.get(max(stats)) if stats else {}
+        bits = []
+        if pl.get("total_companies"):
+            bits.append(f"over {pl['total_companies']} companies recruit from RNSIT")
+        if latest and latest.get("highest_ctc_lpa"):
+            bits.append(f"highest CTC {latest['highest_ctc_lpa']} LPA")
+        if latest and latest.get("average_ctc_lpa"):
+            bits.append(f"average CTC {latest['average_ctc_lpa']} LPA")
+        if pl.get("recent_recruiters"):
+            bits.append("recruiters include " + ", ".join(pl["recent_recruiters"][:6]))
+        if bits:
+            lines.append("- Placements across departments: " + "; ".join(bits) + ".")
+    return "\n".join(lines)
 
 
 # ── Small helpers ────────────────────────────────────────────────────

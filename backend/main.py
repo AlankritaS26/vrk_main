@@ -128,6 +128,7 @@ from backend.database import (
     get_unanswered_questions, get_knowledge_entries, get_rag_settings,
 )
 from backend.rag_calibration_log import read_recent_rows
+from backend.kb_sync import kb_version
 
 # --- REDIS / MEMURAI CACHING ---
 try:
@@ -900,15 +901,20 @@ async def lifespan(app: FastAPI):
         logger.error("[SYSTEM] RAG initialization failed during startup: %s", e)
 
     timeout_task = asyncio.create_task(_session_timeout_loop())
+    from backend.kb_sync import sync_loop as _kb_sync_loop, startup_sync as _kb_startup_sync
+    await _kb_startup_sync()          # purge anything deleted while the backend was off
+    kb_sync_task = asyncio.create_task(_kb_sync_loop())
 
     yield
 
     logger.info("[SYSTEM] Triggering cleanup hooks...")
     timeout_task.cancel()
-    try:
-        await timeout_task
-    except asyncio.CancelledError:
-        pass
+    kb_sync_task.cancel()
+    for _t in (timeout_task, kb_sync_task):
+        try:
+            await _t
+        except asyncio.CancelledError:
+            pass
 
     await close_llm_client()
     logger.info("[SYSTEM] Server teardown complete.")
@@ -2123,6 +2129,13 @@ def _is_cacheable_route(route: str) -> bool:
     return not any(m in r for m in _UNCACHEABLE_ROUTE_MARKERS)
 
 
+def _versioned_cache_key(q_normalized: str) -> tuple[str, str]:
+    """Build the same knowledge-versioned cache key for both ask endpoints."""
+    version = kb_version()
+    question_hash = hashlib.md5(q_normalized.encode()).hexdigest()
+    return f"kiosk:cache:{version}:{question_hash}", version
+
+
 # ==========================================
 # NAME_CHANGE detection — EXPLICIT intent only
 # ==========================================
@@ -2390,13 +2403,14 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
         return await _respond(answer, source=source, session_action=session_action)
 
     # ─── Redis cache fallback ──────────────────────────────────────────────────
-    cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
+    cache_key, cache_version = _versioned_cache_key(q_normalized)
     if redis_client:
         try:
             cached = redis_client.get(cache_key)
             if cached:
-                logger.info("[REDIS HIT] For normalized key: '%s'", q_normalized)
+                logger.info("[REDIS HIT] version=%s normalized_question=%r", cache_version, q_normalized)
                 return await _respond(cached, source="redis_cache")
+            logger.info("[REDIS MISS] version=%s normalized_question=%r", cache_version, q_normalized)
         except Exception as e:
             logger.warning("Redis read error: %s", e)
 
@@ -2432,6 +2446,7 @@ async def ask_kiosk(question: str = Query(..., description="Visitor question")):
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
+                    logger.info("[REDIS SET] version=%s normalized_question=%r", cache_version, q_normalized)
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
 
@@ -2517,16 +2532,17 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             return
 
         # ── Redis cache — also a single instant chunk, same as /ask ──────
-        cache_key = f"kiosk:cache:{hashlib.md5(q_normalized.encode()).hexdigest()}"
+        cache_key, cache_version = _versioned_cache_key(q_normalized)
         if redis_client:
             try:
                 cached = redis_client.get(cache_key)
                 if cached:
-                    logger.info("[REDIS HIT] For normalized key: '%s'", q_normalized)
+                    logger.info("[REDIS HIT] version=%s normalized_question=%r", cache_version, q_normalized)
                     yield f"data: {json.dumps({'sentence': cached})}\n\n"
                     await _finish(cached, "CONTINUE")
                     yield f"data: {json.dumps({'done': True, 'answer': cached, 'session_action': 'CONTINUE'})}\n\n"
                     return
+                logger.info("[REDIS MISS] version=%s normalized_question=%r", cache_version, q_normalized)
             except Exception as e:
                 logger.warning("Redis read error: %s", e)
 
@@ -2578,6 +2594,7 @@ async def ask_kiosk_stream(question: str = Query(..., description="Visitor quest
             try:
                 if _is_cacheable(answer):
                     redis_client.set(cache_key, answer, ex=3600)
+                    logger.info("[REDIS SET] version=%s normalized_question=%r", cache_version, q_normalized)
             except Exception as e:
                 logger.warning("Redis write error: %s", e)
 

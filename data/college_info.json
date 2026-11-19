@@ -43,7 +43,7 @@
   "departments": {
     "cse": {
       "name": "Computer Science and Engineering",
-      "hod": "Dr. Kiran Y.C.",
+      "hod": "Dr. Sampada K S",
       "intake": 720,
       "block": "CSE Block",
       "phd_center": true
@@ -203,7 +203,7 @@
       "Placement Club",
       "Aura"
     ],
-    "cultural_fest": "Aperture"
+    "cultural_fest": "patheon"
   },
   "admissions": {
     "status": "Open for 2026-27 academic year",
@@ -428,7 +428,7 @@
     },
     {
       "question": "What is the cultural fest of RNSIT?",
-      "answer": "The cultural fest of RNSIT is called Aperture."
+      "answer": "The cultural fest of RNSIT is called patheon."
     },
     {
       "question": "What departments does RNSIT have?",

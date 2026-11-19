@@ -809,6 +809,54 @@ async def extract_topic_label(questions) -> str | None:
 # RAGService INTEGRATION
 # ==========================================
 
+def _kb_label(key) -> str:
+    return str(key).replace("_", " ").strip().title()
+
+
+def _kb_scalar(v) -> str:
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    return str(v)
+
+
+def _kb_flatten(value, path: tuple = ()) -> list[tuple[tuple, str]]:
+    """Walk ANY json structure -> [(path_tuple, text)] for every non-empty leaf.
+    This is what lets new/unknown fields in college_info.json reach the RAG
+    without touching the chunker."""
+    out: list[tuple[tuple, str]] = []
+    if isinstance(value, dict):
+        for k, v in value.items():
+            out += _kb_flatten(v, path + (k,))
+    elif isinstance(value, list):
+        if value and all(not isinstance(x, (dict, list)) for x in value):
+            out.append((path, ", ".join(_kb_scalar(x) for x in value)))
+        else:
+            for i, x in enumerate(value, 1):
+                out += _kb_flatten(x, path + (str(i),))
+    elif value is not None and str(value).strip() != "":
+        out.append((path, _kb_scalar(value)))
+    return out
+
+
+def _kb_text(prefix: str, value) -> str:
+    """'Prefix: a: 1; b — c: 2' style sentence for any json value."""
+    if not isinstance(value, (dict, list)):
+        return f"{prefix}: {_kb_scalar(value)}" if value not in (None, "") else ""
+    leaves = _kb_flatten(value)
+    if not leaves:
+        return ""
+    if len(leaves) == 1 and not leaves[0][0]:
+        return f"{prefix}: {leaves[0][1]}"
+    return f"{prefix}: " + "; ".join(
+        (" — ".join(_kb_label(x) for x in pth) + ": " if pth else "") + txt
+        for pth, txt in leaves
+    ) + "."
+
+
+def _kb_extras(obj: dict, handled: set) -> dict:
+    return {k: v for k, v in (obj or {}).items() if k not in handled}
+
+
 def _json_to_text_chunks(json_path: str) -> list[dict]:
     """
     Convert college_info.json into text chunks for RAGService indexing,
@@ -875,6 +923,20 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
         _add(f"RNSIT general enquiry numbers: {', '.join(enquiry)}.",
              "administration", "General Enquiry")
 
+    # ── AUTO: any college / administration field the builders above don't
+    # know about (new keys, nested contacts, group_chairman, emails ...) ──
+    for k, v in _kb_extras(c, {"name", "short_name", "established", "founder", "type",
+                               "affiliation", "website", "location", "admission_codes"}).items():
+        _add(_kb_text(f"RNSIT college — {_kb_label(k)}", v), "college", _kb_label(k))
+    for k, v in _kb_extras(adm, {"working_hours", "contacts"}).items():
+        if k in ("director", "principal") and isinstance(v, dict):
+            for k2, v2 in _kb_extras(v, {"name", "phone"}).items():
+                _add(_kb_text(f"RNSIT {_kb_label(k)} — {_kb_label(k2)}", v2), "administration", _kb_label(k))
+        else:
+            _add(_kb_text(f"RNSIT Administration — {_kb_label(k)}", v), "administration", _kb_label(k))
+    for k, v in _kb_extras(contacts, {"admissions_phone", "admissions_email", "enquiry_phone"}).items():
+        _add(_kb_text(f"RNSIT contact — {_kb_label(k)}", v), "administration", _kb_label(k))
+
     depts = data.get("departments", {})
     if depts:
         dept_names = [d.get("name") or k.upper() for k, d in depts.items()]
@@ -899,6 +961,11 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
             parts.append(f"Annual intake: {dept['intake']} students.")
         if dept.get("phd_center"):
             parts.append("Has a PhD research centre.")
+        # AUTO: every other field of the department (email, labs, faculty count ...)
+        for _k, _v in _kb_extras(dept, {"name", "block", "hod", "intake", "phd_center"}).items():
+            _t = _kb_text(_kb_label(_k), _v)
+            if _t:
+                parts.append(_t if _t.endswith(".") else _t + ".")
         _add(" ".join(parts), "department", dept.get("name") or code.upper())
 
     facs = data.get("facilities", {})
@@ -906,9 +973,7 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
         fac_labels = [fname.replace("_", " ").title() for fname in facs.keys()]
         _add(
             f"RNSIT Campus Facilities Overview: RNSIT provides campus-wide facilities including "
-            f"{', '.join(fac_labels)}. Key facilities on campus include Central Library, Canteen, Shivaram Karanth Auditorium, "
-            f"Boys and Girls Hostels, Gym, Sports Ground, Placement Cell, Medical & 24/7 Ambulance service, "
-            f"Campus-wide Wi-Fi, Canara Bank ATM, Toyota Center of Excellence, and Student Counselling.",
+            f"{', '.join(fac_labels)}.",
             "facility", "Campus Facilities Overview",
         )
 
@@ -919,6 +984,11 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
             for key in ("name", "location", "timings", "details", "capacity", "platform"):
                 if fdet.get(key):
                     parts.append(f"{key.title()}: {fdet[key]}.")
+            # AUTO: every other field (seating_capacity, nested hostels, courts, urls ...)
+            for _k, _v in _kb_extras(fdet, {"name", "location", "timings", "details", "capacity", "platform"}).items():
+                _t = _kb_text(_kb_label(_k), _v)
+                if _t:
+                    parts.append(_t if _t.endswith(".") else _t + ".")
             _add(" ".join(parts), "facility", label)
         elif isinstance(fdet, str):
             _add(f"Facility {label}: {fdet}.", "facility", label)
@@ -940,7 +1010,14 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
                 s_parts.append(f"Average package: {stats['average_ctc_lpa']} LPA.")
             if stats.get("students_placed"):
                 s_parts.append(f"Students placed: {stats['students_placed']}.")
+            for _k, _v in _kb_extras(stats, {"highest_ctc_lpa", "average_ctc_lpa", "students_placed"}).items():
+                _t = _kb_text(_kb_label(_k), _v)
+                if _t:
+                    s_parts.append(_t if _t.endswith(".") else _t + ".")
             _add(" ".join(s_parts), "placements", f"Placement Stats {yr}")
+
+    for _k, _v in _kb_extras(pl, {"total_companies", "recent_recruiters", "stats"}).items():
+        _add(_kb_text(f"RNSIT Placements — {_kb_label(_k)}", _v), "placements", _kb_label(_k))
 
     # ── Admissions: dedicated builder (not the generic key:val loop below) ──
     # because admissions now holds nested dicts/lists (eligibility per
@@ -1005,20 +1082,30 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
             if schol.get("note"):
                 _add(f"RNSIT scholarship note: {schol['note']}", "admissions", "Scholarships")
 
+    # AUTO: admissions keys not covered by the dedicated builder above
+    for _k, _v in _kb_extras(adms, {"status", "academic_year", "contact_phone", "contact_email",
+                                    "cet_code", "comedk_code", "modes", "eligibility",
+                                    "process_steps", "documents_required", "fees",
+                                    "scholarships"}).items():
+        _add(_kb_text(f"RNSIT Admissions — {_kb_label(_k)}", _v), "admissions", _kb_label(_k))
+
+    # ── ANY other top-level section (academics, clubs, transport, ... or a
+    # brand-new one you add later) is walked recursively: nested dicts and
+    # list-of-dicts are no longer silently dropped. ──
     for section, content in data.items():
         if section in ("meta", "college", "administration", "departments",
                         "facilities", "placements", "admissions", "faqs"):
             continue
-        section_label = section.replace("_", " ").title()
+        section_label = _kb_label(section)
         if isinstance(content, dict):
             for key, val in content.items():
-                key_label = f"{section_label} — {key.replace('_', ' ').title()}"
-                if isinstance(val, str) and val.strip():
-                    _add(f"{section_label} — {key}: {val}", section, key_label)
-                elif isinstance(val, list):
-                    _add(f"{section_label} — {key}: {', '.join(str(v) for v in val)}", section, key_label)
-        elif isinstance(content, str):
-            _add(f"{section_label}: {content}", section, section_label)
+                _add(_kb_text(f"{section_label} — {key}", val), section,
+                     f"{section_label} — {_kb_label(key)}")
+        elif isinstance(content, list):
+            for i, item in enumerate(content, 1):
+                _add(_kb_text(f"{section_label} #{i}", item), section, f"{section_label} #{i}")
+        else:
+            _add(_kb_text(section_label, content), section, section_label)
 
     # ── FAQs: these are hand-written, single-topic Q&A pairs — the best
     # possible chunks for direct-match retrieval. Previously silently
@@ -1056,7 +1143,8 @@ def _json_to_text_chunks(json_path: str) -> list[dict]:
         "what languages do you", "how do you work",
     )
     skipped = 0
-    for faq in data.get("faqs", []):
+    from backend.faq_guard import fresh_faqs
+    for faq in fresh_faqs(data):
         q = (faq.get("question") or "").strip()
         a = (faq.get("answer") or "").strip()
         if not (q and a):
@@ -1118,7 +1206,7 @@ async def initialize_rag_knowledge_base(force_reseed: bool = False):
     """Seed the RAGService collection from college_info.json if empty or force_reseed=True."""
     global _rag_seeded
     if _rag_seeded and not force_reseed:
-        return
+        return True
 
     client = get_shared_client()
     try:
@@ -1126,50 +1214,28 @@ async def initialize_rag_knowledge_base(force_reseed: bool = False):
         if not chunks:
             logger.warning("[RAG] college_info.json not found or empty — nothing to seed.")
             _rag_seeded = True
-            return
+            return True
 
-        if force_reseed:
-            try:
-                await client.delete(
-                    f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/source/college_info.json",
-                    timeout=5.0
-                )
-                logger.info("[RAG] Cleared existing college_info.json chunks for re-seed.")
-            except Exception as del_err:
-                logger.warning("[RAG] Failed to clear existing source chunks: %s", del_err)
-
-        # Check whether collection already has data
-        if not force_reseed:
-            resp = await client.get(f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}",
-                                    timeout=5.0)
-            if resp.status_code == 200:
-                stats = resp.json()
-                total_in_db = stats.get("total_chunks", 0)
-                if total_in_db >= len(chunks):
-                    logger.info(
-                        "[RAG] Collection '%s' already has %d chunks (>= %d) — skipping seed.",
-                        RAG_COLLECTION, total_in_db, len(chunks)
-                    )
-                    _rag_seeded = True
-                    return
-
-        logger.info("[RAG] Seeding collection '%s' with %d chunks from college_info.json …",
+        logger.info("[RAG] Syncing collection '%s' with %d chunks from college_info.json ...",
                     RAG_COLLECTION, len(chunks))
-        added = 0
-        for chunk in chunks:
-            r = await client.post(
-                f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/index/text",
-                json={"text": chunk["text"], "source": "college_info.json", "metadata": chunk["metadata"]},
-                timeout=15.0,
-            )
-            if r.status_code == 200:
-                added += r.json().get("added", 0)
-
-        logger.info("[RAG] Seed complete — %d chunks indexed into '%s'.", added, RAG_COLLECTION)
+        # EXACT sync: adds new/changed chunks, then deletes every college_info.json
+        # chunk that is no longer in the JSON (removed/edited info) - no stale
+        # embeddings, and no empty window while re-embedding.
+        r = await client.post(
+            f"{RAG_SERVICE_URL}/v1/collections/{RAG_COLLECTION}/source/college_info.json/sync",
+            json={"chunks": chunks},
+            timeout=600.0,
+        )
+        if r.status_code != 200:
+            logger.warning("[RAG] sync failed: HTTP %s %s", r.status_code, r.text[:200])
+            return False
+        logger.info("[RAG] Sync complete: %s", r.json())
         _rag_seeded = True
+        return True
 
     except Exception as e:
         logger.warning("[RAG] RAGService unreachable during init (%s). Will retry on next query.", e)
+        return False
 
 
 async def rag_upsert_entry(entry_id: str, text: str, metadata: dict | None = None) -> int:
